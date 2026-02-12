@@ -28,10 +28,11 @@ class TrainingConfig:
     micro_batch_size: int = 32
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
-    max_steps: int = 1000
-    eval_steps: int = 100
-    save_steps: int = 500
-    warmup_steps: int = 100
+    max_steps: int = 100
+    eval_steps: int = 50
+    save_steps: int = 50
+    log_steps: int = 10
+    warmup_steps: int = 10
     clip_grad: float = 1.0
     bf16: bool = True
     gradient_checkpointing: bool = False  # Will add in Phase 2
