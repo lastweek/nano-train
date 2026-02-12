@@ -66,7 +66,7 @@ class Trainer:
             log_path = os.path.join(config.log_dir, config.run_name)
             self.writer = SummaryWriter(log_path)
             print(f"TensorBoard logs: {log_path}")
-            print(f"View with: python3 scripts/view_logs.py")
+            print(f"View with: python3 scripts/view_logs.py or open scripts/view_logs.html")
         else:
             print("TensorBoard not available. Install with: pip install tensorboard")
 

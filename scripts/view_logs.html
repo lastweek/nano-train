@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TensorBoard Logs - nano-train</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        .file { background: #f5f5f5; border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .file:hover { background: #f0f0f0; }
+        .metric { background: #e8f5ea; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .empty { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>📊 TensorBoard Logs - nano-train</h1>
+    <div id="content"></div>
+
+    <script>
+        async function loadLogs() {
+            try {
+                const response = await fetch('logs/nano_train_mvp/');
+                const files = await response.json();
+                return files;
+            } catch (error) {
+                document.getElementById('content').innerHTML = '<div class=\"empty\">Error loading logs: ' + error.message + '</div>';
+            }
+        }
+
+        function displayFiles(files) {
+            if (files.length === 0) {
+                document.getElementById('content').innerHTML = '<div class=\"empty\">No logs found yet. Run training first!</div>';
+                return;
+            }
+
+            let html = '<h2>Log Files:</h2>';
+            files.forEach(file => {
+                html += `<div class=\"file\">📄 ${file.name}</div>`;
+            });
+
+            document.getElementById('content').innerHTML = html;
+        }
+
+        loadLogs();
+    </script>
+</body>
+</html>

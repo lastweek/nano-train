@@ -83,6 +83,10 @@ python check_gpu.py  # Verify GPU setup
 # For training:
 pip install -r requirements.txt
 python examples/train_mvp.py
+
+# View logs:
+python3 scripts/view_logs.py  # Simple HTML viewer
+# or open: scripts/view_logs.html
 ```
 
 ## 📊 Current Status
