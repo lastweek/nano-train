@@ -1,0 +1,19 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+# IDE
+.vscode/
+.idea/
+# OS
+.DS_Store
+Thumbs.db
+# Training outputs
+outputs/
+*.pt
+*.log
+# Data
+data/*.csv
+!__pycache__/

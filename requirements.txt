@@ -1,0 +1,16 @@
+# Core ML/DL
+torch>=2.4.0
+numpy>=1.24.0
+
+# Configuration
+omegaconf>=2.3.0
+
+# Logging
+tensorboard>=2.15.0
+
+# Testing
+pytest>=7.4.0
+
+# Utilities
+tqdm>=4.66.0
+pyyaml>=6.0
