@@ -16,4 +16,3 @@ outputs/
 *.log
 # Data
 data/*.csv
-!__pycache__/
