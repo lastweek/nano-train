@@ -10,9 +10,9 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from nano_train.core.config import Config
-from nano_train.training.optimizer import create_optimizer
-from nano_train.training.scheduler import CosineAnnealingScheduler
+from src.core.config import Config
+from src.training.optimizer import create_optimizer
+from src.training.scheduler import CosineAnnealingScheduler
 
 
 class Trainer:

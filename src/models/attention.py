@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from nano_train.core.config import ModelConfig
+from src.core.config import ModelConfig
 
 
 class MultiHeadAttention(nn.Module):

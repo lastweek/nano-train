@@ -7,9 +7,9 @@ Phase 2 will add gradient checkpointing.
 import torch
 import torch.nn as nn
 
-from nano_train.core.config import ModelConfig
-from nano_train.models.attention import MultiHeadAttention
-from nano_train.models.mlp import MLP
+from src.core.config import ModelConfig
+from src.models.attention import MultiHeadAttention
+from src.models.mlp import MLP
 
 
 class TransformerBlock(nn.Module):

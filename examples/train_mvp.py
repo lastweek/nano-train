@@ -15,10 +15,10 @@ import torch
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from nano_train.core.config import Config
-from nano_train.models.transformer import TransformerModel
-from nano_train.data.dataset import TextDataset, create_dataloader
-from nano_train.training.trainer import Trainer
+from src.core.config import Config
+from src.models.transformer import TransformerModel
+from data.dataset import TextDataset, create_dataloader
+from src.training.trainer import Trainer
 
 
 def main():
