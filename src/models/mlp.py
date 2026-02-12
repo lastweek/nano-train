@@ -7,7 +7,7 @@ Phase 7 will add MoE support.
 import torch
 import torch.nn as nn
 
-from src.core.config import ModelConfig
+from src.config import ModelConfig
 
 
 class MLP(nn.Module):

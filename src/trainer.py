@@ -23,9 +23,9 @@ except ImportError:
         except ImportError:
             SummaryWriter = None
 
-from src.core.config import Config
-from src.training.optimizer import create_optimizer
-from src.training.scheduler import CosineAnnealingScheduler
+from src.config import Config
+from src.optimizer import create_optimizer
+from src.scheduler import CosineAnnealingScheduler
 
 
 class Trainer:
@@ -156,7 +156,11 @@ class Trainer:
                         if self.writer is not None:
                             self.writer.add_scalar('Gradients/norm', grad_norm, global_step)
                     if self.writer is not None:
-                        self.writer.add_scalar('Parameters/norm', self._get_param_norm(), global_step)
+                        self.writer.add_scalar(
+                            'Parameters/norm',
+                            self._get_param_norm(),
+                            global_step
+                        )
                     if self.device.type == 'cuda':
                         allocated_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
                         reserved_mb = torch.cuda.memory_reserved(self.device) / (1024 ** 2)

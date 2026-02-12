@@ -15,10 +15,10 @@ import torch
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.core.config import Config
+from src.config import Config
 from src.models.transformer import TransformerModel
 from data.dataset import TextDataset, create_dataloader
-from src.training.trainer import Trainer
+from src.trainer import Trainer
 
 
 def main():
@@ -48,10 +48,18 @@ def main():
     model = TransformerModel(config.model)
     print(f"Model created with {model.num_parameters:,} parameters")
 
+    print(model)
+
     # Update vocab size based on dataset
     print("\nLoading dataset...")
+    dataset_path = config.data.dataset_path
+    if not os.path.isabs(dataset_path):
+        dataset_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            os.path.basename(dataset_path)
+        )
     dataset = TextDataset(
-        config.data.dataset_path,
+        dataset_path,
         max_seq_length=config.data.max_seq_length
     )
 

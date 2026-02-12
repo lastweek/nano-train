@@ -7,7 +7,7 @@ Phase 2 will add gradient checkpointing.
 import torch
 import torch.nn as nn
 
-from src.core.config import ModelConfig
+from src.config import ModelConfig
 from src.models.attention import MultiHeadAttention
 from src.models.mlp import MLP
 
