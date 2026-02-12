@@ -9,8 +9,19 @@ from datetime import timedelta
 
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+# TensorBoard with graceful fallback
+try:
+    from tensorboardX import SummaryWriter
+except ImportError:
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        try:
+            from tensorboard import SummaryWriter
+        except ImportError:
+            SummaryWriter = None
 
 from src.core.config import Config
 from src.training.optimizer import create_optimizer
@@ -50,10 +61,14 @@ class Trainer:
         os.makedirs(config.log_dir, exist_ok=True)
 
         # TensorBoard writer
-        log_path = os.path.join(config.log_dir, config.run_name)
-        self.writer = SummaryWriter(log_path)
-        print(f"TensorBoard logs: {log_path}")
-        print(f"View with: tensorboard --logdir={config.log_dir}")
+        self.writer = None
+        if SummaryWriter is not None:
+            log_path = os.path.join(config.log_dir, config.run_name)
+            self.writer = SummaryWriter(log_path)
+            print(f"TensorBoard logs: {log_path}")
+            print(f"View with: python3 scripts/view_logs.py")
+        else:
+            print("TensorBoard not available. Install with: pip install tensorboard")
 
     def train(self):
         """Main training loop."""
@@ -111,33 +126,37 @@ class Trainer:
                     })
 
                     # TensorBoard logging
-                    self.writer.add_scalar('Loss/train', avg_loss, global_step)
-                    self.writer.add_scalar('LR', lr, global_step)
-                    self.writer.add_scalar('Time/step_seconds', step_time, global_step)
+                    if self.writer is not None:
+                        self.writer.add_scalar('Loss/train', avg_loss, global_step)
+                        self.writer.add_scalar('LR', lr, global_step)
+                        self.writer.add_scalar('Time/step_seconds', step_time, global_step)
 
                     window_time = time.time() - window_start_time
                     if window_time > 0:
                         steps_per_second = window_steps / window_time
                         tokens_per_second = window_tokens / window_time
                         samples_per_second = window_samples / window_time
-                        self.writer.add_scalar(
-                            'Throughput/steps_per_second',
-                            steps_per_second,
-                            global_step
-                        )
-                        self.writer.add_scalar(
-                            'Throughput/tokens_per_second',
-                            tokens_per_second,
-                            global_step
-                        )
-                        self.writer.add_scalar(
-                            'Throughput/samples_per_second',
-                            samples_per_second,
-                            global_step
-                        )
+                        if self.writer is not None:
+                            self.writer.add_scalar(
+                                'Throughput/steps_per_second',
+                                steps_per_second,
+                                global_step
+                            )
+                            self.writer.add_scalar(
+                                'Throughput/tokens_per_second',
+                                tokens_per_second,
+                                global_step
+                            )
+                            self.writer.add_scalar(
+                                'Throughput/samples_per_second',
+                                samples_per_second,
+                                global_step
+                            )
                     if grad_norm is not None:
-                        self.writer.add_scalar('Gradients/norm', grad_norm, global_step)
-                    self.writer.add_scalar('Parameters/norm', self._get_param_norm(), global_step)
+                        if self.writer is not None:
+                            self.writer.add_scalar('Gradients/norm', grad_norm, global_step)
+                    if self.writer is not None:
+                        self.writer.add_scalar('Parameters/norm', self._get_param_norm(), global_step)
                     if self.device.type == 'cuda':
                         allocated_mb = torch.cuda.memory_allocated(self.device) / (1024 ** 2)
                         reserved_mb = torch.cuda.memory_reserved(self.device) / (1024 ** 2)
@@ -145,18 +164,19 @@ class Trainer:
                             torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
                         )
                         max_reserved_mb = torch.cuda.max_memory_reserved(self.device) / (1024 ** 2)
-                        self.writer.add_scalar('Memory/allocated_mb', allocated_mb, global_step)
-                        self.writer.add_scalar('Memory/reserved_mb', reserved_mb, global_step)
-                        self.writer.add_scalar(
-                            'Memory/max_allocated_mb',
-                            max_allocated_mb,
-                            global_step
-                        )
-                        self.writer.add_scalar(
-                            'Memory/max_reserved_mb',
-                            max_reserved_mb,
-                            global_step
-                        )
+                        if self.writer is not None:
+                            self.writer.add_scalar('Memory/allocated_mb', allocated_mb, global_step)
+                            self.writer.add_scalar('Memory/reserved_mb', reserved_mb, global_step)
+                            self.writer.add_scalar(
+                                'Memory/max_allocated_mb',
+                                max_allocated_mb,
+                                global_step
+                            )
+                            self.writer.add_scalar(
+                                'Memory/max_reserved_mb',
+                                max_reserved_mb,
+                                global_step
+                            )
 
                     window_tokens = 0
                     window_samples = 0
@@ -185,19 +205,19 @@ class Trainer:
         print(f"Final loss: {losses[-1]:.4f}")
 
         # Log final metrics to TensorBoard
-        self.writer.add_scalar('Throughput/steps_per_second', steps_per_second, global_step)
-        self.writer.add_scalar('Throughput/tokens_per_second', tokens_per_second, global_step)
-        self.writer.add_scalar('Throughput/samples_per_second', samples_per_second, global_step)
-        self.writer.add_hparams(
-            {'learning_rate': str(self.config.training.learning_rate),
-             'batch_size': str(self.config.training.batch_size),
-             'max_steps': str(self.config.training.max_steps)},
-            {'final_loss': losses[-1],
-             'steps_per_second': steps_per_second}
-        )
-
-        # Close writer
-        self.writer.close()
+        if self.writer is not None:
+            self.writer.add_scalar('Throughput/steps_per_second', steps_per_second, global_step)
+            self.writer.add_scalar('Throughput/tokens_per_second', tokens_per_second, global_step)
+            self.writer.add_scalar('Throughput/samples_per_second', samples_per_second, global_step)
+            self.writer.add_hparams(
+                {'learning_rate': str(self.config.training.learning_rate),
+                     'batch_size': str(self.config.training.batch_size),
+                     'max_steps': str(self.config.training.max_steps)},
+                {'final_loss': losses[-1],
+                 'steps_per_second': steps_per_second}
+            )
+            # Close writer
+            self.writer.close()
 
     def training_step(self, batch, compute_grad_norm=False):
         """Single training step."""
