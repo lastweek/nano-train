@@ -56,5 +56,5 @@ class Config:
     # Output
     output_dir: str = "outputs"
     run_name: str = "nano_train_mvp"
-    log_dir: str = "logs"
+    log_dir: str = "outputs"
     seed: int = 42

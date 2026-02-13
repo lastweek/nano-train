@@ -16,58 +16,68 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import Config
+from src.logging import setup_logging, get_logger
 from src.models.transformer import TransformerModel
-from data.dataset import TextDataset, create_dataloader
+from src.dataset import TextDataset, create_dataloader
 from src.trainer import Trainer
+from src.utils import dump_model_info
+
+
+# Setup logging
+setup_logging(log_level="INFO")
+logger = get_logger(__name__)
+
+
+def resolve_dataset_path(dataset_path: str) -> str:
+    """Resolve dataset path relative to the examples directory."""
+    if os.path.isabs(dataset_path):
+        return dataset_path
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.basename(dataset_path)
+    )
+
+
+def print_config(config: Config) -> None:
+    """Print model and training configuration."""
+    logger.info("=" * 50)
+    logger.info("Nano-Train MVP - First Training Cycle")
+    logger.info("=" * 50)
+
+    logger.info("Model config:")
+    logger.info(f"  Hidden size: {config.model.hidden_size}")
+    logger.info(f"  Num layers: {config.model.num_layers}")
+    logger.info(f"  Num attention heads: {config.model.num_attention_heads}")
+    logger.info(f"  Intermediate size: {config.model.intermediate_size}")
+    logger.info(f"  Max position embeddings: {config.model.max_position_embeddings}")
+
+    logger.info("Training config:")
+    logger.info(f"  Batch size: {config.training.batch_size}")
+    logger.info(f"  Learning rate: {config.training.learning_rate}")
+    logger.info(f"  Max steps: {config.training.max_steps}")
+    logger.info(f"  Warmup steps: {config.training.warmup_steps}")
+    logger.info(f"  Use BF16: {config.training.bf16}")
 
 
 def main():
+
     # Configuration
     config = Config()
+    print_config(config)
 
-    # Print config
-    print("=" * 50)
-    print("Nano-Train MVP - First Training Cycle")
-    print("=" * 50)
-    print(f"\nModel config:")
-    print(f"  Hidden size: {config.model.hidden_size}")
-    print(f"  Num layers: {config.model.num_layers}")
-    print(f"  Num attention heads: {config.model.num_attention_heads}")
-    print(f"  Intermediate size: {config.model.intermediate_size}")
-    print(f"  Max position embeddings: {config.model.max_position_embeddings}")
-    print(f"\nTraining config:")
-    print(f"  Batch size: {config.training.batch_size}")
-    print(f"  Learning rate: {config.training.learning_rate}")
-    print(f"  Max steps: {config.training.max_steps}")
-    print(f"  Warmup steps: {config.training.warmup_steps}")
-    print(f"  Use BF16: {config.training.bf16}")
-    print()
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Training device: {device}")
 
-    # Create model
-    print("Creating model...")
-    model = TransformerModel(config.model)
-    print(f"Model created with {model.num_parameters:,} parameters")
-
-    print(model)
-
-    # Update vocab size based on dataset
-    print("\nLoading dataset...")
-    dataset_path = config.data.dataset_path
-    if not os.path.isabs(dataset_path):
-        dataset_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            os.path.basename(dataset_path)
-        )
+    # Load dataset first to determine vocab size
+    logger.info("Loading dataset...")
     dataset = TextDataset(
-        dataset_path,
+        resolve_dataset_path(config.data.dataset_path),
         max_seq_length=config.data.max_seq_length
     )
 
     # Update config with actual vocab size
     config.model.vocab_size = dataset.vocab_size
-    model = TransformerModel(config.model)
-    print(f"Model updated with vocab size: {config.model.vocab_size}")
-    print(f"Total parameters: {model.num_parameters:,}")
 
     # Create dataloader
     train_loader = create_dataloader(
@@ -76,27 +86,32 @@ def main():
         shuffle=True
     )
 
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nTraining device: {device}")
+    # Create model after vocab is known
+    logger.info("Creating model...")
+    model = TransformerModel(config.model)
+    logger.info(f"Model vocab size: {config.model.vocab_size}")
+    logger.info(f"Total parameters: {model.num_parameters:,}")
+    dump_model_info(model, logger=logger, plot_distributions=False)
 
     # Create trainer
     trainer = Trainer(model, config, train_loader, device)
 
+    exit()
+
     # Train
-    print("\n" + "=" * 50)
-    print("Starting training...")
-    print("=" * 50)
+    logger.info("=" * 50)
+    logger.info("Starting training...")
+    logger.info("=" * 50)
     trainer.train()
 
-    print("\n" + "=" * 50)
-    print("Training completed successfully!")
-    print("=" * 50)
-    print("\nNext steps:")
-    print("1. Check the loss curve in logs/")
-    print("2. Generate text from the trained model")
-    print("3. Increment: Add Flash Attention (Phase 2)")
-    print("4. Increment: Add Tensor Parallelism (Phase 3)")
+    logger.info("=" * 50)
+    logger.info("Training completed successfully!")
+    logger.info("=" * 50)
+    logger.info("Next steps:")
+    logger.info("1. Check the loss curve in outputs/")
+    logger.info("2. Generate text from the trained model")
+    logger.info("3. Increment: Add Flash Attention (Phase 2)")
+    logger.info("4. Increment: Add Tensor Parallelism (Phase 3)")
 
 
 if __name__ == "__main__":
