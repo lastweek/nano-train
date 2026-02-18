@@ -165,12 +165,13 @@ def test_dump_model_info_basic():
         assert "act fusion" in report_str
         assert "elementwise" in report_str
         assert "How These Numbers Are Calculated" in report_str
-        assert "Decode batch sweep varies `B` only" in report_str
+        assert "fixing (`B`, `L`, `EP`)" in report_str
         assert "AI_hbm = F_theory / bytes_hbm" in report_str
         assert "TF_est = F_theory / T_est / 1e12" in report_str
         assert "TF_roofline_hbm = min(P_peak, BW_hbm * AI_hbm / 1e12)" in report_str
         assert "T_est = max(T_comp, T_hbm, T_net)" in report_str
-        assert "Worked example (efficient, `B=128`" in report_str
+        assert "Worked example (efficient, `EP=" in report_str
+        assert "`B=128`" in report_str
         assert "Reading a Roofline Point" in report_str
         assert "**Interpretation**" in report_str
         assert (
@@ -256,20 +257,37 @@ def test_dump_model_info_basic():
                 assert line.startswith("We "), (
                     f"Subheading '{title}' should start with a narrative paragraph, got: {line!r}"
                 )
-                if title == "Decode Compute-Bound Exploration":
-                    assert not line.lstrip().startswith("- "), (
-                        "Decode compute-bound exploration should not start with a bullet list."
-                    )
                 return
             raise AssertionError(f"Subheading '{title}' missing prose paragraph after heading.")
 
         for subheading_title in [
             "Derivation Notes",
-            "Decode Compute-Bound Exploration",
             "Memory Feasibility",
             "Communication Envelope",
         ]:
             _assert_prose_after_subheading(subheading_title)
+
+        def _assert_prose_after_subsubheading(title: str) -> None:
+            heading_idx = None
+            for idx, line in enumerate(report_lines):
+                if line.startswith("#### ") and title in line:
+                    heading_idx = idx
+                    break
+            assert heading_idx is not None, f"Missing subsubheading: {title}"
+            for line in report_lines[heading_idx + 1: heading_idx + 30]:
+                if not line.strip():
+                    continue
+                assert line.startswith("We "), (
+                    f"Subsubheading '{title}' should start with a narrative paragraph, got: {line!r}"
+                )
+                return
+            raise AssertionError(f"Subsubheading '{title}' missing prose paragraph after heading.")
+
+        for subsubheading_title in [
+            "Decode Sweep (vary B, L, EP)",
+            "Prefill Sweep (vary B, S, EP)",
+        ]:
+            _assert_prose_after_subsubheading(subsubheading_title)
 
         first_kpi_index = report_str.find("Regime KPI Matrix (naive vs efficient)")
         if first_kpi_index == -1:
@@ -312,7 +330,8 @@ def test_dump_model_info_basic():
         assert ("Prefill" in report_str) or ("Prefill - Model KPIs" in report_str)
         assert ("Decode" in report_str) or ("Decode - Model KPIs" in report_str)
         assert ("Comparison Across Modes" in report_str) or ("Cross-Mode Summary" in report_str)
-        assert "Prefill Sequence Sweep - Model-Level" in report_str
+        assert "Decode Sweep (vary B, L, EP)" in report_str
+        assert "Prefill Sweep (vary B, S, EP)" in report_str
         assert "KV-cache dtype bytes" in report_str
         assert "`C_kv` mapping" in report_str
         assert "MFU_est" in report_str
@@ -814,6 +833,7 @@ def test_sensitivity_grid_cardinality():
         sensitivity_cfg=cfg,
         batch_size=2,
         seq_len=8,
+        ep_size_override=None,
         activation_bytes=1,
         kv_cache_bytes=1,
         param_bytes_assumed=1,
@@ -896,6 +916,7 @@ def test_sensitivity_deepseek_does_not_scan_named_modules():
         sensitivity_cfg=sensitivity_cfg,
         batch_size=2,
         seq_len=8,
+        ep_size_override=1,
         activation_bytes=1,
         kv_cache_bytes=1,
         param_bytes_assumed=1,
@@ -910,6 +931,54 @@ def test_sensitivity_deepseek_does_not_scan_named_modules():
     assert len(points["naive"]) == 1
 
     print("  ✓ DeepSeek sensitivity avoids named_modules scans")
+
+
+def test_ep_inference_defaults_to_four_experts_per_gpu():
+    """Ensure report defaults to ~4 routed experts per GPU when ep_size is not provided."""
+    print("Testing EP inference defaults to ~4 experts per GPU...")
+
+    cfg = DeepSeekModelConfig(
+        vocab_size=128,
+        hidden_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        n_routed_experts=8,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=8,
+        n_group=1,
+        topk_group=1,
+        dropout=0.0,
+        max_position_embeddings=128,
+    )
+    model = DeepSeekModel(cfg)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        report_path = os.path.join(tmpdir, "model_report.md")
+        model_info = dump_model_info(
+            model=model,
+            logger=None,
+            report_path=report_path,
+            plot_distributions=False,
+            plot_roofline=False,
+            sensitivity_enable=False,
+            include_architecture_diagrams=False,
+            include_appendix_derivations=False,
+        )
+        report_text = Path(model_info.report_path).read_text(encoding="utf-8")
+        assert "| Expert parallel size (`EP`) | `2` |" in report_text
+        assert "| Routed experts per GPU (`E/EP`) | `4` |" in report_text
+
+    print("  ✓ EP inference matches 4 experts/GPU default")
 
 
 def test_roofline_piecewise_curve_correctness():

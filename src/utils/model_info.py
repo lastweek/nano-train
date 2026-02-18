@@ -324,6 +324,49 @@ class SweepPoint:
     t_est_ms: float
     flops_realizable: float = 0.0
 
+
+@dataclass
+class DecodeWorkloadPoint:
+    """Decode operating point for workload sweeps varying (B, L, EP)."""
+
+    batch: int
+    cache_len: int
+    ep_size: int
+    flops: float
+    flops_realizable: float
+    bytes_hbm: float
+    bytes_net: float
+    bytes_total: float
+    ai_hbm: float
+    ai_total: float
+    regime: str
+    t_comp_ms: float
+    t_hbm_ms: float
+    t_net_ms: float
+    t_est_ms: float
+
+
+@dataclass
+class PrefillWorkloadPoint:
+    """Prefill operating point for workload sweeps varying (B, S, EP)."""
+
+    batch: int
+    seq_len: int
+    ep_size: int
+    flops: float
+    flops_realizable: float
+    bytes_hbm: float
+    bytes_net: float
+    bytes_total: float
+    ai_hbm: float
+    ai_total: float
+    regime: str
+    t_comp_ms: float
+    t_hbm_ms: float
+    t_net_ms: float
+    t_est_ms: float
+
+
 @dataclass
 class DecodeEPExplorationConfig:
     """Configuration for decode compute-bound exploration under DP=EP, TP=1 assumptions."""
@@ -333,6 +376,17 @@ class DecodeEPExplorationConfig:
     max_batch_per_gpu: int = 16384
     weight_residency_factor: float = 1.0  # 1.0 = stream weights; >1 amortizes weights (effective bytes /= factor)
     kv_element_bytes: Optional[int] = None  # if None, use kv_cache_bytes
+
+
+@dataclass
+class ParallelismAssumptions:
+    """Per-report parallelism assumptions used to interpret MoE sharding and network attribution."""
+
+    tp_size: int
+    ep_size: int
+    n_routed_experts: Optional[int]
+    routed_experts_per_gpu: Optional[int]
+    ep_from_config: bool
 
 
 def _format_number(num: float) -> str:
@@ -488,6 +542,203 @@ def _b_crit_from_sweep(points: List[SweepPoint], ai_knee: float) -> Optional[flo
     return None
 
 
+def _default_ep_sweep_sizes(
+    n_routed_experts: Optional[int],
+    anchor_ep_size: int,
+) -> List[int]:
+    """Return a small EP sweep list around the anchor (E/8, E/4, E/2) when E is known."""
+    anchor_ep_size = max(1, int(anchor_ep_size))
+    if n_routed_experts is None or n_routed_experts <= 0:
+        return [anchor_ep_size]
+
+    E = int(n_routed_experts)
+    candidates = [
+        int(math.ceil(float(E) / 8.0)),
+        int(math.ceil(float(E) / 4.0)),
+        int(math.ceil(float(E) / 2.0)),
+        anchor_ep_size,
+    ]
+    eps = sorted({max(1, min(E, int(ep))) for ep in candidates})
+    if anchor_ep_size not in eps:
+        eps.append(anchor_ep_size)
+        eps = sorted(set(eps))
+    return eps
+
+
+def _default_decode_cache_lengths(
+    anchor_seq_len: int,
+    max_position_embeddings: Optional[int],
+) -> List[int]:
+    """Return decode KV-cache lengths `L` to evaluate, filtered to model max positions if known."""
+    anchor_seq_len = max(1, int(anchor_seq_len))
+    candidates = [anchor_seq_len, 2048, 4096, 8192, 16384]
+    max_pos = int(max_position_embeddings) if max_position_embeddings is not None else None
+    lengths: List[int] = []
+    for value in candidates:
+        if value <= 0:
+            continue
+        if max_pos is not None and value > max_pos:
+            continue
+        lengths.append(int(value))
+    return sorted(set(lengths))
+
+
+def _default_prefill_batch_sizes(anchor_batch_size: int) -> List[int]:
+    """Return a small prefill batch sweep list used for roofline-space curves."""
+    candidates = [1, int(anchor_batch_size), 32]
+    return sorted({b for b in candidates if b > 0})
+
+
+def _run_decode_workload_sweep(
+    model: torch.nn.Module,
+    execution_models: List[ExecutionModelConfig],
+    batch_sizes: List[int],
+    cache_lengths: List[int],
+    ep_sizes: List[int],
+    activation_bytes: int,
+    kv_cache_bytes: int,
+    param_bytes_assumed: int,
+    roofline: RooflineConfig,
+    interconnect_bw_gbps: float,
+    training_flops_multiplier: float,
+    training_bytes_multiplier: float,
+    tc_cfg: TensorCoreModelConfig,
+    module_weight_bytes_cache: Optional[Dict[int, float]],
+    progress_cb=None,
+) -> Dict[str, List[DecodeWorkloadPoint]]:
+    """Return decode sweep points for the cartesian product of (B, L, EP) for each exec model."""
+    points_by_exec: Dict[str, List[DecodeWorkloadPoint]] = {
+        exec_model.name: [] for exec_model in execution_models
+    }
+    total = max(1, len(execution_models) * len(batch_sizes) * len(cache_lengths) * len(ep_sizes))
+    done = 0
+    for exec_model in execution_models:
+        for ep_size in ep_sizes:
+            for cache_len in cache_lengths:
+                for batch in batch_sizes:
+                    done += 1
+                    if progress_cb is not None and done % 50 == 0:
+                        progress_cb(f"Decode workload sweep progress: {done}/{total}")
+                    eff = _estimate_efficiency(
+                        model=model,
+                        batch_size=batch,
+                        seq_len=cache_len,
+                        activation_bytes=activation_bytes,
+                        kv_cache_bytes=kv_cache_bytes,
+                        param_bytes_assumed=param_bytes_assumed,
+                        roofline=roofline,
+                        interconnect_bw_gbps=interconnect_bw_gbps,
+                        training_flops_multiplier=training_flops_multiplier,
+                        training_bytes_multiplier=training_bytes_multiplier,
+                        exec_model=exec_model,
+                        tc_cfg=tc_cfg,
+                        module_weight_bytes_cache=module_weight_bytes_cache,
+                        modes_to_estimate=("decode",),
+                        ep_size_override=ep_size,
+                    )
+                    stats = _summarize_mode_entries(
+                        mode="decode",
+                        entries_for_mode=eff["decode"],
+                        roofline=roofline,
+                        interconnect_bw_gbps=interconnect_bw_gbps,
+                    )
+                    points_by_exec[exec_model.name].append(
+                        DecodeWorkloadPoint(
+                            batch=batch,
+                            cache_len=cache_len,
+                            ep_size=ep_size,
+                            flops=stats.flops_theory,
+                            flops_realizable=stats.flops_realizable,
+                            bytes_hbm=stats.bytes_hbm,
+                            bytes_net=stats.bytes_net,
+                            bytes_total=stats.bytes_total,
+                            ai_hbm=stats.ai_hbm,
+                            ai_total=stats.ai_total,
+                            regime=stats.regime,
+                            t_comp_ms=stats.t_comp * 1000.0,
+                            t_hbm_ms=stats.t_hbm * 1000.0,
+                            t_net_ms=stats.t_net * 1000.0,
+                            t_est_ms=stats.t_est * 1000.0,
+                        )
+                    )
+    return points_by_exec
+
+
+def _run_prefill_workload_sweep(
+    model: torch.nn.Module,
+    execution_models: List[ExecutionModelConfig],
+    batch_sizes: List[int],
+    seq_lengths: List[int],
+    ep_sizes: List[int],
+    activation_bytes: int,
+    kv_cache_bytes: int,
+    param_bytes_assumed: int,
+    roofline: RooflineConfig,
+    interconnect_bw_gbps: float,
+    training_flops_multiplier: float,
+    training_bytes_multiplier: float,
+    tc_cfg: TensorCoreModelConfig,
+    module_weight_bytes_cache: Optional[Dict[int, float]],
+    progress_cb=None,
+) -> Dict[str, List[PrefillWorkloadPoint]]:
+    """Return prefill sweep points for the cartesian product of (B, S, EP) for each exec model."""
+    points_by_exec: Dict[str, List[PrefillWorkloadPoint]] = {
+        exec_model.name: [] for exec_model in execution_models
+    }
+    total = max(1, len(execution_models) * len(batch_sizes) * len(seq_lengths) * len(ep_sizes))
+    done = 0
+    for exec_model in execution_models:
+        for ep_size in ep_sizes:
+            for seq_len in seq_lengths:
+                for batch in batch_sizes:
+                    done += 1
+                    if progress_cb is not None and done % 50 == 0:
+                        progress_cb(f"Prefill workload sweep progress: {done}/{total}")
+                    eff = _estimate_efficiency(
+                        model=model,
+                        batch_size=batch,
+                        seq_len=seq_len,
+                        activation_bytes=activation_bytes,
+                        kv_cache_bytes=kv_cache_bytes,
+                        param_bytes_assumed=param_bytes_assumed,
+                        roofline=roofline,
+                        interconnect_bw_gbps=interconnect_bw_gbps,
+                        training_flops_multiplier=training_flops_multiplier,
+                        training_bytes_multiplier=training_bytes_multiplier,
+                        exec_model=exec_model,
+                        tc_cfg=tc_cfg,
+                        module_weight_bytes_cache=module_weight_bytes_cache,
+                        modes_to_estimate=("prefill",),
+                        ep_size_override=ep_size,
+                    )
+                    stats = _summarize_mode_entries(
+                        mode="prefill",
+                        entries_for_mode=eff["prefill"],
+                        roofline=roofline,
+                        interconnect_bw_gbps=interconnect_bw_gbps,
+                    )
+                    points_by_exec[exec_model.name].append(
+                        PrefillWorkloadPoint(
+                            batch=batch,
+                            seq_len=seq_len,
+                            ep_size=ep_size,
+                            flops=stats.flops_theory,
+                            flops_realizable=stats.flops_realizable,
+                            bytes_hbm=stats.bytes_hbm,
+                            bytes_net=stats.bytes_net,
+                            bytes_total=stats.bytes_total,
+                            ai_hbm=stats.ai_hbm,
+                            ai_total=stats.ai_total,
+                            regime=stats.regime,
+                            t_comp_ms=stats.t_comp * 1000.0,
+                            t_hbm_ms=stats.t_hbm * 1000.0,
+                            t_net_ms=stats.t_net * 1000.0,
+                            t_est_ms=stats.t_est * 1000.0,
+                        )
+                    )
+    return points_by_exec
+
+
 def _sensitivity_config_from_profile(profile: str) -> SensitivityConfig:
     """Create sensitivity config from profile name."""
     if profile != "medium_full_grid":
@@ -622,6 +873,72 @@ def _infer_architecture(model: torch.nn.Module) -> Dict[str, str]:
         info["family"] = "Transformer"
 
     return info
+
+
+def _infer_parallelism_assumptions(
+    model: torch.nn.Module,
+    target_routed_experts_per_gpu: int = 4,
+) -> ParallelismAssumptions:
+    """
+    Infer TP/EP assumptions for report generation.
+
+    Rationale:
+    Many model configs do not declare `ep_size`. For large routed-MoE models, `EP=1` implies all
+    experts live on one GPU, which is typically unrealistic. When `ep_size` is not explicitly
+    provided by the model config, we infer EP by targeting a small routed-expert set per GPU.
+    """
+    cfg = getattr(model, "config", None)
+    tp_size = 1
+    if cfg is not None and hasattr(cfg, "tp_size"):
+        try:
+            tp_size = int(getattr(cfg, "tp_size") or 1)
+        except Exception:
+            tp_size = 1
+    tp_size = max(1, int(tp_size))
+
+    n_routed_experts: Optional[int] = None
+    if cfg is not None:
+        for key in ["n_routed_experts", "num_experts", "n_experts", "experts"]:
+            if not hasattr(cfg, key):
+                continue
+            value = getattr(cfg, key)
+            if isinstance(value, int) and value > 0:
+                n_routed_experts = int(value)
+                break
+
+    ep_size = 1
+    ep_from_config = False
+    if cfg is not None and hasattr(cfg, "ep_size"):
+        try:
+            cfg_ep_size = int(getattr(cfg, "ep_size") or 0)
+        except Exception:
+            cfg_ep_size = 0
+        if cfg_ep_size > 0:
+            ep_size = cfg_ep_size
+            ep_from_config = True
+
+    if (
+        not ep_from_config
+        and n_routed_experts is not None
+        and n_routed_experts > 0
+    ):
+        target = max(1, int(target_routed_experts_per_gpu))
+        ep_size = int(math.ceil(float(n_routed_experts) / float(target)))
+
+    ep_size = max(1, int(ep_size))
+    if n_routed_experts is not None and n_routed_experts > 0:
+        ep_size = min(ep_size, int(n_routed_experts))
+        routed_experts_per_gpu = int(math.ceil(float(n_routed_experts) / float(ep_size)))
+    else:
+        routed_experts_per_gpu = None
+
+    return ParallelismAssumptions(
+        tp_size=tp_size,
+        ep_size=ep_size,
+        n_routed_experts=n_routed_experts,
+        routed_experts_per_gpu=routed_experts_per_gpu,
+        ep_from_config=ep_from_config,
+    )
 
 
 def _collect_layer_info(model: torch.nn.Module) -> List[LayerInfo]:
@@ -892,6 +1209,7 @@ def _estimate_moe_dispatch_bytes(
     seq_len: int,
     activation_bytes: int,
     top_k_override: Optional[int] = None,
+    ep_size_override: Optional[int] = None,
     hidden_scale: float = 1.0,
 ) -> Tuple[float, float]:
     """
@@ -901,7 +1219,11 @@ def _estimate_moe_dispatch_bytes(
       (intra_device_bytes, inter_device_bytes_estimate)
     """
     cfg = getattr(model, "config", None)
-    ep_size = int(getattr(cfg, "ep_size", 1) or 1)
+    if ep_size_override is None:
+        ep_size = int(getattr(cfg, "ep_size", 1) or 1)
+    else:
+        ep_size = int(ep_size_override)
+    ep_size = max(1, ep_size)
 
     if _is_deepseek_model(model) and cfg is not None:
         _, moe_layers = _deepseek_layer_counts(cfg)
@@ -1007,6 +1329,7 @@ def _estimate_efficiency_deepseek_fast(
     top_k_override: Optional[int],
     hidden_scale: float,
     kv_rank_scale: float,
+    ep_size: int,
     requested_modes: set,
     module_weight_bytes_cache: Optional[Dict[int, float]],
 ) -> Dict[str, List[EfficiencyEntry]]:
@@ -1059,7 +1382,9 @@ def _estimate_efficiency_deepseek_fast(
         top_k = int(top_k_override)
     top_k = max(1, min(max(1, n_routed_experts), top_k))
 
-    ep_size = int(getattr(cfg, "ep_size", 1) or 1)
+    ep_size = max(1, int(ep_size))
+    if n_routed_experts > 0:
+        ep_size = min(ep_size, n_routed_experts)
 
     # Representative modules.
     blocks = getattr(model, "blocks", [])
@@ -1936,6 +2261,8 @@ def _estimate_efficiency(
     modes_to_estimate: Optional[Tuple[str, ...]] = None,
     attention_names_override: Optional[List[str]] = None,
     moe_active_fractions_override: Optional[Dict[str, float]] = None,
+    ep_size_override: Optional[int] = None,
+    tp_size_override: Optional[int] = None,
 ) -> Dict[str, List[EfficiencyEntry]]:
     exec_model.validate()
     tc_cfg.validate()
@@ -1955,6 +2282,15 @@ def _estimate_efficiency(
     need_decode = "decode" in requested_modes
 
     if _is_deepseek_model(model):
+        cfg = getattr(model, "config", None)
+        if ep_size_override is None:
+            ep_size = int(getattr(cfg, "ep_size", 1) or 1)
+        else:
+            ep_size = int(ep_size_override)
+        ep_size = max(1, ep_size)
+        n_routed = int(getattr(cfg, "n_routed_experts", 0) or 0) if cfg is not None else 0
+        if n_routed > 0:
+            ep_size = min(ep_size, n_routed)
         return _estimate_efficiency_deepseek_fast(
             model=model,
             batch_size=batch_size,
@@ -1971,6 +2307,7 @@ def _estimate_efficiency(
             top_k_override=top_k_override,
             hidden_scale=hidden_scale,
             kv_rank_scale=kv_rank_scale,
+            ep_size=ep_size,
             requested_modes=requested_modes,
             module_weight_bytes_cache=module_weight_bytes_cache,
         )
@@ -2402,6 +2739,7 @@ def _estimate_efficiency(
             seq_len=seq_len,
             activation_bytes=activation_bytes,
             top_k_override=top_k_override,
+            ep_size_override=ep_size_override,
             hidden_scale=hidden_scale,
         )
         if inter_dispatch_bytes > 0.0:
@@ -2924,6 +3262,203 @@ def _plot_decode_batch_roofline(
     return output_path
 
 
+def _plot_decode_bl_roofline(
+    points_by_exec: Dict[str, List[DecodeWorkloadPoint]],
+    primary_roofline: RooflineConfig,
+    roofline_targets: List[RooflineConfig],
+    output_path: str,
+    anchor_ep_size: int,
+    cache_lengths: List[int],
+    batch_sizes: List[int],
+    activation_bytes: int,
+    kv_cache_bytes: int,
+    routed_experts_per_gpu: Optional[int],
+    roofline_x_limits: Optional[Tuple[float, float]],
+    roofline_y_limits: Optional[Tuple[float, float]],
+    roofline_label_mode: str,
+) -> Optional[str]:
+    """Plot decode sweep in roofline space for the cartesian product of (B, L) at fixed EP."""
+    try:
+        import matplotlib
+        import matplotlib.pyplot as plt
+        matplotlib.use("Agg")
+    except ImportError:
+        return None
+
+    def tf_est(point: DecodeWorkloadPoint) -> float:
+        if point.t_est_ms <= 0.0:
+            return 0.0
+        return point.flops / ((point.t_est_ms / 1000.0) * 1e12)
+
+    cache_lengths = sorted({int(value) for value in cache_lengths if int(value) > 0})
+    batch_sizes = sorted({int(value) for value in batch_sizes if int(value) > 0})
+    anchor_ep_size = max(1, int(anchor_ep_size))
+
+    selected: Dict[str, List[DecodeWorkloadPoint]] = {}
+    for exec_name in ["naive", "efficient"]:
+        selected[exec_name] = [
+            point
+            for point in points_by_exec.get(exec_name, [])
+            if point.ep_size == anchor_ep_size
+            and point.cache_len in cache_lengths
+            and point.batch in batch_sizes
+            and point.ai_hbm > 0.0
+            and point.t_est_ms > 0.0
+        ]
+    if not selected["naive"] and not selected["efficient"]:
+        return None
+
+    all_points = selected["naive"] + selected["efficient"]
+    point_intensities = [point.ai_hbm for point in all_points]
+    point_tflops = [tf_est(point) for point in all_points]
+    (min_intensity, max_intensity), (min_tflops, max_tflops) = _resolve_roofline_axis_limits(
+        roofline_targets=roofline_targets,
+        point_intensities=point_intensities,
+        point_tflops=point_tflops,
+        requested_x_limits=roofline_x_limits,
+        requested_y_limits=roofline_y_limits,
+    )
+
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.6), sharex=True, sharey=True)
+    exec_order = ["naive", "efficient"]
+    for ax, exec_name in zip(axes, exec_order):
+        _draw_roofline_chip_lines(ax, roofline_targets, min_intensity, max_intensity)
+        points = selected.get(exec_name, [])
+        if not points:
+            ax.set_title(f"{exec_name} (no points)")
+            continue
+
+        grouped: Dict[int, List[DecodeWorkloadPoint]] = {}
+        for point in points:
+            grouped.setdefault(point.cache_len, []).append(point)
+
+        palette = (
+            plt.cm.viridis(np.linspace(0.15, 0.95, len(cache_lengths)))
+            if np is not None
+            else None
+        )
+        for idx, cache_len in enumerate(cache_lengths):
+            series = grouped.get(cache_len, [])
+            if not series:
+                continue
+            series_sorted = sorted(series, key=lambda p: p.batch)
+            xs = [p.ai_hbm for p in series_sorted]
+            ys = [tf_est(p) for p in series_sorted]
+            color = palette[idx] if palette is not None else None
+            ax.plot(
+                xs,
+                ys,
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.85,
+                color=color,
+                label=f"L={cache_len}",
+            )
+            ax.scatter(xs, ys, s=26, alpha=0.9, color=color)
+            if roofline_label_mode == "full":
+                for point in series_sorted:
+                    ax.annotate(
+                        f"B={point.batch}",
+                        (point.ai_hbm, tf_est(point)),
+                        textcoords="offset points",
+                        xytext=(4, 4),
+                        fontsize=7,
+                    )
+
+        experts_label = (
+            f"E/EP={routed_experts_per_gpu}" if routed_experts_per_gpu is not None else "E/EP=?"
+        )
+        ax.set_title(f"{exec_name} (EP={anchor_ep_size}, {experts_label})")
+        ax.set_xlim(min_intensity, max_intensity)
+        ax.set_ylim(min_tflops, max_tflops)
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+        ax.legend(loc="lower right", fontsize=8)
+
+    axes[0].set_ylabel("Estimated TFLOPs (TF_est)")
+    for ax in axes:
+        ax.set_xlabel("Arithmetic intensity (FLOPs / byte)")
+    fig.suptitle(
+        f"Decode Roofline Sweep (primary={primary_roofline.name})\n"
+        f"vary B and L, fixed EP={anchor_ep_size}, A={activation_bytes}B, A_kv={kv_cache_bytes}B",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_decode_ep_l_minbg_heatmap(
+    exploration_metrics: Dict[Tuple[int, int], Dict[str, float]],
+    ep_sizes: List[int],
+    cache_lengths: List[int],
+    primary_roofline: RooflineConfig,
+    output_path: str,
+    alpha: float,
+) -> Optional[str]:
+    """Plot a heatmap of compute-feasible `min B_g` over (EP, L)."""
+    try:
+        import matplotlib
+        import matplotlib.pyplot as plt
+        from matplotlib import colors
+        matplotlib.use("Agg")
+    except ImportError:
+        return None
+
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    ep_sizes = sorted({int(value) for value in ep_sizes if int(value) > 0})
+    cache_lengths = sorted({int(value) for value in cache_lengths if int(value) > 0})
+    if not ep_sizes or not cache_lengths:
+        return None
+
+    grid = np.full((len(ep_sizes), len(cache_lengths)), np.nan, dtype=float)
+    for i, ep in enumerate(ep_sizes):
+        for j, cache_len in enumerate(cache_lengths):
+            metrics = exploration_metrics.get((ep, cache_len))
+            if metrics is None:
+                continue
+            min_bg = metrics.get("min_bg")
+            if min_bg is None or (isinstance(min_bg, float) and math.isnan(min_bg)):
+                continue
+            grid[i, j] = float(min_bg)
+
+    positive = grid[np.isfinite(grid) & (grid > 0)]
+    if positive.size == 0:
+        return None
+
+    fig, ax = plt.subplots(figsize=(9.2, 4.8))
+    cmap = plt.cm.viridis.copy()
+    cmap.set_bad(color="#e6e6e6")
+    norm = colors.LogNorm(vmin=float(positive.min()), vmax=float(positive.max()))
+    im = ax.imshow(grid, aspect="auto", cmap=cmap, norm=norm)
+
+    ax.set_xticks(list(range(len(cache_lengths))))
+    ax.set_xticklabels([str(value) for value in cache_lengths], rotation=0)
+    ax.set_xlabel("KV length L")
+    ax.set_yticks(list(range(len(ep_sizes))))
+    ax.set_yticklabels([str(value) for value in ep_sizes])
+    ax.set_ylabel("Expert parallel size EP")
+    ax.set_title(
+        f"Decode Compute-Feasible Frontier: min B_g (primary={primary_roofline.name}, alpha={alpha:.2f})"
+    )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("min B_g (log scale)")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    return output_path
+
+
 def _plot_prefill_sequence_roofline(
     points_by_exec: Dict[str, List[SweepPoint]],
     primary_roofline: RooflineConfig,
@@ -3014,6 +3549,117 @@ def _plot_prefill_sequence_roofline(
     ax.set_ylim(min_tflops, max_tflops)
     ax.legend(loc="lower right", fontsize=8)
 
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    return output_path
+
+
+def _plot_prefill_bs_roofline(
+    points_by_exec: Dict[str, List[PrefillWorkloadPoint]],
+    primary_roofline: RooflineConfig,
+    roofline_targets: List[RooflineConfig],
+    output_path: str,
+    anchor_ep_size: int,
+    batch_sizes: List[int],
+    activation_bytes: int,
+    kv_cache_bytes: int,
+    routed_experts_per_gpu: Optional[int],
+    roofline_x_limits: Optional[Tuple[float, float]],
+    roofline_y_limits: Optional[Tuple[float, float]],
+    roofline_label_mode: str,
+) -> Optional[str]:
+    """Plot prefill sweep in roofline space for an S sweep at multiple B with fixed EP."""
+    try:
+        import matplotlib
+        import matplotlib.pyplot as plt
+        matplotlib.use("Agg")
+    except ImportError:
+        return None
+
+    def tf_est(point: PrefillWorkloadPoint) -> float:
+        if point.t_est_ms <= 0.0:
+            return 0.0
+        return point.flops / ((point.t_est_ms / 1000.0) * 1e12)
+
+    anchor_ep_size = max(1, int(anchor_ep_size))
+    batch_sizes = sorted({int(value) for value in batch_sizes if int(value) > 0})
+    selected: Dict[str, List[PrefillWorkloadPoint]] = {}
+    for exec_name in ["naive", "efficient"]:
+        selected[exec_name] = [
+            point
+            for point in points_by_exec.get(exec_name, [])
+            if point.ep_size == anchor_ep_size
+            and point.batch in batch_sizes
+            and point.ai_hbm > 0.0
+            and point.t_est_ms > 0.0
+        ]
+    if not selected["naive"] and not selected["efficient"]:
+        return None
+
+    all_points = selected["naive"] + selected["efficient"]
+    point_intensities = [point.ai_hbm for point in all_points]
+    point_tflops = [tf_est(point) for point in all_points]
+    (min_intensity, max_intensity), (min_tflops, max_tflops) = _resolve_roofline_axis_limits(
+        roofline_targets=roofline_targets,
+        point_intensities=point_intensities,
+        point_tflops=point_tflops,
+        requested_x_limits=roofline_x_limits,
+        requested_y_limits=roofline_y_limits,
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.6, 5.6), sharex=True, sharey=True)
+    exec_order = ["naive", "efficient"]
+    for ax, exec_name in zip(axes, exec_order):
+        _draw_roofline_chip_lines(ax, roofline_targets, min_intensity, max_intensity)
+        points = selected.get(exec_name, [])
+        grouped: Dict[int, List[PrefillWorkloadPoint]] = {}
+        for point in points:
+            grouped.setdefault(point.batch, []).append(point)
+
+        for batch in batch_sizes:
+            series = grouped.get(batch, [])
+            if not series:
+                continue
+            series_sorted = sorted(series, key=lambda p: p.seq_len)
+            xs = [p.ai_hbm for p in series_sorted]
+            ys = [tf_est(p) for p in series_sorted]
+            ax.plot(
+                xs,
+                ys,
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.85,
+                label=f"B={batch}",
+            )
+            ax.scatter(xs, ys, s=26, alpha=0.9)
+            if roofline_label_mode == "full":
+                for point in series_sorted:
+                    ax.annotate(
+                        f"S={point.seq_len}",
+                        (point.ai_hbm, tf_est(point)),
+                        textcoords="offset points",
+                        xytext=(4, 4),
+                        fontsize=7,
+                    )
+
+        experts_label = (
+            f"E/EP={routed_experts_per_gpu}" if routed_experts_per_gpu is not None else "E/EP=?"
+        )
+        ax.set_title(f"{exec_name} (EP={anchor_ep_size}, {experts_label})")
+        ax.set_xlim(min_intensity, max_intensity)
+        ax.set_ylim(min_tflops, max_tflops)
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+        ax.legend(loc="lower right", fontsize=8)
+
+    axes[0].set_ylabel("Estimated TFLOPs (TF_est)")
+    for ax in axes:
+        ax.set_xlabel("Arithmetic intensity (FLOPs / byte)")
+    fig.suptitle(
+        f"Prefill Roofline Sweep (primary={primary_roofline.name})\n"
+        f"vary B and S, fixed EP={anchor_ep_size}, A={activation_bytes}B, A_kv={kv_cache_bytes}B",
+        fontsize=11,
+    )
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
     plt.close(fig)
@@ -3202,9 +3848,8 @@ def _default_prefill_seq_lengths(model: torch.nn.Module, base_seq_len: int) -> L
     if model_max_seq > 32768:
         sweep.append(model_max_seq)
     if base_seq_len > 0 and base_seq_len <= model_max_seq:
-        near_existing = any(abs(seq - base_seq_len) <= max(8, int(0.05 * max(1, base_seq_len))) for seq in sweep)
-        if not near_existing:
-            sweep.append(base_seq_len)
+        # Always include the anchor length used for the report's base prefill KPIs.
+        sweep.append(base_seq_len)
     if not sweep:
         sweep = [max(1, base_seq_len)]
 
@@ -3616,6 +4261,7 @@ def _run_sensitivity_analysis(
     sensitivity_cfg: SensitivityConfig,
     batch_size: int,
     seq_len: int,
+    ep_size_override: Optional[int],
     activation_bytes: int,
     kv_cache_bytes: int,
     param_bytes_assumed: int,
@@ -3687,6 +4333,7 @@ def _run_sensitivity_analysis(
                 modes_to_estimate=("decode",),
                 attention_names_override=attention_names if attention_names else None,
                 moe_active_fractions_override=moe_fraction_cache.get(top_k),
+                ep_size_override=ep_size_override,
             )
             mode_kpi = _summarize_mode_entries(
                 mode="decode",
@@ -4173,7 +4820,7 @@ def _validate_report_term_hygiene(markdown_text: str) -> None:
     kpi_markers = [
         "Regime KPI Matrix (naive vs efficient)",
         "Cross-Mode Summary (naive vs efficient)",
-        "Decode Batch Sweep - Model-Level (naive vs efficient)",
+        "Decode Sweep (vary B, L, EP)",
     ]
     marker_positions = [markdown_text.find(marker) for marker in kpi_markers if marker in markdown_text]
     if marker_positions:
@@ -4547,6 +5194,13 @@ def dump_model_info(
     module_patterns = _aggregate_module_patterns(module_sizes)
     _progress("Inferred architecture and module size breakdown.")
 
+    parallelism = _infer_parallelism_assumptions(
+        model=model,
+        target_routed_experts_per_gpu=4,
+    )
+    tp_size_assumed = parallelism.tp_size
+    ep_size_assumed = parallelism.ep_size
+
     def summarize_mode(mode: str, entries_for_mode: List[EfficiencyEntry]) -> ModeKpiExtended:
         return _summarize_mode_entries(
             mode=mode,
@@ -4585,8 +5239,8 @@ def dump_model_info(
     execution_models = default_execution_models()
     module_weight_bytes_cache: Dict[int, float] = {}
     efficiency_by_exec: Dict[str, Dict[str, List[EfficiencyEntry]]] = {}
-    decode_sweep_by_exec: Dict[str, List[SweepPoint]] = {}
-    prefill_sweep_by_exec: Dict[str, List[SweepPoint]] = {}
+    decode_workload_points_by_exec: Dict[str, List[DecodeWorkloadPoint]] = {}
+    prefill_workload_points_by_exec: Dict[str, List[PrefillWorkloadPoint]] = {}
     mode_category_shares_by_exec: Dict[str, Dict[str, Dict[str, Tuple[float, float]]]] = {}
     _progress(
         "Estimating static efficiency for execution modes: "
@@ -4609,102 +5263,134 @@ def dump_model_info(
             exec_model=execution_model,
             tc_cfg=tc_cfg,
             module_weight_bytes_cache=module_weight_bytes_cache,
+            ep_size_override=ep_size_assumed,
+            tp_size_override=tp_size_assumed,
         )
         efficiency_by_exec[execution_model.name] = efficiency
         mode_category_shares_by_exec[execution_model.name] = compute_mode_category_shares(efficiency)
-
-        decode_points: List[SweepPoint] = []
-        _progress(
-            f"Running decode sweep (exec={execution_model.name}) over "
-            f"{len(decode_batch_sizes)} batch sizes..."
-        )
-        for idx, sweep_batch in enumerate(decode_batch_sizes, start=1):
-            _progress(
-                f"Decode sweep {idx}/{len(decode_batch_sizes)} "
-                f"(exec={execution_model.name}): B={sweep_batch}"
-            )
-            sweep = _estimate_efficiency(
-                model=model,
-                batch_size=sweep_batch,
-                seq_len=seq_len,
-                activation_bytes=activation_bytes,
-                kv_cache_bytes=kv_cache_bytes,
-                param_bytes_assumed=param_bytes_assumed,
-                roofline=primary_roofline,
-                interconnect_bw_gbps=interconnect_bw_gbps,
-                training_flops_multiplier=training_flops_multiplier,
-                training_bytes_multiplier=training_bytes_multiplier,
-                exec_model=execution_model,
-                tc_cfg=tc_cfg,
-                module_weight_bytes_cache=module_weight_bytes_cache,
-            )
-            stats = summarize_mode("decode", sweep["decode"])
-            decode_points.append(
-                SweepPoint(
-                    x=sweep_batch,
-                    flops=stats.flops_theory,
-                    bytes_hbm=stats.bytes_hbm,
-                    bytes_net=stats.bytes_net,
-                    bytes_total=stats.bytes_total,
-                    ai_hbm=stats.ai_hbm,
-                    ai_total=stats.ai_total,
-                    roofline_tflops_hbm=stats.roofline_tflops_hbm,
-                    regime_hbm=stats.regime,
-                    t_comp_ms=stats.t_comp * 1000.0,
-                    t_hbm_ms=stats.t_hbm * 1000.0,
-                    t_net_ms=stats.t_net * 1000.0,
-                    t_est_ms=stats.t_est * 1000.0,
-                    flops_realizable=stats.flops_realizable,
-                )
-            )
-        decode_sweep_by_exec[execution_model.name] = decode_points
-
-        prefill_points: List[SweepPoint] = []
-        _progress(
-            f"Running prefill sweep (exec={execution_model.name}) over "
-            f"{len(prefill_seq_lengths)} sequence lengths..."
-        )
-        for idx, sweep_seq in enumerate(prefill_seq_lengths, start=1):
-            _progress(
-                f"Prefill sweep {idx}/{len(prefill_seq_lengths)} "
-                f"(exec={execution_model.name}): S={sweep_seq}"
-            )
-            sweep = _estimate_efficiency(
-                model=model,
-                batch_size=batch_size,
-                seq_len=sweep_seq,
-                activation_bytes=activation_bytes,
-                kv_cache_bytes=kv_cache_bytes,
-                param_bytes_assumed=param_bytes_assumed,
-                roofline=primary_roofline,
-                interconnect_bw_gbps=interconnect_bw_gbps,
-                training_flops_multiplier=training_flops_multiplier,
-                training_bytes_multiplier=training_bytes_multiplier,
-                exec_model=execution_model,
-                tc_cfg=tc_cfg,
-                module_weight_bytes_cache=module_weight_bytes_cache,
-            )
-            stats = summarize_mode("prefill", sweep["prefill"])
-            prefill_points.append(
-                SweepPoint(
-                    x=sweep_seq,
-                    flops=stats.flops_theory,
-                    bytes_hbm=stats.bytes_hbm,
-                    bytes_net=stats.bytes_net,
-                    bytes_total=stats.bytes_total,
-                    ai_hbm=stats.ai_hbm,
-                    ai_total=stats.ai_total,
-                    roofline_tflops_hbm=stats.roofline_tflops_hbm,
-                    regime_hbm=stats.regime,
-                    t_comp_ms=stats.t_comp * 1000.0,
-                    t_hbm_ms=stats.t_hbm * 1000.0,
-                    t_net_ms=stats.t_net * 1000.0,
-                    t_est_ms=stats.t_est * 1000.0,
-                    flops_realizable=stats.flops_realizable,
-                )
-            )
-        prefill_sweep_by_exec[execution_model.name] = prefill_points
     _progress("Execution-mode efficiency estimates complete.")
+
+    max_position_embeddings: Optional[int] = None
+    if hasattr(model, "config") and hasattr(model.config, "max_position_embeddings"):
+        try:
+            max_position_embeddings = int(getattr(model.config, "max_position_embeddings"))
+        except Exception:
+            max_position_embeddings = None
+        if max_position_embeddings is not None and max_position_embeddings <= 0:
+            max_position_embeddings = None
+
+    decode_cache_lengths = _default_decode_cache_lengths(seq_len, max_position_embeddings)
+    ep_sweep_sizes = _default_ep_sweep_sizes(parallelism.n_routed_experts, ep_size_assumed)
+    prefill_batch_sizes = _default_prefill_batch_sizes(batch_size)
+
+    _progress(
+        "Running merged decode workload sweep "
+        f"(B={len(decode_batch_sizes)}, L={len(decode_cache_lengths)}, EP={len(ep_sweep_sizes)})..."
+    )
+    decode_workload_points_by_exec = _run_decode_workload_sweep(
+        model=model,
+        execution_models=execution_models,
+        batch_sizes=decode_batch_sizes,
+        cache_lengths=decode_cache_lengths,
+        ep_sizes=ep_sweep_sizes,
+        activation_bytes=activation_bytes,
+        kv_cache_bytes=kv_cache_bytes,
+        param_bytes_assumed=param_bytes_assumed,
+        roofline=primary_roofline,
+        interconnect_bw_gbps=interconnect_bw_gbps,
+        training_flops_multiplier=training_flops_multiplier,
+        training_bytes_multiplier=training_bytes_multiplier,
+        tc_cfg=tc_cfg,
+        module_weight_bytes_cache=module_weight_bytes_cache,
+        progress_cb=_progress,
+    )
+
+    _progress(
+        "Running merged prefill workload sweep "
+        f"(B={len(prefill_batch_sizes)}, S={len(prefill_seq_lengths)}, EP={len(ep_sweep_sizes)})..."
+    )
+    prefill_workload_points_by_exec = _run_prefill_workload_sweep(
+        model=model,
+        execution_models=execution_models,
+        batch_sizes=prefill_batch_sizes,
+        seq_lengths=prefill_seq_lengths,
+        ep_sizes=ep_sweep_sizes,
+        activation_bytes=activation_bytes,
+        kv_cache_bytes=kv_cache_bytes,
+        param_bytes_assumed=param_bytes_assumed,
+        roofline=primary_roofline,
+        interconnect_bw_gbps=interconnect_bw_gbps,
+        training_flops_multiplier=training_flops_multiplier,
+        training_bytes_multiplier=training_bytes_multiplier,
+        tc_cfg=tc_cfg,
+        module_weight_bytes_cache=module_weight_bytes_cache,
+        progress_cb=_progress,
+    )
+
+    decode_frontier_md = ""
+    decode_frontier_metrics: Dict[Tuple[int, int], Dict[str, float]] = {}
+    decode_frontier_cfg = DecodeEPExplorationConfig(
+        ep_sizes=ep_sweep_sizes,
+        cache_lengths=decode_cache_lengths,
+        alpha=0.9,
+        max_batch_per_gpu=16384,
+        weight_residency_factor=1.0,
+        kv_element_bytes=kv_cache_bytes,
+    )
+    try:
+        decode_frontier_md, decode_frontier_metrics = _collect_decode_ep_exploration(
+            model=model,
+            roofline=primary_roofline,
+            activation_bytes=activation_bytes,
+            kv_cache_bytes=kv_cache_bytes,
+            interconnect_bw_gbps=interconnect_bw_gbps,
+            param_bytes_assumed=param_bytes_assumed,
+            cfg=decode_frontier_cfg,
+        )
+    except Exception:
+        # Keep report generation robust; the decode sweep subsection handles empty metrics.
+        decode_frontier_md = ""
+        decode_frontier_metrics = {}
+
+    # Preserve a 1D decode batch slice at the anchor (L=seq_len, EP=ep_size_assumed) for
+    # executive-summary `B_crit` and a worked example, while the report body uses the merged
+    # 3-axis sweep presentation.
+    decode_sweep_by_exec: Dict[str, List[SweepPoint]] = {}
+    for exec_name, points in decode_workload_points_by_exec.items():
+        slice_points = [
+            point
+            for point in points
+            if point.ep_size == ep_size_assumed
+            and point.cache_len == seq_len
+            and point.batch in decode_batch_sizes
+            and point.ai_hbm > 0.0
+            and point.t_est_ms > 0.0
+        ]
+        sweep_points: List[SweepPoint] = []
+        for point in slice_points:
+            roofline_tflops_hbm = min(
+                primary_roofline.peak_tflops,
+                primary_roofline.mem_bw_gbps * point.ai_hbm / 1e3,
+            )
+            sweep_points.append(
+                SweepPoint(
+                    x=point.batch,
+                    flops=point.flops,
+                    bytes_hbm=point.bytes_hbm,
+                    bytes_net=point.bytes_net,
+                    bytes_total=point.bytes_total,
+                    ai_hbm=point.ai_hbm,
+                    ai_total=point.ai_total,
+                    roofline_tflops_hbm=roofline_tflops_hbm,
+                    regime_hbm=point.regime,
+                    t_comp_ms=point.t_comp_ms,
+                    t_hbm_ms=point.t_hbm_ms,
+                    t_net_ms=point.t_net_ms,
+                    t_est_ms=point.t_est_ms,
+                    flops_realizable=point.flops_realizable,
+                )
+            )
+        decode_sweep_by_exec[exec_name] = sorted(sweep_points, key=lambda p: p.x)
 
     roofline_points_ai: List[float] = []
     roofline_points_tf: List[float] = []
@@ -4714,24 +5400,20 @@ def dump_model_info(
             if mode_kpi.ai_hbm > 0.0 and mode_kpi.t_est > 0.0:
                 roofline_points_ai.append(mode_kpi.ai_hbm)
                 roofline_points_tf.append(mode_kpi.flops_theory / (mode_kpi.t_est * 1e12))
-    for exec_name in decode_sweep_by_exec:
-        roofline_points_ai.extend(
-            [point.ai_hbm for point in decode_sweep_by_exec[exec_name] if point.ai_hbm > 0]
-        )
-        roofline_points_tf.extend([
-            point.flops / ((point.t_est_ms / 1000.0) * 1e12)
-            for point in decode_sweep_by_exec[exec_name]
-            if point.ai_hbm > 0 and point.t_est_ms > 0.0
-        ])
-    for exec_name in prefill_sweep_by_exec:
-        roofline_points_ai.extend(
-            [point.ai_hbm for point in prefill_sweep_by_exec[exec_name] if point.ai_hbm > 0]
-        )
-        roofline_points_tf.extend([
-            point.flops / ((point.t_est_ms / 1000.0) * 1e12)
-            for point in prefill_sweep_by_exec[exec_name]
-            if point.ai_hbm > 0 and point.t_est_ms > 0.0
-        ])
+    for exec_name, points in decode_workload_points_by_exec.items():
+        for point in points:
+            if point.ep_size != ep_size_assumed:
+                continue
+            if point.ai_hbm > 0.0 and point.t_est_ms > 0.0:
+                roofline_points_ai.append(point.ai_hbm)
+                roofline_points_tf.append(point.flops / ((point.t_est_ms / 1000.0) * 1e12))
+    for exec_name, points in prefill_workload_points_by_exec.items():
+        for point in points:
+            if point.ep_size != ep_size_assumed:
+                continue
+            if point.ai_hbm > 0.0 and point.t_est_ms > 0.0:
+                roofline_points_ai.append(point.ai_hbm)
+                roofline_points_tf.append(point.flops / ((point.t_est_ms / 1000.0) * 1e12))
     resolved_roofline_x_limits, resolved_roofline_y_limits = _resolve_roofline_axis_limits(
         roofline_targets=roofline_targets,
         point_intensities=roofline_points_ai,
@@ -4742,8 +5424,9 @@ def dump_model_info(
     plot_paths: List[str] = []
     pie_plot_path: Optional[str] = None
     roofline_summary_path: Optional[str] = None
-    decode_roofline_path: Optional[str] = None
-    prefill_roofline_path: Optional[str] = None
+    decode_bl_roofline_path: Optional[str] = None
+    decode_frontier_heatmap_path: Optional[str] = None
+    prefill_bs_roofline_path: Optional[str] = None
     category_roofline_paths: Dict[str, str] = {}
     mode_stack_paths: Dict[str, str] = {}
     report_dir = os.path.dirname(report_path) or "."
@@ -4761,6 +5444,7 @@ def dump_model_info(
             sensitivity_cfg=sensitivity_cfg,
             batch_size=batch_size,
             seq_len=seq_len,
+            ep_size_override=ep_size_assumed,
             activation_bytes=activation_bytes,
             kv_cache_bytes=kv_cache_bytes,
             param_bytes_assumed=param_bytes_assumed,
@@ -4801,41 +5485,60 @@ def dump_model_info(
             roofline_summary_path = out_path
             plot_paths.append(out_path)
 
-        decode_plot_name = f"{base_name}_decode_batch_roofline.png"
-        decode_plot_path = os.path.join(report_dir, decode_plot_name)
-        decode_out = _plot_decode_batch_roofline(
-            decode_sweep_by_exec,
-            primary_roofline,
-            roofline_targets,
-            output_path=decode_plot_path,
-            seq_len=seq_len,
+        decode_bl_plot_name = f"{base_name}_decode_bl_roofline.png"
+        decode_bl_plot_path = os.path.join(report_dir, decode_bl_plot_name)
+        decode_bl_out = _plot_decode_bl_roofline(
+            points_by_exec=decode_workload_points_by_exec,
+            primary_roofline=primary_roofline,
+            roofline_targets=roofline_targets,
+            output_path=decode_bl_plot_path,
+            anchor_ep_size=ep_size_assumed,
+            cache_lengths=decode_cache_lengths,
+            batch_sizes=decode_batch_sizes,
             activation_bytes=activation_bytes,
             kv_cache_bytes=kv_cache_bytes,
+            routed_experts_per_gpu=parallelism.routed_experts_per_gpu,
             roofline_x_limits=resolved_roofline_x_limits,
             roofline_y_limits=resolved_roofline_y_limits,
             roofline_label_mode=roofline_label_mode,
         )
-        if decode_out:
-            decode_roofline_path = decode_out
-            plot_paths.append(decode_out)
+        if decode_bl_out:
+            decode_bl_roofline_path = decode_bl_out
+            plot_paths.append(decode_bl_out)
 
-        prefill_plot_name = f"{base_name}_prefill_seq_roofline.png"
-        prefill_plot_path = os.path.join(report_dir, prefill_plot_name)
-        prefill_out = _plot_prefill_sequence_roofline(
-            prefill_sweep_by_exec,
-            primary_roofline,
-            roofline_targets,
-            output_path=prefill_plot_path,
-            batch_size=batch_size,
+        decode_frontier_plot_name = f"{base_name}_decode_ep_l_minbg.png"
+        decode_frontier_plot_path = os.path.join(report_dir, decode_frontier_plot_name)
+        decode_frontier_out = _plot_decode_ep_l_minbg_heatmap(
+            exploration_metrics=decode_frontier_metrics,
+            ep_sizes=ep_sweep_sizes,
+            cache_lengths=decode_cache_lengths,
+            primary_roofline=primary_roofline,
+            output_path=decode_frontier_plot_path,
+            alpha=decode_frontier_cfg.alpha,
+        )
+        if decode_frontier_out:
+            decode_frontier_heatmap_path = decode_frontier_out
+            plot_paths.append(decode_frontier_out)
+
+        prefill_bs_plot_name = f"{base_name}_prefill_bs_roofline.png"
+        prefill_bs_plot_path = os.path.join(report_dir, prefill_bs_plot_name)
+        prefill_bs_out = _plot_prefill_bs_roofline(
+            points_by_exec=prefill_workload_points_by_exec,
+            primary_roofline=primary_roofline,
+            roofline_targets=roofline_targets,
+            output_path=prefill_bs_plot_path,
+            anchor_ep_size=ep_size_assumed,
+            batch_sizes=prefill_batch_sizes,
             activation_bytes=activation_bytes,
             kv_cache_bytes=kv_cache_bytes,
+            routed_experts_per_gpu=parallelism.routed_experts_per_gpu,
             roofline_x_limits=resolved_roofline_x_limits,
             roofline_y_limits=resolved_roofline_y_limits,
             roofline_label_mode=roofline_label_mode,
         )
-        if prefill_out:
-            prefill_roofline_path = prefill_out
-            plot_paths.append(prefill_out)
+        if prefill_bs_out:
+            prefill_bs_roofline_path = prefill_bs_out
+            plot_paths.append(prefill_bs_out)
 
         for mode in ["training", "prefill", "decode"]:
             category_plot_name = f"{base_name}_{mode}_category_roofline.png"
@@ -5430,39 +6133,27 @@ def dump_model_info(
     )
     report_lines.append("### Configuration & Assumptions")
     report_lines.append("")
-    report_lines.append(
+    config_note = (
         "We evaluate roofline points at an anchor workload defined by the caller-provided "
         "`batch_size` and `seq_len` arguments to `dump_model_info(...)`. In "
         "`examples/train_deepseek.py`, this corresponds to the training microbatch "
         "(`config.training.batch_size`) and the dataset/training context length "
-        "(`config.data.max_seq_length - 1`). We set decode KV length `L=seq_len` in the decode "
-        "batch sweep only to isolate batch effects; other sections vary `S` or `L` explicitly "
-        "(prefill sweep varies `S`; sensitivity varies `L`). To change the anchor, pass different "
-        "`batch_size`/`seq_len` or override the sweep lists."
+        "(`config.data.max_seq_length - 1`). We set the base point with prefill length `S=seq_len` "
+        "and decode KV length `L=seq_len`, and then run merged sweeps that vary decode (`B`, `L`, "
+        "`EP`) and prefill (`B`, `S`, `EP`) around that anchor. To change the anchor, pass "
+        "different `batch_size`/`seq_len` or override the sweep lists."
     )
+    if parallelism.n_routed_experts is not None and not parallelism.ep_from_config:
+        config_note += (
+            " For routed-MoE models where `ep_size` is not provided by the model config, we "
+            "default to ~4 routed experts per GPU (`EP=ceil(E/4)`) to reflect common expert "
+            "sharding."
+        )
+    report_lines.append(config_note)
     report_lines.append("")
-    tp_size = 1
-    ep_size = 1
-    routed_experts_per_gpu: Optional[int] = None
-    if hasattr(model, "config"):
-        cfg = model.config
-        try:
-            tp_size = int(getattr(cfg, "tp_size", 1) or 1)
-        except Exception:
-            tp_size = 1
-        try:
-            ep_size = int(getattr(cfg, "ep_size", 1) or 1)
-        except Exception:
-            ep_size = 1
-        n_routed = None
-        for key in ["n_routed_experts", "num_experts", "n_experts", "experts"]:
-            if hasattr(cfg, key):
-                value = getattr(cfg, key)
-                if isinstance(value, int) and value > 0:
-                    n_routed = value
-                    break
-        if n_routed is not None:
-            routed_experts_per_gpu = int(math.ceil(float(n_routed) / float(max(1, ep_size))))
+    tp_size = tp_size_assumed
+    ep_size = ep_size_assumed
+    routed_experts_per_gpu = parallelism.routed_experts_per_gpu
 
     report_lines.append("| Property | Value |")
     report_lines.append("|---|---|")
@@ -5490,8 +6181,12 @@ def dump_model_info(
     report_lines.append(f"| Interconnect bandwidth (`BW_net`) | `{interconnect_bw_gbps:.0f} GB/s` |")
     report_lines.append(f"| HBM ridge (`OI_knee`) | `{ai_knee:.3f} FLOP/byte` |")
     report_lines.append(f"| Network ridge (`OI_net`) | `{net_knee:.3f} FLOP/byte` |")
-    report_lines.append(f"| Decode batch sweep | `{decode_batch_sizes}` |")
-    report_lines.append(f"| Prefill sequence sweep | `{prefill_seq_lengths}` |")
+    report_lines.append(f"| Decode batch sweep (`B`) | `{decode_batch_sizes}` |")
+    report_lines.append(f"| Decode KV-length sweep (`L`) | `{decode_cache_lengths}` |")
+    report_lines.append(f"| Decode EP sweep (`EP`) | `{ep_sweep_sizes}` |")
+    report_lines.append(f"| Prefill sequence sweep (`S`) | `{prefill_seq_lengths}` |")
+    report_lines.append(f"| Prefill batch sweep (`B`) | `{prefill_batch_sizes}` |")
+    report_lines.append(f"| Prefill EP sweep (`EP`) | `{ep_sweep_sizes}` |")
     report_lines.append(f"| Requested roofline x-limits | `{roofline_x_limits}` |")
     report_lines.append(f"| Requested roofline y-limits | `{roofline_y_limits}` |")
     report_lines.append(
@@ -5606,7 +6301,7 @@ def dump_model_info(
         "`embedding`, `other`) to explain which operator families drive the deltas between "
         "`naive` and `efficient`. For each mode and category we recompute `AI_hbm` from aggregated "
         "`F_theory` and `bytes_hbm`, and we report `bytes_total` as HBM+network attribution. With "
-        "`EP=1` at the anchor workload, network bytes are ~0 and `bytes_total` is dominated by HBM "
+        "`EP=1`, network bytes are zero by construction and `bytes_total` is dominated by HBM "
         "terms; when `EP>1`, routed-MoE dispatch/collect can make the network term material."
     )
     report_lines.append("")
@@ -5672,58 +6367,115 @@ def dump_model_info(
         )
 
     report_lines.append("")
-    report_lines.append("#### Decode Batch Sweep - Model-Level (naive vs efficient)")
+    report_lines.append("#### Decode Sweep (vary B, L, EP)")
     report_lines.append("")
     report_lines.append(
-        "We sweep decode microbatch `B` while holding KV length `L` fixed to the anchor `seq_len`, "
-        "so we isolate the effect of batching on amortization and the utilization model. We keep "
-        "parallelism fixed to the configuration in 6.2 (`TP`/`EP`), which fixes the per-GPU routed "
-        "expert set (`E/EP`) and therefore the expert weight-streaming model. Each row reports "
-        "`AI_hbm` and `T_est` for both execution modes, and `Regime` is computed from the time "
-        "model (`argmax(T_comp,T_hbm,T_net)`). For roofline intuition we also report `B_crit`, the "
-        "first batch (interpolated) where `AI_hbm` crosses the HBM ridge; this ridge-side "
-        "diagnostic can disagree with the time-model regime when utilization effects dominate."
+        "We treat decode as a three-axis workload: microbatch `B`, KV-cache length `L`, and expert "
+        "parallelism `EP` (which sets routed experts per GPU `E/EP`). This matters because the "
+        "dominant decode bytes are typically streaming terms (weights and KV reads), so `AI_hbm` "
+        "can shift substantially with batching and with long-context KV traffic. We keep `TP` fixed "
+        f"(`TP={tp_size}`) and evaluate all points under the same static time model "
+        "`T_est=max(T_comp,T_hbm,T_net)` so `Regime` is auditable as the max-time limiter."
     )
     report_lines.append("")
-    naive_bcrit = _b_crit_from_sweep(decode_sweep_by_exec["naive"], ai_knee)
-    eff_bcrit = _b_crit_from_sweep(decode_sweep_by_exec["efficient"], ai_knee)
+
+    decode_index_by_exec: Dict[str, Dict[Tuple[int, int, int], DecodeWorkloadPoint]] = {}
+    for exec_name, points in decode_workload_points_by_exec.items():
+        decode_index_by_exec[exec_name] = {
+            (point.batch, point.cache_len, point.ep_size): point for point in points
+        }
+
     report_lines.append(
-        f"`B_crit` at HBM ridge (`AI_hbm = OI_knee={ai_knee:.2f}`): "
-        f"naive=`{naive_bcrit}`, efficient=`{eff_bcrit}`."
+        "| EP | E/EP | AI_hbm naive | AI_hbm eff | T_est naive (ms) | T_est eff (ms) | "
+        "TF_est naive | TF_est eff | Regime naive | Regime eff |"
     )
-    report_lines.append("")
-    report_lines.append(
-        "| Batch | AI_hbm naive | AI_hbm eff | T_est naive (ms) | "
-        "T_est eff (ms) | TF_est naive | TF_est eff | Regime naive | Regime eff |"
-    )
-    report_lines.append("|---:|---:|---:|---:|---:|---:|---:|---|---|")
-    for point in decode_sweep_by_exec["naive"]:
-        eff_point = next(p for p in decode_sweep_by_exec["efficient"] if p.x == point.x)
-        tf_est_naive = point.flops / ((max(1e-12, point.t_est_ms) / 1000.0) * 1e12)
+    report_lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+    for ep_value in ep_sweep_sizes:
+        experts_per_gpu = ""
+        if parallelism.n_routed_experts is not None:
+            experts_per_gpu = str(int(math.ceil(parallelism.n_routed_experts / max(1, ep_value))))
+        naive_point = decode_index_by_exec.get("naive", {}).get((batch_size, seq_len, ep_value))
+        eff_point = decode_index_by_exec.get("efficient", {}).get((batch_size, seq_len, ep_value))
+        if naive_point is None or eff_point is None:
+            continue
+        tf_est_naive = naive_point.flops / ((max(1e-12, naive_point.t_est_ms) / 1000.0) * 1e12)
         tf_est_eff = eff_point.flops / ((max(1e-12, eff_point.t_est_ms) / 1000.0) * 1e12)
         report_lines.append(
-            f"| {point.x} | {point.ai_hbm:.3e} | {eff_point.ai_hbm:.3e} | "
-            f"{point.t_est_ms:.3f} | {eff_point.t_est_ms:.3f} | "
+            f"| {ep_value} | {experts_per_gpu} | {naive_point.ai_hbm:.3e} | {eff_point.ai_hbm:.3e} | "
+            f"{naive_point.t_est_ms:.3f} | {eff_point.t_est_ms:.3f} | "
             f"{tf_est_naive:.2f} | {tf_est_eff:.2f} | "
-            f"`{point.regime_hbm}` | `{eff_point.regime_hbm}` |"
+            f"`{naive_point.regime}` | `{eff_point.regime}` |"
         )
+
+    naive_bcrit = _b_crit_from_sweep(decode_sweep_by_exec.get("naive", []), ai_knee)
+    eff_bcrit = _b_crit_from_sweep(decode_sweep_by_exec.get("efficient", []), ai_knee)
+    report_lines.append("")
+    report_lines.append(
+        f"At the anchor slice (`EP={ep_size}`, `L={seq_len}`), `B_crit` at the HBM ridge "
+        f"(`OI_knee={ai_knee:.2f}`) is: naive=`{naive_bcrit}`, efficient=`{eff_bcrit}`."
+    )
+
+    if decode_bl_roofline_path is not None:
+        report_lines.append("")
+        report_lines.append(f"![]({os.path.basename(decode_bl_roofline_path)})")
+        report_lines.append("")
+        report_lines.append(
+            "We plot `B×L` points in roofline space at the anchor `EP` to show how longer KV "
+            "contexts shift the same model leftward in `AI_hbm`, while increasing batch moves "
+            "points rightward by amortizing streamed weights and fixed overheads. The key question "
+            "is whether practical serving batches can move decode near the ridge for the target "
+            "`L`, or whether KV traffic leaves decode firmly HBM-limited."
+        )
+
+    report_lines.append("")
+    report_lines.append("##### Compute-Feasible Frontier (min B_g over EP×L)")
+    report_lines.append("")
+    report_lines.append(
+        "We complement the roofline-space curves with a compute-feasibility frontier: under the "
+        "simplifying per-GPU view (`DP=EP`, `TP=1`, no PP/SP), we search for the smallest microbatch "
+        "`B_g` such that compute time is within `alpha` of the slower of HBM and network "
+        "(`T_comp >= alpha*max(T_hbm,T_net)`). Empty cells indicate that KV/network asymptotes "
+        "remain left of ridge (or that we did not find a crossing within the search grid), so "
+        "decode cannot become compute-favorable at that (`EP`,`L`) under the model."
+    )
+    if decode_frontier_heatmap_path is not None:
+        report_lines.append("")
+        report_lines.append(f"![]({os.path.basename(decode_frontier_heatmap_path)})")
+    if decode_frontier_metrics:
+        report_lines.append("")
+        col_titles = " | ".join(f"L={value}" for value in decode_cache_lengths)
+        report_lines.append(f"| EP | E/EP | {col_titles} |")
+        report_lines.append("|---:|---:|" + "|".join(["---:"] * len(decode_cache_lengths)) + "|")
+        for ep_value in ep_sweep_sizes:
+            experts_per_gpu = ""
+            if parallelism.n_routed_experts is not None:
+                experts_per_gpu = str(int(math.ceil(parallelism.n_routed_experts / max(1, ep_value))))
+            row = [str(ep_value), experts_per_gpu]
+            for cache_len in decode_cache_lengths:
+                metrics = decode_frontier_metrics.get((ep_value, cache_len))
+                min_bg = None if metrics is None else metrics.get("min_bg")
+                if min_bg is None or (isinstance(min_bg, float) and math.isnan(min_bg)):
+                    row.append("")
+                else:
+                    row.append(str(int(min_bg)))
+            report_lines.append("| " + " | ".join(row) + " |")
+
     report_lines.append("")
     report_lines.append("**How These Numbers Are Calculated**")
     report_lines.append("")
     report_lines.append(
-        "We compute each row by aggregating model-level FLOPs and bytes under fixed parallelism, "
-        "then evaluating the static time model and derived roofline diagnostics. Decode batch sweep "
-        f"varies `B` only. Decode KV length is fixed at `L={seq_len}` for all rows to isolate batch "
-        "effects (the sensitivity sweep varies `L` explicitly). The calculation chain is:"
+        "We compute each sweep point by fixing (`B`, `L`, `EP`), aggregating model-level FLOPs "
+        "and bytes under fixed parallelism, and then evaluating the static time model and derived "
+        "roofline diagnostics. The calculation chain is:"
     )
     report_lines.append("")
     report_lines.append("```text")
-    report_lines.append("F_theory(B,L,m) = sum_i F_i(B,L,m)")
+    report_lines.append("F_theory(B,L,EP,m) = sum_i F_i(B,L,EP,m)")
     report_lines.append(
-        "bytes_hbm(B,L,m) = sum_i (bytes_weights_i + bytes_activations_i + "
+        "bytes_hbm(B,L,EP,m) = sum_i (bytes_weights_i + bytes_activations_i + "
         "bytes_kv_i + bytes_temporary_i)"
     )
-    report_lines.append("bytes_net(B,L,m) = sum_i bytes_net_i")
+    report_lines.append("bytes_net(B,L,EP,m) = sum_i bytes_net_i")
     report_lines.append("AI_hbm = F_theory / bytes_hbm")
     report_lines.append("T_comp = F_realizable / (P_peak * 1e12)")
     report_lines.append("T_hbm = bytes_hbm / (BW_hbm * 1e9)")
@@ -5734,93 +6486,106 @@ def dump_model_info(
     report_lines.append("TF_roofline_hbm = min(P_peak, BW_hbm * AI_hbm / 1e12)")
     report_lines.append("```")
     report_lines.append("")
-    eff_decode_points = decode_sweep_by_exec["efficient"]
-    eff_decode_points_sorted = sorted(eff_decode_points, key=lambda point: point.x)
-    example_batch = 128
-    if not any(point.x == example_batch for point in eff_decode_points_sorted):
-        example_batch = eff_decode_points_sorted[-1].x
-    eff_example = next(point for point in eff_decode_points_sorted if point.x == example_batch)
-    unclipped_tf = (primary_roofline.mem_bw_gbps * 1e9 * eff_example.ai_hbm) / 1e12
-    clipped_tf = min(primary_roofline.peak_tflops, unclipped_tf)
-    ai_side = ">=" if eff_example.ai_hbm >= ai_knee else "<"
-    tf_est = eff_example.flops / ((max(1e-12, eff_example.t_est_ms) / 1000.0) * 1e12)
-    report_lines.append(
-        f"- Worked example (efficient, `B={example_batch}`, fixed `L={seq_len}`):"
-    )
-    report_lines.append(
-        f"  `F_theory={eff_example.flops:.3e}`, `bytes_hbm={eff_example.bytes_hbm:.3e}`, so "
-        f"`AI_hbm={eff_example.ai_hbm:.3e}`."
-    )
-    report_lines.append(
-        f"  Ridge check: `AI_hbm {ai_side} OI_knee` -> `{eff_example.ai_hbm:.3e} {ai_side} "
-        f"{ai_knee:.3e}`."
-    )
-    report_lines.append(
-        f"  Roofline upper bound: `BW_hbm * AI_hbm / 1e12 = {unclipped_tf:.2f} TFLOPs`; "
-        f"`TF_roofline_hbm = min(P_peak, unclipped) = min({primary_roofline.peak_tflops:.2f}, "
-        f"{unclipped_tf:.2f}) = {clipped_tf:.2f} TFLOPs`."
-    )
-    report_lines.append(
-        f"  Time path: `T_comp={eff_example.t_comp_ms:.3f} ms`, "
-        f"`T_hbm={eff_example.t_hbm_ms:.3f} ms`, `T_net={eff_example.t_net_ms:.3f} ms`, "
-        f"`T_est={eff_example.t_est_ms:.3f} ms` -> regime `{eff_example.regime_hbm}`."
-    )
-    report_lines.append(
-        f"  Estimated throughput: `TF_est = F_theory / T_est / 1e12 = {tf_est:.2f} TFLOPs`."
-    )
-    if decode_roofline_path is not None:
-        report_lines.append("")
-        report_lines.append(f"![]({os.path.basename(decode_roofline_path)})")
-        report_lines.append("")
-        report_lines.append("**Interpretation**")
-        report_lines.append("")
+    example_batch = 128 if 128 in decode_batch_sizes else max(decode_batch_sizes)
+    example_key = (example_batch, seq_len, ep_size)
+    eff_example = decode_index_by_exec.get("efficient", {}).get(example_key)
+    if eff_example is not None:
+        unclipped_tf = (primary_roofline.mem_bw_gbps * 1e9 * eff_example.ai_hbm) / 1e12
+        clipped_tf = min(primary_roofline.peak_tflops, unclipped_tf)
+        ai_side = ">=" if eff_example.ai_hbm >= ai_knee else "<"
+        tf_est = eff_example.flops / ((max(1e-12, eff_example.t_est_ms) / 1000.0) * 1e12)
         report_lines.append(
-            f"Decode AI rises with batch at fixed `L`, but the operational takeaway is whether "
-            f"`B_crit={eff_bcrit}` is reachable under latency constraints. If practical serving "
-            f"batch stays below this threshold at `OI_knee={ai_knee:.2f}`, decode remains "
-            "memory-limited despite better throughput-mode points."
+            f"- Worked example (efficient, `EP={ep_size}`, `B={example_batch}`, fixed `L={seq_len}`):"
+        )
+        report_lines.append(
+            f"  `F_theory={eff_example.flops:.3e}`, `bytes_hbm={eff_example.bytes_hbm:.3e}`, so "
+            f"`AI_hbm={eff_example.ai_hbm:.3e}`."
+        )
+        report_lines.append(
+            f"  Ridge check: `AI_hbm {ai_side} OI_knee` -> `{eff_example.ai_hbm:.3e} {ai_side} "
+            f"{ai_knee:.3e}`."
+        )
+        report_lines.append(
+            f"  Roofline upper bound: `BW_hbm * AI_hbm / 1e12 = {unclipped_tf:.2f} TFLOPs`; "
+            f"`TF_roofline_hbm = min(P_peak, unclipped) = min({primary_roofline.peak_tflops:.2f}, "
+            f"{unclipped_tf:.2f}) = {clipped_tf:.2f} TFLOPs`."
+        )
+        report_lines.append(
+            f"  Time path: `T_comp={eff_example.t_comp_ms:.3f} ms`, "
+            f"`T_hbm={eff_example.t_hbm_ms:.3f} ms`, `T_net={eff_example.t_net_ms:.3f} ms`, "
+            f"`T_est={eff_example.t_est_ms:.3f} ms` -> regime `{eff_example.regime}`."
+        )
+        report_lines.append(
+            f"  Estimated throughput: `TF_est = F_theory / T_est / 1e12 = {tf_est:.2f} TFLOPs`."
         )
 
     report_lines.append("")
-    report_lines.append("#### Prefill Sequence Sweep - Model-Level (naive vs efficient)")
+    report_lines.append("#### Prefill Sweep (vary B, S, EP)")
     report_lines.append("")
     report_lines.append(
-        "We sweep prefill prompt length `S` while holding per-GPU microbatch `B` and the "
-        f"parallelism assumptions fixed (`TP={tp_size}`, `EP={ep_size}`), so the per-GPU expert "
-        "set and per-GPU token count are well-defined. This isolates how sequence length changes "
-        "reuse and temporary traffic in attention: in `naive`, attention has explicit `O(S^2)` "
-        "score/prob materialization, while `flash`-style kernels reduce this temporary traffic. "
-        "Meanwhile, weight bytes are comparatively insensitive to `S`, so longer prompts tend to "
-        "amortize weight streaming and increase `AI_hbm` until other terms dominate. In the table "
-        "below, we look for where `AI_hbm` crosses the ridge and where `T_est` stops improving, "
-        "which indicates that prefill has transitioned from being HBM-limited to being compute- or "
-        "utilization-limited under the model."
+        "We treat prefill as a three-axis workload: microbatch `B`, prompt length `S`, and `EP`. "
+        "Prefill differs from decode because attention has prompt-side reuse and (in naive mode) "
+        "explicit `O(S^2)` temporary traffic, so increasing `S` can either amortize weight streaming "
+        "or amplify temporary bytes depending on the attention bytes model. We keep `TP` fixed "
+        f"(`TP={tp_size}`) and reuse the same time model as decode so the curves are directly "
+        "comparable under the report’s assumptions."
     )
-    report_lines.append("")
-    report_lines.append(
-        "| Sequence | AI_hbm naive | AI_hbm eff | T_est naive (ms) | T_est eff (ms) | TF_est naive | TF_est eff |"
-    )
-    report_lines.append("|---:|---:|---:|---:|---:|---:|---:|")
-    for point in prefill_sweep_by_exec["naive"]:
-        eff_point = next(p for p in prefill_sweep_by_exec["efficient"] if p.x == point.x)
-        tf_est_naive = point.flops / ((max(1e-12, point.t_est_ms) / 1000.0) * 1e12)
-        tf_est_eff = eff_point.flops / ((max(1e-12, eff_point.t_est_ms) / 1000.0) * 1e12)
-        report_lines.append(
-            f"| {point.x} | {point.ai_hbm:.3e} | {eff_point.ai_hbm:.3e} | "
-            f"{point.t_est_ms:.3f} | {eff_point.t_est_ms:.3f} | "
-            f"{tf_est_naive:.2f} | {tf_est_eff:.2f} |"
-        )
-    if prefill_roofline_path is not None:
+    if prefill_bs_roofline_path is not None:
         report_lines.append("")
-        report_lines.append(f"![]({os.path.basename(prefill_roofline_path)})")
-        report_lines.append("")
-        report_lines.append("**Interpretation**")
+        report_lines.append(f"![]({os.path.basename(prefill_bs_roofline_path)})")
         report_lines.append("")
         report_lines.append(
-            "Prefill trends toward higher AI as sequence grows, and efficient kernels reduce "
-            "temporary-byte pressure, so prefill often reaches compute-favorable operation earlier "
-            "than decode. This does not imply decode will share the same regime at matched model size."
+            "We plot an `S` sweep at multiple `B` values (fixed `EP`) to show how longer prompts "
+            "shift `AI_hbm` and whether efficient attention reduces temporary-byte pressure enough "
+            "to keep prefill compute-favorable at practical batch sizes."
         )
+
+    prefill_index_by_exec: Dict[str, Dict[Tuple[int, int, int], PrefillWorkloadPoint]] = {}
+    for exec_name, points in prefill_workload_points_by_exec.items():
+        prefill_index_by_exec[exec_name] = {
+            (point.batch, point.seq_len, point.ep_size): point for point in points
+        }
+
+    slice_seq_lengths: List[int] = []
+    for candidate in [seq_len, 1024, 4096]:
+        if candidate <= 0:
+            continue
+        if max_position_embeddings is not None and candidate > max_position_embeddings:
+            continue
+        if candidate not in prefill_seq_lengths:
+            continue
+        slice_seq_lengths.append(int(candidate))
+    slice_seq_lengths = sorted(set(slice_seq_lengths))
+
+    if slice_seq_lengths:
+        report_lines.append("")
+        report_lines.append(
+            "To make the `EP` effect auditable, we report a small slice at the anchor batch "
+            f"(`B={batch_size}`) and selected prompt lengths."
+        )
+        report_lines.append("")
+        header_parts = ["EP", "E/EP"]
+        for s_value in slice_seq_lengths:
+            header_parts.append(f"naive (S={s_value})")
+            header_parts.append(f"eff (S={s_value})")
+        report_lines.append("| " + " | ".join(header_parts) + " |")
+        report_lines.append("|" + "|".join(["---:"] * 2 + ["---"] * (len(header_parts) - 2)) + "|")
+        for ep_value in ep_sweep_sizes:
+            experts_per_gpu = ""
+            if parallelism.n_routed_experts is not None:
+                experts_per_gpu = str(int(math.ceil(parallelism.n_routed_experts / max(1, ep_value))))
+            row_cells = [str(ep_value), experts_per_gpu]
+            for s_value in slice_seq_lengths:
+                naive_point = prefill_index_by_exec.get("naive", {}).get((batch_size, s_value, ep_value))
+                eff_point = prefill_index_by_exec.get("efficient", {}).get((batch_size, s_value, ep_value))
+                if naive_point is None or eff_point is None:
+                    row_cells.extend(["", ""])
+                    continue
+                tf_est_naive = naive_point.flops / ((max(1e-12, naive_point.t_est_ms) / 1000.0) * 1e12)
+                tf_est_eff = eff_point.flops / ((max(1e-12, eff_point.t_est_ms) / 1000.0) * 1e12)
+                row_cells.append(f"`AI={naive_point.ai_hbm:.2e}, TF={tf_est_naive:.1f}`")
+                row_cells.append(f"`AI={eff_point.ai_hbm:.2e}, TF={tf_est_eff:.1f}`")
+            report_lines.append("| " + " | ".join(row_cells) + " |")
 
     report_lines.append("")
     report_lines.append("#### Mode Share Overview (naive vs efficient)")
@@ -5869,47 +6634,30 @@ def dump_model_info(
         )
         report_lines.append("")
 
-    _progress("Running decode compute-bound exploration subsection...")
-    try:
-        exploration_cfg = DecodeEPExplorationConfig()
-        exploration_md, _ = _collect_decode_ep_exploration(
-            model=model,
-            roofline=primary_roofline,
-            activation_bytes=activation_bytes,
-            kv_cache_bytes=kv_cache_bytes,
-            interconnect_bw_gbps=interconnect_bw_gbps,
-            param_bytes_assumed=param_bytes_assumed,
-            cfg=exploration_cfg,
-        )
-        report_lines.append("")
-        report_lines.append("### Decode Compute-Bound Exploration (DP=EP, TP=1)")
-        report_lines.append("")
-        exploration_lines = exploration_md.strip().splitlines()
-        if exploration_lines and exploration_lines[0].startswith("###"):
-            exploration_lines = exploration_lines[1:]
-        report_lines.extend(exploration_lines)
-    except Exception as e:
-        report_lines.append("")
-        report_lines.append("### Decode Compute-Bound Exploration (DP=EP, TP=1)")
-        report_lines.append("")
-        report_lines.append(
-            "We include this subsection to ask whether decode can ever become compute-limited as "
-            "`EP` and KV length `L` vary, but we only render it when we can reliably infer MLA and "
-            "routed-MoE dimensions from the model. This run skipped the exploration due to an "
-            "internal error."
-        )
-        report_lines.append("")
-        report_lines.append(f"- Skipped due to error: `{type(e).__name__}: {e}`")
-    _progress("Decode compute-bound exploration subsection complete.")
-
     kv_cache_map = _collect_kv_cache_elements_per_token(model)
     total_kv_elements_per_token = sum(kv_cache_map.values())
     kv_cache_resident_bytes = (
         batch_size * seq_len * total_kv_elements_per_token * kv_cache_bytes
     )
-    parameter_resident_bytes = total_params * param_bytes_assumed
-    training_grad_bytes = total_params * param_bytes_assumed
-    training_optimizer_bytes = total_params * (optimizer_state_bytes + master_weight_bytes)
+    expert_param_count = sum(layer.num_params for layer in layers if ".experts." in layer.name)
+    non_expert_param_count = max(0, total_params - expert_param_count)
+    tp_shard = max(1, int(tp_size))
+    ep_shard = max(1, int(ep_size))
+
+    expert_param_bytes_global = expert_param_count * param_bytes_assumed
+    non_expert_param_bytes_global = non_expert_param_count * param_bytes_assumed
+    non_expert_param_bytes_per_gpu = non_expert_param_bytes_global / tp_shard
+    expert_param_bytes_per_gpu = expert_param_bytes_global / (tp_shard * ep_shard)
+    parameter_resident_bytes = non_expert_param_bytes_per_gpu + expert_param_bytes_per_gpu
+
+    training_grad_bytes = (
+        (non_expert_param_count * param_bytes_assumed) / tp_shard
+        + (expert_param_count * param_bytes_assumed) / (tp_shard * ep_shard)
+    )
+    training_optimizer_bytes = (
+        (non_expert_param_count * (optimizer_state_bytes + master_weight_bytes)) / tp_shard
+        + (expert_param_count * (optimizer_state_bytes + master_weight_bytes)) / (tp_shard * ep_shard)
+    )
     training_activation_bytes = _estimate_activation_memory_bytes(
         model=model,
         batch_size=batch_size,
@@ -5939,16 +6687,24 @@ def dump_model_info(
     )
     report_lines.append("")
     report_lines.append(
-        "We deliberately keep the accounting coarse. For inference we count `params + kv_cache`, "
-        "with `kv_cache = B * L * sum(C_kv_per_layer) * A_kv`. For training we add gradients, "
-        "optimizer+master weights, and a coarse saved-activation term. We do not model tensor/"
-        "optimizer sharding, activation checkpoint schedules, allocator fragmentation, or overlap; "
-        "interpret these totals as feasibility signals rather than allocator-accurate budgets."
+        "We deliberately keep the accounting coarse but consistent with `TP/EP`: we assume "
+        "non-expert weights are sharded by `TP`, routed-expert weights are sharded by `TP×EP`, and "
+        "KV/activations are per GPU. For inference we count `params + kv_cache`, with "
+        "`kv_cache = B * L * sum(C_kv_per_layer) * A_kv`. For training we add gradients, "
+        "optimizer+master weights, and a coarse saved-activation term. We do not model activation "
+        "checkpoint schedules, allocator fragmentation, or overlap; interpret these totals as "
+        "feasibility signals rather than allocator-accurate budgets."
     )
     report_lines.append("")
     report_lines.append("| Item | Estimated Bytes |")
     report_lines.append("|---|---:|")
-    report_lines.append(f"| Parameters (assumed dtype) | {_format_bytes(parameter_resident_bytes)} |")
+    report_lines.append(
+        f"| Parameters (non-expert, per GPU) | {_format_bytes(non_expert_param_bytes_per_gpu)} |"
+    )
+    report_lines.append(
+        f"| Parameters (routed experts, per GPU) | {_format_bytes(expert_param_bytes_per_gpu)} |"
+    )
+    report_lines.append(f"| Parameters (total, per GPU) | {_format_bytes(parameter_resident_bytes)} |")
     report_lines.append(f"| KV Cache (B={batch_size}, L={seq_len}) | {_format_bytes(kv_cache_resident_bytes)} |")
     report_lines.append(f"| Training Gradients | {_format_bytes(training_grad_bytes)} |")
     report_lines.append(f"| Training Optimizer+Master | {_format_bytes(training_optimizer_bytes)} |")
@@ -5974,10 +6730,10 @@ def dump_model_info(
         "routed-MoE dispatch/collect when experts are sharded across devices (`EP>1`). We report a "
         "simple envelope estimate (not a measured time) for activation bytes that must move to "
         "send token activations to experts and return expert outputs, which scales roughly with "
-        "tokens, hidden size, and `top_k`. Under the anchor setting (`EP=1`), the inter-device "
-        "portion is zero by construction, so `T_net` does not dominate base KPIs; increasing `EP` "
-        "makes this table a quick check for whether dispatch bytes are large enough to warrant "
-        "compression and overlap."
+        "tokens, hidden size, and `top_k`. At the anchor setting (`EP="
+        f"{ep_size}`), we report both intra-device and inter-device attribution; when `EP=1` the "
+        "inter-device portion is zero by construction, while larger `EP` values can make `T_net` "
+        "material and motivate compression and overlap."
     )
     report_lines.append("")
     report_lines.append("| Mode | Intra-device Dispatch | Inter-device Dispatch (est.) | Interconnect Time (ms, est.) |")
@@ -5989,6 +6745,7 @@ def dump_model_info(
             batch_size=batch_size,
             seq_len=seq_len,
             activation_bytes=activation_bytes,
+            ep_size_override=ep_size,
         )
         inter_ms = _safe_div(inter_b, interconnect_bw_gbps * 1e9) * 1000.0
         report_lines.append(
@@ -6106,10 +6863,12 @@ def dump_model_info(
         core_plot_paths.add(pie_plot_path)
     if roofline_summary_path is not None:
         core_plot_paths.add(roofline_summary_path)
-    if decode_roofline_path is not None:
-        core_plot_paths.add(decode_roofline_path)
-    if prefill_roofline_path is not None:
-        core_plot_paths.add(prefill_roofline_path)
+    if decode_bl_roofline_path is not None:
+        core_plot_paths.add(decode_bl_roofline_path)
+    if decode_frontier_heatmap_path is not None:
+        core_plot_paths.add(decode_frontier_heatmap_path)
+    if prefill_bs_roofline_path is not None:
+        core_plot_paths.add(prefill_bs_roofline_path)
     core_plot_paths.update(mode_stack_paths.values())
     core_plot_paths.update(category_roofline_paths.values())
     for path in plot_paths:
