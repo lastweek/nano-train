@@ -163,6 +163,21 @@ class Trainer:
                     if grad_norm is not None:
                         if self.writer is not None:
                             self.writer.add_scalar('Gradients/norm', grad_norm, global_step)
+
+                    # Log detailed per-layer gradient statistics
+                    self._log_detailed_gradient_stats(global_step)
+
+                    # Log weight update ratios (learning rate diagnostic)
+                    self._log_weight_update_ratios(global_step)
+
+                    # Log gradient histograms (for visualization)
+                    self._log_gradient_histograms(global_step)
+
+                    # Log weight norms and changes (weight evolution tracking)
+                    self._log_weight_norms(global_step)
+                    self._log_weight_changes(global_step)
+                    self._log_weight_histograms(global_step)
+
                     if self.writer is not None:
                         self.writer.add_scalar(
                             'Parameters/norm',
@@ -347,3 +362,323 @@ class Trainer:
             total_norm_sq += param_norm.item() ** 2
         # OUTPUT: sqrt(sum of all squared norms) - for logging
         return math.sqrt(total_norm_sq)
+
+    def _log_detailed_gradient_stats(self, step):
+        """
+        Log detailed per-layer gradient statistics.
+
+        Logs per-layer gradient norms, means, and stds to TensorBoard.
+        This helps identify which layers are most/least active during training.
+
+        Args:
+            step: Current training step
+        """
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm(2).item()
+                grad_mean = param.grad.mean().item()
+                grad_std = param.grad.std().item()
+
+                # Log to TensorBoard
+                if self.writer is not None:
+                    self.writer.add_scalar(f'gradients/{name}/norm', grad_norm, step)
+                    self.writer.add_scalar(f'gradients/{name}/mean', grad_mean, step)
+                    self.writer.add_scalar(f'gradients/{name}/std', grad_std, step)
+
+                # Log to console every 100 steps
+                if step % 100 == 0:
+                    logger.info(f"  {name}: grad_norm={grad_norm:.4f}, mean={grad_mean:.6f}, std={grad_std:.6f}")
+
+    def _log_weight_update_ratios(self, step):
+        """
+        Log weight update ratios to detect learning rate issues.
+
+        Update ratio = ||weight_change|| / ||weight|| where weight_change is the
+        optimizer step (lr * gradient). This helps identify if the learning rate
+        is too high (ratio > 0.1) or too low (ratio < 1e-7).
+
+        Args:
+            step: Current training step
+        """
+        # Get current learning rate
+        lr = self.scheduler.get_lr()
+
+        alerts = []
+
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                # Compute weight norm
+                weight_norm = param.data.norm(2).item()
+
+                # Compute update norm (approximate as lr * grad_norm)
+                # This is the change the optimizer will apply
+                grad_norm = param.grad.norm(2).item()
+                update_norm = lr * grad_norm
+
+                # Compute update ratio (relative change)
+                if weight_norm > 0:
+                    update_ratio = update_norm / weight_norm
+                else:
+                    update_ratio = 0.0
+
+                # Log to TensorBoard
+                if self.writer is not None:
+                    self.writer.add_scalar(f'updates/{name}/ratio', update_ratio, step)
+                    self.writer.add_scalar(f'updates/{name}/update_norm', update_norm, step)
+                    self.writer.add_scalar(f'updates/{name}/weight_norm', weight_norm, step)
+
+                # Check for issues
+                if update_ratio > 0.1:
+                    alerts.append((name, update_ratio, 'TOO_HIGH'))
+                elif update_ratio < 1e-7 and weight_norm > 1e-6:
+                    alerts.append((name, update_ratio, 'TOO_LOW'))
+
+        # Log alerts to console
+        if alerts and step % 100 == 0:
+            logger.warning(f"Update ratio alerts (step {step}):")
+            for name, ratio, issue in alerts:
+                if issue == 'TOO_HIGH':
+                    logger.warning(f"  {name}: {ratio:.4f} > 0.1 (learning rate may be too high)")
+                else:
+                    logger.warning(f"  {name}: {ratio:.8f} < 1e-7 (learning rate may be too low)")
+
+    def _log_gradient_histograms(self, step):
+        """
+        Log gradient histograms to visualize gradient flow over time.
+
+        Histograms show the full distribution of gradients, not just summary stats.
+        This helps identify:
+        - Gradient distribution changes over time
+        - Multi-modal distributions (multiple peaks)
+        - Outliers and heavy tails
+        - Dead neurons (gradients concentrated near zero)
+
+        Args:
+            step: Current training step
+        """
+        if self.writer is None:
+            return
+
+        # Log histograms less frequently (expensive operation)
+        histogram_freq = max(100, self.log_steps * 10)
+        if step % histogram_freq != 0:
+            return
+
+        # Collect gradients for histogram logging
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                # Log gradient histogram
+                self.writer.add_histogram(
+                    f'gradients_hist/{name}',
+                    param.grad.data,
+                    step
+                )
+
+        # Log a summary of gradient distribution statistics
+        if step % (histogram_freq * 10) == 0:
+            grad_data = []
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    grad_flat = param.grad.data.flatten().cpu()
+                    grad_data.append({
+                        'name': name,
+                        'min': grad_flat.min().item(),
+                        'max': grad_flat.max().item(),
+                        'p25': grad_flat.quantile(0.25).item(),
+                        'p50': grad_flat.quantile(0.50).item(),
+                        'p75': grad_flat.quantile(0.75).item(),
+                        'p95': grad_flat.quantile(0.95).item(),
+                        'p99': grad_flat.quantile(0.99).item(),
+                    })
+
+            logger.info(f"Gradient distribution summary (step {step}):")
+            for g in grad_data[:5]:  # Show first 5 layers
+                logger.info(
+                    f"  {g['name']}: "
+                    f"min={g['min']:.6f}, p25={g['p25']:.6f}, "
+                    f"median={g['p50']:.6f}, p75={g['p75']:.6f}, "
+                    f"p95={g['p95']:.6f}, max={g['max']:.6f}"
+                )
+    def _log_weight_norms(self, step):
+        """
+        Log per-layer weight norms to track weight evolution during training.
+
+        This helps identify:
+        - Weights growing too fast (instability risk)
+        - Weights not changing (LR too low or frozen layers)
+        - Per-layer weight divergence
+        - Weight initialization issues
+
+        Args:
+            step: Current training step
+        """
+        if self.writer is None:
+            return
+
+        # Log less frequently than gradients (weights change slower)
+        weight_log_freq = max(100, self.log_steps * 10)
+        if step % weight_log_freq != 0:
+            return
+
+        # Track weight norms for each layer
+        layer_norms = {}
+        for name, param in self.model.named_parameters():
+            if param.data is not None:
+                weight_norm = param.data.norm(2).item()
+                layer_norms[name] = weight_norm
+
+                # Log to TensorBoard
+                self.writer.add_scalar(f'weights/{name}/norm', weight_norm, step)
+
+        # Log summary every 1000 steps
+        if step % (weight_log_freq * 10) == 0:
+            # Find min/max/median weight norms
+            norms_list = list(layer_norms.values())
+            if norms_list:
+                global_norm = math.sqrt(sum(n**2 for n in norms_list))
+                min_norm = min(norms_list)
+                max_norm = max(norms_list)
+                median_norm = sorted(norms_list)[len(norms_list) // 2]
+
+                # Check for anomalies
+                anomalies = []
+                if max_norm / min_norm > 1000:
+                    anomalies.append(f"Weight norm variance > 1000× (min={min_norm:.4f}, max={max_norm:.4f})")
+
+                # Log summary
+                logger.info(f"Weight norm summary (step {step}):")
+                logger.info(f"  Global norm: {global_norm:.4f}")
+                logger.info(f"  Layer norms: min={min_norm:.4f}, median={median_norm:.4f}, max={max_norm:.4f}")
+                logger.info(f"  Ratio (max/min): {max_norm/min_norm:.2f}×")
+
+                if anomalies:
+                    for anomaly in anomalies:
+                        logger.warning(f"  ⚠ {anomaly}")
+
+    def _log_weight_changes(self, step):
+        """
+        Track how much weights are changing over time.
+
+        Computes the change in weight norms compared to the previous logging step.
+        This helps detect:
+        - Sudden weight changes (instability)
+        - Weights stagnating (LR too low)
+        - Training convergence
+
+        Args:
+            step: Current training step
+        """
+        if self.writer is None:
+            return
+
+        # Initialize previous norms if first call
+        if not hasattr(self, '_prev_weight_norms'):
+            self._prev_weight_norms = {}
+            self._weight_log_step = 0
+            return
+
+        # Log less frequently
+        weight_change_freq = max(500, self.log_steps * 50)
+        if step % weight_change_freq != 0:
+            return
+
+        # Compute weight changes
+        changes = []
+        for name, param in self.model.named_parameters():
+            if param.data is not None:
+                current_norm = param.data.norm(2).item()
+
+                # Compute change if we have previous measurement
+                if name in self._prev_weight_norms:
+                    prev_norm = self._prev_weight_norms[name]
+                    if prev_norm > 0:
+                        change_pct = ((current_norm - prev_norm) / prev_norm) * 100
+                    else:
+                        change_pct = 0.0
+
+                    changes.append({
+                        'name': name,
+                        'prev_norm': prev_norm,
+                        'current_norm': current_norm,
+                        'change_pct': change_pct
+                    })
+
+                # Store current norm for next time
+                self._prev_weight_norms[name] = current_norm
+
+        # Log summary if we have changes
+        if changes and step % (weight_change_freq * 10) == 0:
+            changes_pct = [c['change_pct'] for c in changes]
+            avg_change = sum(changes_pct) / len(changes_pct)
+
+            # Find layers with largest changes
+            changes.sort(key=lambda x: abs(x['change_pct']), reverse=True)
+
+            logger.info(f"Weight change summary (step {step}):")
+            logger.info(f"  Steps since last check: {step - self._weight_log_step}")
+            logger.info(f"  Average change: {avg_change:.2f}%")
+
+            # Show top 5 changed layers
+            for c in changes[:5]:
+                logger.info(
+                    f"  {c['name']}: {c['prev_norm']:.4f} → {c['current_norm']:.4f} "
+                    f"({c['change_pct']:+.2f}%)"
+                )
+
+            self._weight_log_step = step
+
+    def _log_weight_histograms(self, step):
+        """
+        Log weight histograms to visualize weight distributions over time.
+
+        This helps identify:
+        - Weight initialization quality
+        - Weight distribution shifts during training
+        - Dead neurons (weights concentrated at zero)
+        - Multi-modal distributions
+        - Outliers and heavy tails
+
+        Args:
+            step: Current training step
+        """
+        if self.writer is None:
+            return
+
+        # Log histograms less frequently (expensive)
+        histogram_freq = max(500, self.log_steps * 50)
+        if step % histogram_freq != 0:
+            return
+
+        # Log weight histograms for each layer
+        for name, param in self.model.named_parameters():
+            if param.data is not None:
+                self.writer.add_histogram(
+                    f'weights_hist/{name}',
+                    param.data,
+                    step
+                )
+
+        # Log distribution summary every 5000 steps
+        if step % (histogram_freq * 10) == 0:
+            weight_data = []
+            for name, param in self.model.named_parameters():
+                if param.data is not None:
+                    weight_flat = param.data.flatten().cpu()
+                    weight_data.append({
+                        'name': name,
+                        'mean': weight_flat.mean().item(),
+                        'std': weight_flat.std().item(),
+                        'min': weight_flat.min().item(),
+                        'max': weight_flat.max().item(),
+                        'p01': weight_flat.quantile(0.01).item(),  # 1st percentile
+                        'p99': weight_flat.quantile(0.99).item(),  # 99th percentile
+                    })
+
+            logger.info(f"Weight distribution summary (step {step}):")
+            for w in weight_data[:5]:  # Show first 5 layers
+                logger.info(
+                    f"  {w['name']}: "
+                    f"mean={w['mean']:.6f}, std={w['std']:.6f}, "
+                    f"min={w['min']:.6f}, max={w['max']:.6f}, "
+                    f"p99={w['p99']:.6f}"
+                )

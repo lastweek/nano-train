@@ -221,13 +221,11 @@ class TestLayerNorm:
 
         # Check mean is close to zero
         mean = out.mean(dim=-1)
-        assert torch.allclose(mean, torch.zeros_like(mean),
-                           atol=1e-5), msg="Mean not close to zero"
+        assert torch.allclose(mean, torch.zeros_like(mean), atol=1e-5), "Mean not close to zero"
 
         # Check std is close to one
         std = out.std(dim=-1, unbiased=False)
-        assert torch.allclose(std, torch.ones_like(std),
-                           atol=1e-5), msg="Std not close to one"
+        assert torch.allclose(std, torch.ones_like(std), atol=1e-5), "Std not close to one"
 
     def test_backward_accuracy(self, device, tolerances):
         """Backward pass produces correct gradients."""

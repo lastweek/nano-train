@@ -309,6 +309,39 @@ except Exception as e:
     print()
 
 # =============================================================================
+# Test DeepSeek-style Model
+# =============================================================================
+
+print("5. Testing DeepSeek-style Model...")
+print("-" * 70)
+
+try:
+    from test_deepseek_model import (
+        test_backward_runs,
+        test_forward_shape,
+        test_meta_init_avoids_storage,
+    )
+
+    test_forward_shape()
+    print("  ✓ Forward shape")
+
+    test_backward_runs()
+    print("  ✓ Backward pass")
+
+    test_meta_init_avoids_storage()
+    print("  ✓ Meta init (no parameter storage)")
+
+    results['deepseek'] = 'PASS'
+    print()
+
+except Exception as e:
+    print(f"  ✗ FAILED: {e}")
+    results['deepseek'] = 'FAIL'
+    import traceback
+    traceback.print_exc()
+    print()
+
+# =============================================================================
 # Summary
 # =============================================================================
 

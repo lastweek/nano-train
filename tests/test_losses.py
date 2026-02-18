@@ -9,6 +9,7 @@ Tests verify:
 """
 
 import pytest
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -157,7 +158,9 @@ class TestCrossEntropyLoss:
         targets = torch.randint(0, num_classes, (batch_size, seq_len), device=device)
 
         native_loss = native(logits, targets)
-        ref_loss = ref(logits, targets)
+        # PyTorch CrossEntropyLoss expects input shape (N, C, ...) and target shape (N, ...).
+        # Flatten (B,S,*) into a single batch dimension for a fair comparison.
+        ref_loss = ref(logits.reshape(-1, num_classes), targets.reshape(-1))
 
         assert_tensor_close(
             native_loss, ref_loss,

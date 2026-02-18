@@ -77,10 +77,9 @@ class TestAdamW:
         # Store initial weight
         initial_weight = model.weight.data.clone()
 
-        # Create loss that doesn't depend on weights (should still get decay)
-        x = torch.randn(5, in_features, device=device)
-        loss = torch.zeros(device=device)
-        loss.backward()
+        # Zero gradient: AdamW should still apply decoupled weight decay.
+        optimizer.zero_grad(set_to_none=True)
+        model.weight.grad = torch.zeros_like(model.weight)
 
         optimizer.step()
 

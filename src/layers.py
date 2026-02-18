@@ -538,10 +538,9 @@ class GELU(nn.Module):
         """
         Apply GELU activation.
 
-        Approximation: GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
-
-        This is the fast approximation used in most implementations.
-        The exact formula uses the error function (erf).
+        We use the same definition as `torch.nn.GELU` (exact formulation) so that unit tests and
+        reference comparisons match closely. The commonly used tanh-approximation is a valid
+        alternative for speed, but it introduces small numerical differences.
 
         Args:
             x: Input tensor of any shape
@@ -549,12 +548,7 @@ class GELU(nn.Module):
         Returns:
             Activated tensor of same shape
         """
-        # Constants for the approximation
-        # √(2/π) ≈ 0.7978845608
-        # 0.044715 is a small correction term
-        return 0.5 * x * (1.0 + torch.tanh(
-            0.7978845608 * (x + 0.044715 * torch.pow(x, 3))
-        ))
+        return F.gelu(x)
 
 
 # =============================================================================

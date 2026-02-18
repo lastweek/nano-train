@@ -12,6 +12,7 @@ __pycache__/
 Thumbs.db
 # Training outputs
 outputs/
+outputs/nano_train_mvp/
 *.pt
 *.log
 # Data

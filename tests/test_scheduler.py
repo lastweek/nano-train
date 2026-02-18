@@ -59,7 +59,7 @@ class TestCosineAnnealing:
 
         # Check annealing phase
         base_lr = 1e-3
-        for step in range(warmup_steps, max_steps + 1):
+        for step in range(warmup_steps + 1, max_steps + 1):
             lr = scheduler.step()
 
             progress = (step - warmup_steps) / (max_steps - warmup_steps)

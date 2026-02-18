@@ -96,8 +96,6 @@ def main():
     # Create trainer
     trainer = Trainer(model, config, train_loader, device)
 
-    exit()
-
     # Train
     logger.info("=" * 50)
     logger.info("Starting training...")
