@@ -13,5 +13,7 @@ Thumbs.db
 # Training outputs
 *.pt
 *.log
+# Generated docs exports
+docs/training_monitoring.html
 # Data
 data/*.csv

@@ -1,575 +1,239 @@
-# Training Monitoring & Stability Guide
+# Training Monitoring v2: Stability/Precision vs Performance
 
-**Purpose**: Comprehensive guide for monitoring LLM training, detecting issues early, and maintaining training stability.
+**Purpose**: nano-train monitoring is designed to answer two different questions:
 
-**Last Updated**: 2026-02-16
+1) **Training stability / numerical precision**: are updates finite, well-scaled, and flowing
+through depth?
+2) **Training performance**: are we compute- or input-bound, and are we trending toward OOM or
+regressions?
 
----
-
-## Table of Contents
-
-1. [Implementation Status](#implementation-status)
-2. [Implemented Features](#implemented-features)
-3. [Core Monitoring Metrics](#core-monitoring-metrics)
-4. [How to Use](#how-to-use)
-5. [Troubleshooting Guide](#troubleshooting-guide)
-6. [Best Practices](#best-practices)
-7. [Implementation Roadmap](#implementation-roadmap)
-8. [References](#references)
+**Last Updated**: 2026-02-19
 
 ---
 
-## Implementation Status
+## Quickstart
 
-### Completed ✅
-
-- **Phase 1: Gradient Monitoring** (100%)
-  - Per-layer gradient statistics (norm, mean, std)
-  - Weight update ratio monitoring
-  - Gradient flow visualization (histograms)
-  - Automatic alert system for learning rate issues
-
-### In Progress 🚧
-
-- None currently
-
-### Planned 📋
-
-- Phase 2: Weight & Activation Monitoring
-- Phase 3: Performance Monitoring
-- Phase 4: Convergence & Stability Monitoring
-- Phase 5: Advanced Diagnostics
-
----
-
-## Implemented Features
-
-### Phase 1: Gradient Monitoring (COMPLETE)
-
-**Location**: [src/trainer.py:358-496](src/trainer.py#L358-L496)
-
-Three methods added to the `Trainer` class:
-
-#### 1.1 Per-Layer Gradient Statistics
-
-**Method**: `_log_detailed_gradient_stats(step)`
-
-**Metrics**:
-- **Gradient Norm** (L2 magnitude): Overall gradient scale per layer
-- **Gradient Mean**: Average gradient value (should be near zero)
-- **Gradient Std**: Standard deviation (gradient variance)
-
-**TensorBoard**: `gradients/{layer_name}/norm|mean|std`
-
-**Console Output** (every 100 steps):
-```
-INFO  transformer.blocks.0.attn_norm.weight: grad_norm=0.1234, mean=0.000012, std=0.000456
-INFO  transformer.blocks.0.attn.c_proj.weight: grad_norm=0.2345, mean=-0.000023, std=0.000567
-```
-
-#### 1.2 Weight Update Ratio Monitoring
-
-**Method**: `_log_weight_update_ratios(step)`
-
-**Formula**: `update_ratio = (learning_rate × gradient_norm) / weight_norm`
-
-**Purpose**: Detect learning rate issues
-- **Ratio > 0.1**: Learning rate too high (unstable)
-- **Ratio < 1e-7**: Learning rate too low (not learning)
-
-**TensorBoard**: `updates/{layer_name}/ratio|update_norm|weight_norm`
-
-**Console Alerts** (every 100 steps when issues detected):
-```
-WARNING  Update ratio alerts (step 100):
-WARNING    blocks.0.attn.c_proj.weight: 0.1234 > 0.1 (learning rate may be too high)
-WARNING    blocks.5.mlp.c_fc.weight: 0.00000008 < 1e-7 (learning rate may be too low)
-```
-
-#### 1.3 Gradient Flow Visualization
-
-**Method**: `_log_gradient_histograms(step)`
-
-**Metrics**:
-- Full gradient histograms (distribution shapes)
-- Percentiles: min, p25, p50 (median), p75, p95, p99, max
-
-**TensorBoard**: `gradients_hist/{layer_name}` (Histograms/Distributions tab)
-
-**Console Output** (every 1000 steps):
-```
-INFO  Gradient distribution summary (step 1000):
-INFO    blocks.0.attn.c_proj.weight: min=-0.002345, p25=-0.000456,
-      median=0.000012, p75=0.000489, p95=0.001234, max=0.002567
-```
-
-**Detects**:
-- Multi-modal distributions (multiple peaks)
-- Outliers and heavy tails
-- Dead neurons (gradients concentrated at zero)
-- Distribution shifts over time
-
----
-
-## Core Monitoring Metrics
-
-### Loss Metrics
-
-| Metric | Healthy Pattern | Red Flag |
-|--------|-----------------|----------|
-| **Training Loss** | Smooth decrease, occasional plateaus | Spikes, NaN, increase |
-| **Validation Loss** | Decreases with train loss | Much higher than train |
-
-**What to Expect**:
-- Loss decreases in "hockey stick" pattern
-- Initial rapid decrease, then gradual improvement
-- Small plateaus during LR warmup/decay are normal
-
-**When to Worry**:
-- Loss spikes > 10× moving average
-- Loss becomes NaN or Inf
-- Validation loss increases while training decreases (overfitting)
-
-### Gradient Metrics
-
-| Metric | Healthy Range | Red Flag |
-|--------|---------------|----------|
-| **Global Gradient Norm** | 0.1 - 10.0 | < 0.01 or > 100 |
-| **Per-Layer Gradient Norm** | Early layers 2-5× smaller than last | Early < 1% of last |
-| **Gradient Mean** | Near zero (small values) | Large values, skewed |
-| **Update Ratio** | 1e-5 to 1e-2 (depends on phase) | > 0.1 or < 1e-7 |
-
-**Phase-Dependent Update Ratios**:
-- Early training (0-1K steps): 1e-3 to 1e-2
-- Mid training (1K-10K steps): 1e-4 to 1e-3
-- Late training (10K+ steps): 1e-5 to 1e-4
-
-**When to Worry**:
-- **Vanishing gradients**: First layer < 1% of last layer
-- **Exploding gradients**: Any layer > 100
-- **Update ratio > 0.1**: Reduce LR by 5-10×
-- **Update ratio < 1e-7**: Increase LR by 5-10×
-
-### Weight Metrics
-
-| Metric | Healthy Pattern | Red Flag |
-|--------|-----------------|----------|
-| **Weight Norm** | Grows slowly (10-50% over training) | Sudden spikes > 10× |
-| **Per-Layer Weight Norms** | Consistent ratios across layers | Diverge by > 1000× |
-
-### Performance Metrics
-
-| Metric | Healthy Range | Red Flag |
-|--------|---------------|----------|
-| **Tokens/Second** | Consistent (±5%) | Drops > 50% |
-| **GPU Utilization** | 80-95% | < 50% or > 98% |
-| **Memory Usage** | 70-90% of VRAM | Spikes near limit |
-| **Step Time** | Consistent (±10%) | Increases > 2× |
-
----
-
-## How to Use
-
-### Basic Training
-
-Gradient monitoring is automatically enabled when you run training:
+### 1) Run training (writes TensorBoard event files)
 
 ```bash
-python3 examples/train_mvp.py
+python examples/train_mvp.py
 ```
 
-### TensorBoard Visualization
+### 2) View metrics in TensorBoard
 
 ```bash
-tensorboard --logdir=logs/
+# Option A: helper script (if present in your checkout)
+./start_tensorboard.sh
+
+# Option B: start TensorBoard directly
+tensorboard --logdir=outputs --port=6006 --host=localhost
 ```
 
-Navigate to `http://localhost:6006`:
+Open `http://localhost:6006`.
 
-**Scalars Tab**:
-- `gradients/` - Per-layer gradient statistics
-  - Compare layers by overlaying multiple
-  - Look for smooth decreasing trends
-- `updates/` - Weight update ratios
-  - Check all layers in healthy range (1e-5 to 1e-2)
-  - Debug layers with ratios > 0.1 or < 1e-7
+### 3) Where logs live (source of truth)
 
-**Histograms/Distributions Tab**:
-- `gradients_hist/` - Full gradient distributions
-  - Watch distribution shape evolution
-  - Look for bell curves centered at zero
-  - Identify multi-modal patterns, outliers
+Event files are written to:
 
-**Console Output** (automatic):
-- Every 100 steps: Per-layer gradient stats
-- Every 100 steps: Update ratio alerts (if issues)
-- Every 1000 steps: Gradient distribution summary
-
-### Interpreting Histogram Shapes
-
-**HEALTHY**:
 ```
-Normal Distribution:    ╭────╮
-                        ╱      ╲   ← Centered at zero, smooth spread
-                       ╱        ╲
+{config.log_dir}/{config.run_name}/
 ```
 
-**UNHEALTHY**:
-```
-Multi-modal:        ╭╮  ╭╮      ← Multiple behaviors
-                    ╰╯  ╰╯         (e.g., attention vs MLP)
+Defaults (see `../src/config.py`):
+- `Config.log_dir = "outputs"`
+- `Config.run_name = "nano_train_mvp"`
 
-Heavy Tails:       ╭───╮          ← Extreme outliers
-                   ╱     ╲___
-                  ╱          ╲___
-
-Shifted Center:      ╭────╮     ← Not centered at zero
-                     ╱      ╲
-                    ╱        ╲
-
-Collapsed:           │            ← Dead gradients
-                     │
-```
+So by default: `outputs/nano_train_mvp/`.
 
 ---
 
-## Troubleshooting Guide
+## Monitoring Modes (bounded by default)
 
-### Problem 1: Loss Not Decreasing
+Configured via `Config.monitoring.mode` (see `../src/config.py`):
 
-**Symptoms**: Loss flat or decreasing very slowly
+- `minimal`: performance + core scalars only (no per-parameter or histogram work).
+- `standard` (default): **bounded** monitoring. The number of time series scales with
+  **#layers**, not **#parameter tensors**.
+- `debug`: opt-in deep dive; enables per-parameter scalars/histograms (expensive).
 
-**Diagnosis Steps**:
-1. Check gradient norms:
-   ```python
-   # In TensorBoard: gradients/{layer}/norm
-   ```
-   - Too low (< 0.01)? → Increase LR
-   - Too high (> 100)? → Enable gradient clipping
-
-2. Check update ratios:
-   ```python
-   # In TensorBoard: updates/{layer}/ratio
-   ```
-   - All low? → Increase global LR by 5-10×
-   - Single layer high? → Check that layer's initialization
-
-3. Check histograms:
-   ```python
-   # In TensorBoard: gradients_hist/{layer}
-   ```
-   - Collapsed to zero? → Vanishing gradients
-   - Multi-modal? → Check layer architecture
-
-**Solutions**:
-- Increase learning rate (if gradients too small)
-- Enable gradient clipping (if gradients too large)
-- Check for dead ReLUs (if gradients are zero)
-- Verify data is being loaded correctly
-
-### Problem 2: Loss Spike
-
-**Symptoms**: Sudden large increase in loss (e.g., 2.5 → 10.0)
-
-**Diagnosis Steps**:
-1. Check gradient norms:
-   - Sudden spike? → Gradient explosion
-   - Fix: Reduce LR, enable clipping
-
-2. Check update ratios:
-   - Sudden increase > 0.1? → LR too high
-   - Fix: Reduce LR by 5-10×
-
-3. Check histograms:
-   - Heavy tails? → Outliers causing instability
-   - Fix: Gradient clipping, batch normalization
-
-**Solutions**:
-- Reduce learning rate by 5-10×
-- Enable gradient clipping (max_norm=1.0)
-- Check for batch contamination (outliers)
-- Switch from FP16 to BF16 or FP32
-
-### Problem 3: Validation Loss Increasing
-
-**Symptoms**: Training loss decreases but validation increases
-
-**Diagnosis Steps**:
-1. Check gradient norms (train vs val)
-   - Train much higher? → Overfitting
-   - Fix: Early stopping, regularization
-
-2. Check per-layer patterns
-   - Later layers much larger? → Overfitting in head
-   - Fix: Weight decay, dropout
-
-3. Check update ratios
-   - Still high in late training? → LR not decayed
-   - Fix: Check LR schedule
-
-**Solutions**:
-- Add/increase weight decay
-- Add dropout layers
-- Implement early stopping
-- Reduce model capacity
-- Increase training data
-
-### Problem 4: Specific Layer Not Learning
-
-**Symptoms**: One layer has much smaller gradients than others
-
-**Diagnosis Steps**:
-1. Check gradient norm for that layer:
-   - Much smaller than others? → Vanishing
-   - Fix: Residual connections, layer norm
-
-2. Check update ratio for that layer:
-   - Near zero? → Layer not receiving gradients
-   - Fix: Check connectivity, skip connections
-
-3. Check histogram:
-   - Different shape than others? → Architecture issue
-   - Fix: Check layer initialization, activation function
-
-**Solutions**:
-- Add residual connections
-- Add layer normalization
-- Check for disconnected layers
-- Verify weight initialization
-
-### Problem 5: Gradient Explosion
-
-**Symptoms**: Gradient norms > 100, loss spikes to NaN
-
-**Diagnosis**:
-- Check global gradient norm in TensorBoard
-- Look for sudden spikes in `Gradients/norm`
-
-**Solutions**:
-- Enable gradient clipping (max_norm=1.0)
-- Reduce learning rate by 10×
-- Check sequence length (longer = more unstable)
-- Use gradient checkpointing
-
-### Problem 6: Gradient Vanishing
-
-**Symptoms**: Early layers have near-zero gradients
-
-**Diagnosis**:
-- Compare first layer norm to last layer norm
-- Ratio < 0.01 indicates vanishing
-
-**Solutions**:
-- Increase learning rate
-- Use gradient clipping with minimum threshold
-- Add residual connections
-- Use layer normalization
-- Reduce network depth
+**Histogram cadence** is controlled by `Config.monitoring.histogram_steps` (default: `1000`).
 
 ---
 
-## Best Practices
+## Notation / Glossary
 
-### Logging Configuration
+Let:
 
-**DO**:
-- ✅ Log gradients every step (lightweight)
-- ✅ Log weights every 100 steps (medium weight)
-- ✅ Use TensorBoard for visualization
-- ✅ Set up automated alerts for red conditions
-
-**DON'T**:
-- ❌ Log activations every step (too heavy)
-- ❌ Use multiple logging frameworks (confusing)
-- ❌ Log without timestamps (hard to debug)
-
-### Logging Frequency Guide
-
-| Metric | Frequency | Rationale |
-|--------|-----------|-----------|
-| Loss | Every step | Critical for convergence |
-| Learning rate | Every step | Debug schedule issues |
-| Gradient norm (global) | Every step | Detect explosion early |
-| Per-layer gradients | Every log_steps | Detailed debugging |
-| Per-layer weights | Every 100-1000 steps | Track evolution |
-| Throughput | Every 100 steps | Detect performance issues |
-| Memory usage | Every 100 steps | Prevent OOM |
-| Gradient histograms | Every 100-1000 steps | Expensive operation |
-| Validation loss | Every 1000 steps | Overfitting check |
-
-### TensorBoard Organization
-
-```
-runs/
-└── experiment_name/
-    ├── Loss/
-    │   ├── train           # Training loss
-    │   └── validation      # Validation loss
-    ├── Gradients/
-    │   ├── norm_global     # Global gradient norm
-    │   └── per_layer/      # Per-layer statistics
-    │       ├── blocks.0.attn.c_proj.weight/norm
-    │       ├── blocks.0.attn.c_proj.weight/mean
-    │       └── ...
-    ├── Gradients_Hist/     # Histogram distributions
-    │   └── per_layer/
-    │       └── ...
-    ├── Updates/
-    │   └── per_layer/      # Update ratios
-    │       └── ...
-    ├── Optimization/
-    │   ├── lr              # Learning rate
-    │   └── update_ratio    # Weight/gradient ratio
-    ├── Performance/
-    │   ├── tokens_per_sec  # Throughput
-    │   ├── gpu_utilization # GPU % used
-    │   └── memory_mb       # VRAM usage
-    └── Parameters/
-        └── norm_global     # Global weight norm
-```
-
-### Alert Thresholds
-
-```python
-ALERT_THRESHOLDS = {
-    'loss_spike': 10.0,           # 10× increase in loss
-    'grad_norm_max': 100.0,       # Maximum gradient norm
-    'grad_norm_min': 0.001,       # Minimum gradient norm
-    'weight_update_max': 0.1,     # Maximum update ratio
-    'weight_update_min': 1e-7,    # Minimum update ratio
-    'throughput_drop': 0.5,       # 50% throughput drop
-    'memory_usage': 0.95,         # 95% VRAM usage
-    'val_loss_increase': 0.1,    # 10% validation increase
-}
-```
+- Step index: \(t\)
+- Learning rate used for the step: \(\eta_t\) (logged as `LR`)
+- Parameters before the update: \(w_t\)
+- Gradients: \(g_t = \nabla_w L_t\)
+- Global L2 norm: \(\lVert x \rVert_2 = \sqrt{\sum_i x_i^2}\)
+- Gradient clipping threshold: \(G_{\max}\) (`Config.training.clip_grad`)
+- Small epsilon: \(\epsilon \approx 10^{-6}\)
 
 ---
 
-## Implementation Roadmap
+## Metric Table A — Training Stability / Precision (numerics + optimization)
 
-### Phase 1: Gradient Monitoring ✅ (COMPLETE)
+Default cadence:
+- **Core scalars**: every `Config.training.log_steps`
+- **Validation**: every `Config.training.eval_steps` (if a `val_loader` exists)
+- **Histograms**: every `Config.monitoring.histogram_steps` (sentinel-only in Standard)
 
-- [x] Per-layer gradient statistics (norm, mean, std)
-- [x] Weight update ratio monitoring
-- [x] Gradient flow visualization (histograms)
-- [x] Automatic alert system
-- [ ] Gradient accumulation tracking
-- [ ] Gradient flow quantile tracking
+| Metric (TensorBoard tag) | What it is | Formula | Good (heuristic) | Bad / Action threshold (heuristic) | Mode |
+|---|---|---|---|---|---|
+| `Loss/train` | EMA of token cross-entropy (train) | \( \bar L_t=\beta\bar L_{t-1}+(1-\beta)L_t\) | Decreasing trend | Flat for long window → LR/data issue | Standard |
+| `Health/loss_spike_ratio` | Spike detector vs previous EMA | \(S_t = L_t/\bar L_{t-1}\) | \(S_t < 2\) | Warn: \(>3\); Treat as “stop + debug”: \(>10\) | Standard |
+| `Loss/val` | Held-out token cross-entropy | \(L^{val}=\mathrm{mean}(-\log p_\theta(y\mid x))\) | Tracks train downward | Rising while train falls → overfit / eval mismatch | Standard |
+| `PPL/val` | Perplexity on val | \(\mathrm{PPL}=\exp(L^{val})\) | Decreasing | Rapid increase or non-finite | Standard |
+| `LR` | LR actually used for the update | \(\eta_t\) | Matches schedule | Unexpected discontinuities / zeros | Standard |
+| `Health/non_finite_loss` | Non-finite loss flag (fail-fast) | \(1[\neg\mathrm{isfinite}(L_t)]\) | Always 0 | If 1: run is invalid (training raises) | Standard |
+| `Data/ignore_frac` | Fraction of targets ignored in loss (train) | \(\#(y=-100)/\#y\) | Near 0 | Warn: \(>0.2\); Bad: \(>0.3\) | Standard |
+| `Data/ignore_frac_val` | Fraction ignored in loss (val) | same | Near 0 | Warn: \(>0.2\); Bad: \(>0.3\) | Standard |
+| `Gradients/norm` | Global grad norm (pre-clip) | \(\lVert g_t\rVert_2\) | \(\sim 10^{-1}\)–\(10^{1}\) | Warn: \(>10^2\) or \(<10^{-2}\); Bad: \(>10^3\) | Standard |
+| `Gradients/clip_coef` | Clip coefficient (how much we scale grads) | \(c_t=\min(1,\frac{G_{\max}}{\lVert g_t\rVert_2+\epsilon})\) | \(\approx 1\) most steps | Warn if \(<0.5\); Bad if \(<0.1\) repeatedly | Standard |
+| `Gradients/clipped` | Whether clipping was active | \(1[\lVert g_t\rVert_2>G_{\max}]\) | Mostly 0 | If frequent → LR too high or unstable batch | Standard |
+| `Parameters/norm` | Global param norm (pre-update) | \(\lVert w_t\rVert_2\) | Slowly drifting | Non-finite → run invalid (training raises) | Standard |
+| `Updates/ratio_global` | Relative update size (proxy) | \(\frac{\eta_t\cdot (c_t\lVert g_t\rVert_2)}{\lVert w_t\rVert_2+\epsilon}\) | \(10^{-5}\)–\(10^{-2}\) | Warn: \(>10^{-1}\) or \(<10^{-7}\); Bad: \(>3\times10^{-1}\) | Standard |
+| `Updates/ratio_p50` | Median update ratio over **block-main weights** | quantile of ratios | Stable | Very low \(<10^{-7}\) → too-small updates | Standard |
+| `Updates/ratio_p95` | Tail update ratio (robust high end) | quantile | Not near \(10^{-1}\) | Warn if \(>10^{-1}\) | Standard |
+| `Updates/ratio_max` | Max update ratio (outlier detector) | max | Stable | Bad if \(>3\times10^{-1}\) | Standard |
+| `Gradients/block_{i}/norm` | Block aggregate grad norm (block-main weights) | \(\sqrt{\sum_j \lVert g_{i,j}\rVert_2^2}\) | Smooth across depth | Early blocks \(\ll\) last → vanishing | Standard |
+| `Updates/block_{i}/ratio` | Block update ratio (block-main weights) | \(\eta_t\lVert g_i\rVert/\lVert w_i\rVert\) | Similar order across depth | Early blocks \(\ll\) last → “only last layers move” | Standard |
+| `Gradients/depth_ratio_first_last` | First/last block grad ratio | \(\lVert g_0\rVert/\lVert g_{L-1}\rVert\) | \(0.1\)–\(1.0\) | Warn: \(<0.05\); Bad: \(<0.01\) | Standard |
+| `Updates/depth_ratio_first_last` | First/last block update ratio | \(r_0/r_{L-1}\) | \(0.1\)–\(1.0\) | Warn: \(<0.05\); Bad: \(<0.01\) | Standard |
+| `Activations/{site}/rms` | LayerNorm output RMS (sentinel sites) | \(\sqrt{\mathrm{mean}(a^2)}\) | \(\approx 1\) | Warn: \(<0.5\) or \(>2\); Bad: \(<0.25\) or \(>4\) | Standard |
+| `Activations/{site}/max_abs` | Max abs activation (sentinel) | \(\max|a|\) | Stable | Warn: \(>20\); Bad: \(>50\) | Standard |
+| `gradients/{param}/norm|mean|std` | Per-parameter gradient localization | \(\lVert g_i\rVert,\mu(g_i),\sigma(g_i)\) | mean near 0, std nonzero | Large outliers vs peers | Debug (sentinel-only in Standard) |
+| `updates/{param}/ratio|update_norm|weight_norm` | Per-parameter update localization | ratio as above | Stable | Outliers \(>0.1\) or \(<10^{-7}\) | Debug (sentinel-only in Standard) |
+| `gradients_hist/{param}` | Gradient histogram (shape) | distribution | Symmetric, stable tails | Heavy tails growing; collapse near 0 | Debug (sentinel-only in Standard) |
+| `weights/{param}/norm` | Per-parameter weight norm | \(\lVert w_i\rVert_2\) | Stable | Sudden jumps / drift | Debug (sentinel-only in Standard) |
+| `Weights/block_{i}/norm` | Block aggregate weight norm | \(\sqrt{\sum_j \lVert w_{i,j}\rVert_2^2}\) | Similar scale across depth | Warn if max/min \(>1000\times\) | Standard |
+| `weights_hist/{param}` | Weight histogram (shape) | distribution | Stable tails | Heavy tails / drift | Debug (sentinel-only in Standard) |
 
-### Phase 2: Weight & Activation Monitoring (PLANNED)
-
-- [ ] Per-layer weight norm logging
-- [ ] Weight distribution tracking (histograms)
-- [ ] Activation statistics (mean, std, min, max)
-- [ ] Dead neuron detection
-- [ ] Activation flow visualization
-- [ ] Layer-wise feature statistics
-
-### Phase 3: Performance Monitoring (PLANNED)
-
-- [ ] Throughput tracking (tokens/sec)
-- [ ] GPU utilization logging
-- [ ] Memory usage profiling
-- [ ] Step time breakdown (forward/backward/optimize)
-- [ ] Communication overhead tracking
-- [ ] Data loading statistics
-
-### Phase 4: Convergence & Stability (PLANNED)
-
-- [ ] Loss plateau detection
-- [ ] Validation divergence alerts
-- [ ] Learning rate schedule validation
-- [ ] Training convergence prediction
-- [ ] Early stopping criteria
-- [ ] Overfitting detection
-
-### Phase 5: Advanced Diagnostics (PLANNED)
-
-- [ ] Automated health checks
-- [ ] Alert system (email/slack integration)
-- [ ] Anomaly detection (statistical)
-- [ ] Comparative analysis (run comparison)
-- [ ] Debug mode (detailed logging on failure)
-- [ ] Recovery recommendations
+**Where this is implemented**: `../src/trainer.py` (training loop + monitoring helpers) and
+`../src/config.py` (modes + thresholds).
 
 ---
 
-## Quick Reference
+## Metric Table B — Training Performance (time + throughput + memory)
 
-### Red Alert Conditions 🚨
-
-**Immediate Action Required** (Stop Training):
-- Loss is NaN/Inf
-- Loss spikes > 100×
-- Gradient norm > 1000
-- GPU memory OOM
-- Throughput drops > 80%
-
-**Warning Conditions** (Monitor Closely):
-- Validation loss plateau (no improvement > 10K steps)
-- Gradient norm decay (< 0.1× starting value)
-- Per-layer gradient variance > 100× across depth
-- Weight update ratio < 1e-7 or > 0.1
-
-### Healthy Training Checklist ✅
-
-- [ ] Loss decreases smoothly (no spikes)
-- [ ] Gradient norms in 0.1-10 range
-- [ ] Update ratios in phase-appropriate range
-- [ ] Gradient histograms show bell curves at zero
-- [ ] Per-layer gradient variance < 100×
-- [ ] Throughput stable (±5%)
-- [ ] Memory usage stable (70-90% VRAM)
-- [ ] No update ratio alerts
-
-### Debugging Workflow
-
-```
-Training Issue Detected
-         ↓
-Check Loss Trend (Spikes? NaN? Flat?)
-         ↓
-Check Gradient Norms (Too high? Too low?)
-         ↓
-Check Update Ratios (All same? Single outlier?)
-         ↓
-Check Histograms (Distribution shape?)
-         ↓
-Identify Root Cause
-         ↓
-Apply Fix (LR, clipping, architecture)
-         ↓
-Monitor Recovery
-```
+| Metric (TensorBoard tag) | What it is | Formula | Good (heuristic) | Bad / Action threshold (heuristic) |
+|---|---|---|---|---|
+| `Time/step_seconds` | Wall time per training step | \(t_{\text{step}}\) | Stable (±10%) | Persistent \(>2\times\) jump → regression |
+| `Time/data_wait_seconds` | Time waiting for next batch | \(t_{\text{wait}}\) | Small vs step time | Persistent large wait → input-bound |
+| `Time/data_wait_frac` | Input-bound indicator | \(t_{\text{wait}}/t_{\text{step}}\) | < 0.3 | Warn: > 0.3; Bad: > 0.5 |
+| `Throughput/steps_per_second` | Steps/sec over the current window | steps / time | Stable | Drop \(>30\%\) needs investigation |
+| `Throughput/tokens_per_second` | Tokens/sec over the current window | \(\sum N_{\text{tok}}/\Delta t\) | Stable | Drop \(>50\%\) → likely regression |
+| `Throughput/samples_per_second` | Samples/sec over the current window | samples / time | Stable | Same as above |
+| `Memory/allocated_mb` | Active CUDA memory | MB | Stable | Upward creep suggests leak |
+| `Memory/reserved_mb` | CUDA allocator reserved memory | MB | Stabilizes after warmup | Persistent climb → fragmentation/leak risk |
+| `Memory/max_allocated_mb` | High-water mark allocated | MB | Stable | Approaches VRAM limit → OOM risk |
+| `Memory/max_reserved_mb` | High-water mark reserved | MB | Stable | Approaches VRAM limit → OOM risk |
+| `Memory/reserved_frac` | Reserved / total VRAM | reserved / total | < 0.90 | Warn: > 0.90; Bad: > 0.95 |
+| `Time/checkpoint_seconds` | Checkpoint save latency | seconds | Occasional spikes ok | Persistent stalls → I/O bottleneck |
 
 ---
 
-## References
+## Interpretation Rules (fast diagnosis)
 
-### Academic Papers
+### Rule 1: “Is this run numerically valid?”
 
-- [AtPatch: Debugging Transformers via Hot-Fixing Over-Attention](https://arxiv.org/html/2601.21695v1) (2026)
-- [Transformer Instability in Long Sequence Training](https://openreview.net/forum?id=hkVTFQQHBd) (2026)
+Stop and debug immediately if any are non-finite:
+- `Health/non_finite_loss` becomes 1
+- `Gradients/norm` becomes non-finite
+- `Parameters/norm` becomes non-finite
 
-### Practical Guides
+First actions:
+- Reduce `Config.training.learning_rate` by 5–10×
+- Ensure `Config.training.clip_grad` is enabled (default: 1.0)
+- If on FP16: switch to BF16 (nano-train defaults to BF16 when available)
 
-- [LLM Evaluation: Frameworks, Metrics, and Best Practices (2026 Edition)](https://medium.com/@future_agi/llm-evaluation-frameworks-metrics-and-best-practices-2026-edition-162790f831f4)
-- [The Complete Guide to LLM Evaluation Tools in 2026](https://futureagi.substack.com/p/the-complete-guide-to-llm-evaluation-c82)
-- [The LLM Evaluation Guide: Metrics, Methods & Best Practices](https://www.comet.com/site/blog/llm-evaluation-guide/)
-- [7 RL Debugging Moves When Training Looks Random](https://medium.com/@duckweave/7-rl-debugging-moves-when-training-looks-random-3d048d70616e)
+### Rule 2: “Are updates the right size?”
 
-### Tools & Frameworks
+Look at:
+- `Updates/ratio_global`
+- `Updates/ratio_p95` and `Updates/ratio_max`
 
-- [Weights & Biases (W&B)](https://wandb.ai/) - Experiment tracking
-- [TensorBoard](https://www.tensorflow.org/tensorboard) - Visualization
-- [MLflow](https://mlflow.org/) - Open-source tracking
-- [Neptune.ai](https://neptune.ai/) - Experiment management
-- [DeepEval](https://deepeval.ai/) - Production monitoring
+Interpretation:
+- Too high (≈\(10^{-1}\) or above): updates are huge → instability risk.
+- Too low (≈\(10^{-7}\) or below): weights barely move → training will look flat.
+
+First actions:
+- Too high: reduce LR 5–10×; check for frequent clipping (`Gradients/clipped`).
+- Too low: increase LR 5–10×; confirm gradients aren’t vanishing (`Gradients/depth_ratio_first_last`).
+
+### Rule 3: “Are gradients flowing through depth?”
+
+Look at:
+- `Gradients/block_{i}/norm`
+- `Gradients/depth_ratio_first_last`
+
+Interpretation rule:
+- If early blocks are consistently < 1% of the last block, you’re effectively only training the top.
+
+First actions:
+- Increase LR slightly (if global update ratios are too low).
+- Check data/labels (high `Data/ignore_frac` makes learning look dead).
+
+### Rule 4: “Is the run input-bound or compute-bound?”
+
+Look at:
+- `Time/data_wait_frac`
+- `Throughput/tokens_per_second`
+
+Interpretation:
+- If `Time/data_wait_frac` is high, you’re waiting on the dataloader/CPU, not the GPU.
+
+First actions:
+- Reduce Python overhead; simplify dataset transforms.
+- Consider increasing batch size if memory allows.
+
+### Rule 5: “Am I heading toward OOM?”
+
+Look at:
+- `Memory/reserved_frac`
+- `Memory/max_reserved_mb`
+
+First actions:
+- Reduce batch size or sequence length.
+- Enable BF16 (already default).
 
 ---
 
-**Document Status**: Living document, updated as new monitoring features are implemented.
+## Tuning Knobs (config-driven) and what to watch
 
-**Next Implementation**: Phase 2 - Weight & Activation Monitoring
+All knobs live in `../src/config.py`.
 
-**For Questions**: Refer to the [Troubleshooting Guide](#troubleshooting-guide) or [Implementation Roadmap](#implementation-roadmap)
+- `Config.training.learning_rate`: primarily moves `Updates/*` ratios up/down. Confirm by watching
+  `Updates/ratio_global` and `Updates/ratio_p95`.
+- `Config.training.clip_grad`: controls clipping. Confirm with `Gradients/clip_coef` and
+  `Gradients/clipped`.
+- `Config.training.warmup_steps`: affects early `LR` and early update ratios. Watch `LR` and
+  `Updates/ratio_global`.
+- `Config.training.log_steps`: controls scalar logging cadence. Watch tags update every N steps.
+- `Config.monitoring.histogram_steps`: controls histogram cadence. Watch `*_hist/*` update every N.
+- `Config.training.eval_steps`: controls `Loss/val` / `PPL/val` cadence.
+- `Config.monitoring.mode`: `standard` for bounded; `debug` for per-parameter deep dives.
+- `Config.monitoring.sync_cuda_timing`: if `True`, `Time/step_seconds` is measured with CUDA sync
+  (more accurate, more overhead).
+
+---
+
+## Known Limitations (current MVP)
+
+- Update ratios are **proxies** for AdamW (moments + weight decay are not modeled).
+- No GPU utilization logging yet (we only log wall time + throughput + CUDA memory).
+- No activation histograms (only sentinel LN output scalars).
+- No detailed time breakdown (forward/backward/optim) unless we add a future timing module.
+
+---
+
+## Roadmap (high-signal next additions)
+
+- Configurable alerts (Slack/email) + structured “health check” summaries.
+- More activation sentinels (expand to `mlp_norm`, etc.) and optional histograms.
+- Timing breakdown (forward/backward/optimizer), optionally with CUDA events.
+- Richer validation metrics (accuracy proxies, sample generation checks).
+

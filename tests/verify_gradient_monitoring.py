@@ -7,35 +7,54 @@ is correctly integrated into the training loop without requiring
 PyTorch to be installed.
 """
 
+from __future__ import annotations
+
 import ast
 import sys
 from pathlib import Path
 
 
-def check_gradient_monitoring():
+def _contains_name(node: ast.AST, name: str) -> bool:
+    """Return True if the AST subtree contains a Name node matching `name`."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id == name:
+            return True
+    return False
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    """Return a dotted-name string for an Attribute/Name chain (best-effort)."""
+    parts = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    else:
+        return None
+    return ".".join(reversed(parts))
+
+
+def check_gradient_monitoring() -> bool:
     """Verify gradient monitoring is properly implemented."""
-
     trainer_path = Path(__file__).parent.parent / "src" / "trainer.py"
-
     if not trainer_path.exists():
         print(f"✗ Trainer file not found: {trainer_path}")
         return False
 
-    with open(trainer_path) as f:
-        code = f.read()
-
+    code = trainer_path.read_text(encoding="utf-8")
     tree = ast.parse(code)
 
     # Check 1: _log_detailed_gradient_stats method exists
     method_found = False
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == '_log_detailed_gradient_stats':
+        if isinstance(node, ast.FunctionDef) and node.name == "_log_detailed_gradient_stats":
             method_found = True
             print(f"✓ Method _log_detailed_gradient_stats defined (line {node.lineno})")
 
-            # Check parameters
             args = [arg.arg for arg in node.args.args]
-            if args == ['self', 'step']:
+            if args[:2] == ["self", "step"]:
                 print("  ✓ Has correct parameters: self, step")
             else:
                 print(f"  ✗ Unexpected parameters: {args}")
@@ -46,77 +65,141 @@ def check_gradient_monitoring():
         print("✗ Method _log_detailed_gradient_stats not found")
         return False
 
-    # Check 2: Method is called in train() method
-    train_method = None
+    # Check 2: Methods are called in training_step() before optimizer.zero_grad()
+    trainer_class = None
     for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == 'Trainer':
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name == 'train':
-                    train_method = item
-                    break
-
-    if train_method is None:
-        print("✗ Train method not found in Trainer class")
-        return False
-
-    # Look for the call in the source
-    source_lines = code.split('\n')
-    call_found = False
-    call_line = None
-
-    for i, line in enumerate(source_lines):
-        if '_log_detailed_gradient_stats' in line and 'self.' in line:
-            # Make sure it's a call, not just a comment or definition
-            if 'def ' not in line and not line.strip().startswith('#'):
-                call_found = True
-                call_line = i + 1
-                print(f"✓ Method called in train() at line {call_line}")
-                break
-
-    if not call_found:
-        print("✗ Method _log_detailed_gradient_stats not called in train()")
-        return False
-
-    # Check 3: Verify it's inside the logging block
-    # Find the log_this_step check and verify proper indentation
-    log_check_found = False
-    log_line = None
-    for i in range(call_line - 50, call_line):
-        if i >= 0 and 'if log_this_step:' in source_lines[i]:
-            log_check_found = True
-            log_line = i + 1
-            print(f"✓ Call is inside the log_this_step conditional block (line {log_line})")
+        if isinstance(node, ast.ClassDef) and node.name == "Trainer":
+            trainer_class = node
             break
 
-    if not log_check_found:
-        print("⚠ Warning: Could not verify log_this_step block (may be OK)")
+    if trainer_class is None:
+        print("✗ Trainer class not found")
+        return False
 
-    # Check 4: Verify method content
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == '_log_detailed_gradient_stats':
-            # Check for named_parameters usage
-            method_source = '\n'.join(source_lines[node.lineno - 1:node.lineno + 30])
-            checks = {
-                'named_parameters': 'named_parameters' in method_source,
-                'TensorBoard logging': 'writer.add_scalar' in method_source,
-                'console logging': 'logger.info' in method_source and 'grad_norm' in method_source,
+    training_step_method = None
+    for item in trainer_class.body:
+        if isinstance(item, ast.FunctionDef) and item.name == "training_step":
+            training_step_method = item
+            break
+
+    if training_step_method is None:
+        print("✗ training_step method not found in Trainer class")
+        return False
+
+    class CallCollector(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.log_guard_depth = 0
+            self.hist_guard_depth = 0
+            self.calls = {
+                "self._log_detailed_gradient_stats": [],
+                "self._log_weight_update_ratios": [],
+                "self._log_gradient_histograms": [],
+                "self.optimizer.zero_grad": [],
             }
 
-            for check_name, result in checks.items():
-                if result:
-                    print(f"  ✓ Uses {check_name}")
-                else:
-                    print(f"  ✗ Missing {check_name}")
-                    return False
-            break
+        def visit_If(self, node: ast.If) -> None:
+            is_log_guard = _contains_name(node.test, "log_this_step")
+            is_hist_guard = _contains_name(node.test, "hist_this_step")
+            if is_log_guard:
+                self.log_guard_depth += 1
+            if is_hist_guard:
+                self.hist_guard_depth += 1
+            for child in node.body:
+                self.visit(child)
+            for child in node.orelse:
+                self.visit(child)
+            if is_log_guard:
+                self.log_guard_depth -= 1
+            if is_hist_guard:
+                self.hist_guard_depth -= 1
+
+        def visit_Call(self, node: ast.Call) -> None:
+            dotted = _dotted_name(node.func)
+            if dotted in self.calls:
+                self.calls[dotted].append(
+                    (
+                        int(getattr(node, "lineno", -1)),
+                        self.log_guard_depth > 0,
+                        self.hist_guard_depth > 0,
+                    )
+                )
+            self.generic_visit(node)
+
+    collector = CallCollector()
+    collector.visit(training_step_method)
+
+    def min_line(name: str) -> int:
+        if not collector.calls[name]:
+            return -1
+        return min(lineno for lineno, _guarded, _hist_guarded in collector.calls[name])
+
+    log_line = min_line("self._log_detailed_gradient_stats")
+    ratios_line = min_line("self._log_weight_update_ratios")
+    hist_line = min_line("self._log_gradient_histograms")
+    zero_grad_line = min_line("self.optimizer.zero_grad")
+
+    if log_line < 0:
+        print("✗ _log_detailed_gradient_stats not called in training_step()")
+        return False
+    print(f"✓ _log_detailed_gradient_stats called in training_step() at line {log_line}")
+
+    if ratios_line < 0:
+        print("✗ _log_weight_update_ratios not called in training_step()")
+        return False
+    print(f"✓ _log_weight_update_ratios called in training_step() at line {ratios_line}")
+
+    if hist_line < 0:
+        print("✗ _log_gradient_histograms not called in training_step()")
+        return False
+    print(f"✓ _log_gradient_histograms called in training_step() at line {hist_line}")
+
+    if zero_grad_line < 0:
+        print("✗ optimizer.zero_grad not called in training_step()")
+        return False
+    print(f"✓ optimizer.zero_grad called in training_step() at line {zero_grad_line}")
+
+    for name, call_line in [
+        ("_log_detailed_gradient_stats", log_line),
+        ("_log_weight_update_ratios", ratios_line),
+        ("_log_gradient_histograms", hist_line),
+    ]:
+        if call_line >= zero_grad_line:
+            print(
+                f"✗ {name} called after optimizer.zero_grad "
+                f"(line {call_line} >= {zero_grad_line})"
+            )
+            return False
+        print(f"  ✓ {name} runs before optimizer.zero_grad")
+
+    for dotted in [
+        "self._log_detailed_gradient_stats",
+        "self._log_weight_update_ratios",
+    ]:
+        unguarded = [
+            lineno
+            for lineno, guarded, _hist_guarded in collector.calls[dotted]
+            if not guarded
+        ]
+        if unguarded:
+            print(f"✗ {dotted} is not guarded by log_this_step at lines {unguarded}")
+            return False
+    print("✓ Scalar monitoring calls are guarded by log_this_step")
+
+    unguarded_hist = [
+        lineno
+        for lineno, _guarded, hist_guarded in collector.calls["self._log_gradient_histograms"]
+        if not hist_guarded
+    ]
+    if unguarded_hist:
+        print(f"✗ self._log_gradient_histograms is not guarded by hist_this_step at lines {unguarded_hist}")
+        return False
+    print("✓ Histogram monitoring call is guarded by hist_this_step")
 
     print("\n✓ All gradient monitoring checks passed!")
     print("\nWhat this enables:")
-    print("  • Per-layer gradient norm tracking")
-    print("  • Per-layer gradient mean/std tracking")
-    print("  • TensorBoard visualization of gradient flow")
-    print("  • Console logging every 100 steps")
-    print("  • Debug vanishing/exploding gradients")
+    print("  • Bounded monitoring by default (Standard mode)")
+    print("  • Deep-dive per-parameter monitoring (Debug mode)")
+    print("  • Reliable grad-dependent metrics (logged before zero_grad)")
 
     return True
 
@@ -141,3 +224,4 @@ if __name__ == "__main__":
         print("VERIFICATION FAILED ✗")
         print("=" * 70)
         sys.exit(1)
+

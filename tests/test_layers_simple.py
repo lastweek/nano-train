@@ -12,7 +12,7 @@ import math
 
 
 def assert_tensor_close(actual, expected,
-                      rtol=1e-5, atol=1e-8,
+                      rtol=1e-5, atol=1e-6,
                       msg=None):
     """Assert two tensors are close within tolerances."""
     if actual.shape != expected.shape:

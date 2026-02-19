@@ -11,6 +11,7 @@ The goal is to verify the loss decreases and the model learns.
 import os
 import sys
 import torch
+from torch.utils.data import random_split
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -79,12 +80,39 @@ def main():
     # Update config with actual vocab size
     config.model.vocab_size = dataset.vocab_size
 
-    # Create dataloader
+    # Deterministic train/val split for monitoring Loss/val + PPL/val.
+    num_total = len(dataset)
+    num_train = int(num_total * float(config.data.train_split))
+    num_val = max(0, num_total - num_train)
+    if num_train <= 0 or num_val <= 0:
+        logger.warning(
+            "Dataset too small to split (total=%d, train_split=%.3f); running without validation.",
+            num_total,
+            float(config.data.train_split),
+        )
+        train_dataset = dataset
+        val_dataset = None
+    else:
+        generator = torch.Generator().manual_seed(int(config.seed))
+        train_dataset, val_dataset = random_split(
+            dataset,
+            [num_train, num_val],
+            generator=generator,
+        )
+        logger.info("Dataset split: train=%d, val=%d", len(train_dataset), len(val_dataset))
+
     train_loader = create_dataloader(
-        dataset,
+        train_dataset,
         batch_size=config.training.batch_size,
-        shuffle=True
+        shuffle=True,
     )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = create_dataloader(
+            val_dataset,
+            batch_size=config.training.batch_size,
+            shuffle=False,
+        )
 
     # Create model after vocab is known
     logger.info("Creating model...")
@@ -94,7 +122,7 @@ def main():
     dump_model_info(model, logger=logger, plot_distributions=False)
 
     # Create trainer
-    trainer = Trainer(model, config, train_loader, device)
+    trainer = Trainer(model, config, train_loader, device, val_loader=val_loader)
 
     # Train
     logger.info("=" * 50)
