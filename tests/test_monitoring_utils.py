@@ -9,10 +9,12 @@ from __future__ import annotations
 import math
 
 from src.monitoring import (
+    achieved_tflops,
     block_main_weight_names,
     candidate_sentinel_param_names,
     clip_coef,
     global_update_ratio,
+    mfu,
     resolve_sentinel_blocks,
     update_ratio,
 )
@@ -67,3 +69,8 @@ def test_update_ratio() -> None:
     ratio = update_ratio(1e-3, grad_norm=2.0, weight_norm=10.0, eps=1e-12)
     assert math.isclose(ratio, 2e-4, rel_tol=0.0, abs_tol=1e-12)
 
+
+def test_achieved_tflops_and_mfu() -> None:
+    tflops = achieved_tflops(1000.0, 1_000_000_000, flops_multiplier=6.0)
+    assert math.isclose(tflops, 6.0, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(mfu(tflops, peak_tflops=12.0), 0.5, rel_tol=0.0, abs_tol=1e-12)

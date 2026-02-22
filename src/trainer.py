@@ -11,6 +11,7 @@ from datetime import timedelta
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 # TensorBoard with graceful fallback
@@ -29,10 +30,13 @@ from src.config import Config
 from src.logging import get_logger
 from src.losses import CrossEntropyLoss
 from src.monitoring import (
+    achieved_tflops as compute_achieved_tflops,
     block_main_weight_names as monitoring_block_main_weight_names,
     candidate_sentinel_param_names,
     clip_coef as compute_clip_coef,
+    eval_artifact_hash as compute_eval_artifact_hash,
     global_update_ratio as compute_global_update_ratio,
+    mfu as compute_mfu,
     resolve_sentinel_blocks as compute_sentinel_blocks,
     update_ratio as compute_update_ratio,
 )
@@ -65,6 +69,12 @@ class Trainer:
 
         self._loss_ema: Optional[float] = None
 
+        # Fixed-probe monitoring (immutable batch + hash).
+        self._probe_batch_cpu: Optional[dict[str, torch.Tensor]] = None
+        self._probe_hash: Optional[str] = None
+        self._probe_source: Optional[str] = None
+        self._probe_prev_log_probs_last: Optional[torch.Tensor] = None
+
         # Optimizer
         self.optimizer = create_optimizer(
             model,
@@ -94,11 +104,18 @@ class Trainer:
         self._sentinel_blocks = self._resolve_sentinel_blocks()
         self._block_main_params_by_block = self._build_block_main_params_by_block()
         self._sentinel_param_names = self._build_sentinel_param_names()
+        self._attn_modules_by_block = self._resolve_attention_modules_by_block()
 
         # Activation monitoring hooks (LayerNorm output sentinels).
         self._activation_log_step: Optional[int] = None
         self._activation_log_enabled: bool = False
         self._activation_hook_handles = []
+
+        # Residual stream monitoring hooks (block outputs).
+        self._residual_log_step: Optional[int] = None
+        self._residual_log_enabled: bool = False
+        self._residual_hook_handles = []
+        self._residual_rms_baseline: dict[int, float] = {}
 
         # CUDA memory totals (for reserved fraction).
         self._cuda_total_mem_bytes: Optional[int] = None
@@ -108,6 +125,27 @@ class Trainer:
                 self._cuda_total_mem_bytes = int(props.total_memory)
             except Exception:
                 self._cuda_total_mem_bytes = None
+
+        # Optional NVML-based GPU telemetry (best-effort).
+        self._nvml = None
+        self._nvml_handle = None
+        if self.device.type == "cuda":
+            try:
+                import pynvml  # type: ignore
+
+                pynvml.nvmlInit()
+                device_index = self.device.index
+                if device_index is None:
+                    device_index = int(torch.cuda.current_device())
+                self._nvml = pynvml
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(int(device_index))
+            except Exception as exc:
+                logger.warning(
+                    "NVML metrics unavailable (pynvml not installed or init failed): %s",
+                    exc,
+                )
+                self._nvml = None
+                self._nvml_handle = None
 
         # TensorBoard writer
         self.writer = None
@@ -123,6 +161,72 @@ class Trainer:
             self.writer.add_scalar("Memory/total_mb", self._cuda_total_mem_bytes / (1024**2), 0)
 
         self._register_activation_hooks()
+        self._register_residual_hooks()
+        self._capture_probe_batch()
+
+    def _probe_hash_for_batch(self, input_ids: torch.Tensor, labels: torch.Tensor) -> str:
+        """Hash probe inputs/labels plus a few invariants to detect drift."""
+        return compute_eval_artifact_hash(
+            input_ids_bytes=input_ids.contiguous().numpy().tobytes(),
+            labels_bytes=labels.contiguous().numpy().tobytes(),
+            input_dtype=str(input_ids.dtype),
+            labels_dtype=str(labels.dtype),
+            input_shape=tuple(input_ids.shape),
+            labels_shape=tuple(labels.shape),
+            vocab_size=int(self.config.model.vocab_size),
+            max_seq_length=int(self.config.data.max_seq_length),
+            seed=int(self.config.seed),
+        )
+
+    def _capture_probe_batch(self) -> None:
+        """Capture an immutable probe batch used for fixed-probe metrics and artifact hashing."""
+        loader = None
+        source = None
+        if self.val_loader is not None:
+            loader = self.val_loader
+            source = "val"
+        elif self.train_loader is not None:
+            loader = self.train_loader
+            source = "train"
+
+        if loader is None:
+            return
+
+        try:
+            batch = next(iter(loader))
+        except Exception as exc:
+            logger.warning("Could not capture probe batch: %s", exc)
+            return
+
+        if not isinstance(batch, dict) or "input_ids" not in batch or "labels" not in batch:
+            if isinstance(batch, dict):
+                batch_keys = sorted(batch.keys())
+            else:
+                batch_keys = str(type(batch))
+            logger.warning("Probe batch missing required keys: %s", batch_keys)
+            return
+
+        input_ids = batch["input_ids"].detach().cpu().clone().contiguous()
+        labels = batch["labels"].detach().cpu().clone().contiguous()
+        self._probe_batch_cpu = {"input_ids": input_ids, "labels": labels}
+        self._probe_source = source
+        self._probe_hash = self._probe_hash_for_batch(input_ids, labels)
+
+        if self._probe_source == "train":
+            logger.warning(
+                "Fixed probe batch captured from train_loader "
+                "(shuffle may make comparisons unstable)."
+            )
+
+        if self.writer is None:
+            return
+
+        if hasattr(self.writer, "add_text"):
+            self.writer.add_text("Eval/eval_artifact_hash", str(self._probe_hash), 0)
+        else:
+            logger.warning(
+                "TensorBoard writer does not support add_text; skipping Eval/eval_artifact_hash."
+            )
 
     def _resolve_sentinel_blocks(self) -> tuple[int, ...]:
         """Resolve sentinel block indices for bounded monitoring."""
@@ -154,6 +258,234 @@ class Trainer:
         """Build the per-parameter sentinel set for Standard monitoring."""
         names = candidate_sentinel_param_names(sentinel_blocks=self._sentinel_blocks)
         return {name for name in names if name in self._named_params}
+
+    def _resolve_attention_modules_by_block(self) -> list[Optional[torch.nn.Module]]:
+        """Resolve attention modules per block for attention-internal monitoring."""
+        blocks = getattr(self.model, "blocks", None)
+        if blocks is None:
+            return []
+        modules: list[Optional[torch.nn.Module]] = []
+        for block in blocks:
+            modules.append(getattr(block, "attention", None))
+        return modules
+
+    def _set_attention_monitoring(self, *, blocks_to_monitor: set[int], tau: float) -> None:
+        """Enable attention monitoring for the requested blocks (disable for all others)."""
+        if not self._attn_modules_by_block:
+            return
+
+        for block_idx, attn in enumerate(self._attn_modules_by_block):
+            if attn is None:
+                continue
+            enabled = block_idx in blocks_to_monitor
+            if hasattr(attn, "set_monitoring"):
+                try:
+                    attn.set_monitoring(enabled, tau=float(tau))
+                    continue
+                except Exception:
+                    pass
+
+            if hasattr(attn, "_monitor_enabled"):
+                try:
+                    setattr(attn, "_monitor_enabled", bool(enabled))
+                    setattr(attn, "_monitor_tau", float(tau))
+                    if not enabled:
+                        setattr(attn, "_monitor_stats", None)
+                except Exception:
+                    continue
+
+    def _log_attention_metrics(self, step: int, *, blocks_to_monitor: set[int]) -> None:
+        """Log attention vitals (max attention logits, attention entropy) for bounded blocks."""
+        if self.monitoring_mode == "minimal":
+            return
+        if not blocks_to_monitor:
+            return
+
+        alerts = self.config.alerts
+
+        max_logit_overall: Optional[tuple[int, float]] = None
+        min_entropy_norm: Optional[tuple[int, float]] = None
+
+        for block_idx in sorted(blocks_to_monitor):
+            if block_idx < 0 or block_idx >= len(self._attn_modules_by_block):
+                continue
+            attn = self._attn_modules_by_block[block_idx]
+            if attn is None:
+                continue
+
+            stats = getattr(attn, "_monitor_stats", None)
+            if not stats:
+                continue
+
+            max_attn_logit = float(stats.get("max_attn_logit", float("nan")))
+            attn_entropy = float(stats.get("attn_entropy", float("nan")))
+            attn_entropy_norm = float(stats.get("attn_entropy_norm", float("nan")))
+
+            if self.writer is not None:
+                self.writer.add_scalar(
+                    f"Attention/block_{block_idx}/max_attn_logit",
+                    max_attn_logit,
+                    step,
+                )
+                self.writer.add_scalar(
+                    f"Attention/block_{block_idx}/attn_entropy",
+                    attn_entropy,
+                    step,
+                )
+                self.writer.add_scalar(
+                    f"Attention/block_{block_idx}/attn_entropy_norm",
+                    attn_entropy_norm,
+                    step,
+                )
+
+                if self.monitoring_mode == "debug" and "frac_logits_gt_tau" in stats:
+                    self.writer.add_scalar(
+                        f"Attention/block_{block_idx}/frac_logits_gt_tau",
+                        float(stats["frac_logits_gt_tau"]),
+                        step,
+                    )
+
+            if max_logit_overall is None or max_attn_logit > max_logit_overall[1]:
+                max_logit_overall = (block_idx, max_attn_logit)
+            if min_entropy_norm is None or attn_entropy_norm < min_entropy_norm[1]:
+                min_entropy_norm = (block_idx, attn_entropy_norm)
+
+        if step % 100 != 0:
+            return
+
+        if max_logit_overall is not None:
+            idx, value = max_logit_overall
+            if value > alerts.max_attn_logit_crit:
+                logger.warning(
+                    "Max attention logit CRIT (block %d, step %d): %.3f > %.3f",
+                    idx,
+                    step,
+                    value,
+                    alerts.max_attn_logit_crit,
+                )
+            elif value > alerts.max_attn_logit_warn:
+                logger.warning(
+                    "Max attention logit warning (block %d, step %d): %.3f > %.3f",
+                    idx,
+                    step,
+                    value,
+                    alerts.max_attn_logit_warn,
+                )
+
+            if min_entropy_norm is not None:
+                idx, value = min_entropy_norm
+                if value < alerts.attn_entropy_norm_warn:
+                    logger.warning(
+                        "Attention entropy-norm warning (block %d, step %d): %.4f < %.4f",
+                        idx,
+                        step,
+                        value,
+                        alerts.attn_entropy_norm_warn,
+                    )
+
+    def _check_opt_state_finite(self, step: int) -> None:
+        """Periodically verify optimizer moments/state tensors are finite (SEV0 if not)."""
+        if self.monitoring_mode == "minimal":
+            return
+
+        check_steps = int(self.config.monitoring.opt_state_check_steps)
+        if check_steps <= 0:
+            return
+        if step <= 0 or (step % check_steps) != 0:
+            return
+
+        if self.monitoring_mode == "debug":
+            named_params = list(self.model.named_parameters())
+        else:
+            names = sorted(self._sentinel_param_names)
+            named_params = [(name, self._named_params[name]) for name in names]
+
+        is_finite = True
+        bad_entries: list[tuple[str, str]] = []
+        for name, param in named_params:
+            state = self.optimizer.state.get(param)
+            if not state:
+                continue
+            for key in ("exp_avg", "exp_avg_sq"):
+                tensor = state.get(key)
+                if torch.is_tensor(tensor) and not torch.isfinite(tensor).all():
+                    is_finite = False
+                    bad_entries.append((name, key))
+                    break
+            if not is_finite and len(bad_entries) >= 5:
+                break
+
+        if self.writer is not None:
+            self.writer.add_scalar("Optimizer/opt_state_finite", 1.0 if is_finite else 0.0, step)
+
+        if not is_finite:
+            details = ", ".join([f"{name}:{key}" for name, key in bad_entries])
+            raise FloatingPointError(f"Non-finite optimizer state at step {step}: {details}")
+
+    @torch.no_grad()
+    def _run_fixed_probe(self, *, step: int) -> None:
+        """Run fixed-probe metrics and log behavioral drift signals."""
+        if self.monitoring_mode == "minimal":
+            return
+        if self._probe_batch_cpu is None or self._probe_hash is None:
+            return
+        if self.writer is None:
+            return
+
+        input_ids_cpu = self._probe_batch_cpu["input_ids"]
+        labels_cpu = self._probe_batch_cpu["labels"]
+        current_hash = self._probe_hash_for_batch(input_ids_cpu, labels_cpu)
+        if current_hash != self._probe_hash:
+            raise RuntimeError(
+                "Probe batch hash mismatch (mutable probe batch): "
+                f"{current_hash} != {self._probe_hash}"
+            )
+
+        input_ids = input_ids_cpu.to(self.device)
+        labels = labels_cpu.to(self.device)
+
+        self._activation_log_enabled = False
+        self._residual_log_enabled = False
+        self._set_attention_monitoring(
+            blocks_to_monitor=set(),
+            tau=float(self.config.monitoring.attn_tau),
+        )
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            if self.config.training.bf16 and torch.cuda.is_bf16_supported():
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    logits = self.model(input_ids)
+                    loss = self._compute_loss(logits, labels)
+            else:
+                logits = self.model(input_ids)
+                loss = self._compute_loss(logits, labels)
+
+            loss_value = float(loss.detach().cpu().item())
+            self.writer.add_scalar("Probes/fixed_probe_loss", loss_value, step)
+
+            logits_f = logits.float()
+            log_probs_last = F.log_softmax(logits_f[:, -1, :], dim=-1)
+            probs_last = log_probs_last.exp()
+            entropy_last = -(probs_last * log_probs_last).sum(dim=-1)
+            logit_entropy = float(entropy_last.mean().item())
+            self.writer.add_scalar("Probes/logit_entropy", logit_entropy, step)
+
+            topk = max(1, int(self.config.monitoring.probe_topk))
+            topk = min(topk, probs_last.size(-1))
+            topk_values = torch.topk(probs_last, k=topk, dim=-1).values
+            topk_mass = float(topk_values.sum(dim=-1).mean().item())
+            self.writer.add_scalar(f"Probes/topk_mass_k{topk}", topk_mass, step)
+
+            if self.monitoring_mode == "debug" and self._probe_prev_log_probs_last is not None:
+                prev = self._probe_prev_log_probs_last.to(probs_last.device)
+                kl = (probs_last * (log_probs_last - prev)).sum(dim=-1)
+                self.writer.add_scalar("Probes/output_kl_to_prev", float(kl.mean().item()), step)
+            if self.monitoring_mode == "debug":
+                self._probe_prev_log_probs_last = log_probs_last.detach().cpu()
+        finally:
+            self.model.train(was_training)
 
     def _register_activation_hooks(self) -> None:
         """Register forward hooks for activation sentinels (LayerNorm outputs)."""
@@ -195,6 +527,28 @@ class Trainer:
             handle = module.register_forward_hook(self._make_activation_hook(site))
             self._activation_hook_handles.append(handle)
 
+    def _register_residual_hooks(self) -> None:
+        """Register forward hooks for residual stream metrics (block outputs)."""
+        if self.monitoring_mode == "minimal":
+            return
+
+        blocks = getattr(self.model, "blocks", None)
+        if blocks is None:
+            return
+
+        if self.monitoring_mode == "debug":
+            block_indices = range(len(blocks))
+        else:
+            block_indices = self._sentinel_blocks
+
+        for block_idx in block_indices:
+            if block_idx < 0 or block_idx >= len(blocks):
+                continue
+            handle = blocks[block_idx].register_forward_hook(
+                self._make_residual_hook(int(block_idx))
+            )
+            self._residual_hook_handles.append(handle)
+
     def _make_activation_hook(self, site: str):
         """Create a forward hook that logs activation scale metrics for `site`."""
         alerts = self.config.alerts
@@ -229,6 +583,74 @@ class Trainer:
                     site,
                     step,
                     max_abs,
+                )
+
+        return _hook
+
+    def _make_residual_hook(self, block_idx: int):
+        """Create a forward hook that logs residual stream scale/tail metrics for a block output."""
+        alerts = self.config.alerts
+
+        def _hook(_module, _inputs, output) -> None:
+            if not self._residual_log_enabled:
+                return
+            step = self._residual_log_step
+            if step is None:
+                return
+            if not torch.is_tensor(output):
+                return
+
+            if self.writer is None and (step % 100) != 0:
+                return
+
+            with torch.no_grad():
+                out = output
+                if out.dtype not in (torch.float32, torch.float64):
+                    out = out.float()
+                rms = torch.sqrt(torch.mean(out * out)).item()
+                threshold = 10.0 * float(rms)
+                outlier_rate = float((torch.abs(out) > threshold).float().mean().item())
+
+            if self.writer is not None:
+                self.writer.add_scalar(f"Residual/block_{block_idx}/rms", float(rms), step)
+                self.writer.add_scalar(
+                    f"Residual/block_{block_idx}/outlier_rate_k10",
+                    float(outlier_rate),
+                    step,
+                )
+
+            baseline = self._residual_rms_baseline.get(block_idx)
+            if baseline is None and self._is_finite_scalar(float(rms)):
+                self._residual_rms_baseline[block_idx] = float(rms)
+                return
+
+            if step % 100 != 0:
+                return
+
+            if baseline is not None and baseline > 0 and float(rms) > (2.0 * float(baseline)):
+                logger.warning(
+                    "Residual RMS runaway (block %d, step %d): rms=%.4f > 2×baseline=%.4f",
+                    block_idx,
+                    step,
+                    float(rms),
+                    float(baseline),
+                )
+
+            if outlier_rate > alerts.residual_outlier_rate_bad:
+                logger.warning(
+                    "Residual outlier-rate BAD (block %d, step %d): %.3e > %.3e",
+                    block_idx,
+                    step,
+                    float(outlier_rate),
+                    alerts.residual_outlier_rate_bad,
+                )
+            elif outlier_rate > alerts.residual_outlier_rate_warn:
+                logger.warning(
+                    "Residual outlier-rate warning (block %d, step %d): %.3e > %.3e",
+                    block_idx,
+                    step,
+                    float(outlier_rate),
+                    alerts.residual_outlier_rate_warn,
                 )
 
         return _hook
@@ -273,14 +695,20 @@ class Trainer:
         global_step = 0
         losses: list[float] = []
         total_tokens = 0
+        total_effective_tokens = 0
         total_samples = 0
         window_tokens = 0
+        window_effective_tokens = 0
         window_samples = 0
         window_steps = 0
+        window_clipped_steps = 0
         window_start_time = time.time()
         prev_step_end_time = time.time()
 
         start_time = time.time()
+
+        if self.config.monitoring.probe_steps > 0:
+            self._run_fixed_probe(step=0)
 
         while global_step < self.config.training.max_steps:
             epoch_progress = tqdm(self.train_loader, desc=f"Step {global_step}")
@@ -301,7 +729,7 @@ class Trainer:
 
                 lr_used = float(self.optimizer.param_groups[0]["lr"])
 
-                loss, grad_norm, tokens, samples = self.training_step(
+                loss, grad_norm, tokens, effective_tokens, samples = self.training_step(
                     batch,
                     step=global_step,
                     log_this_step=log_this_step,
@@ -314,10 +742,19 @@ class Trainer:
                 loss_value = float(loss.detach().cpu().item())
                 losses.append(loss_value)
                 total_tokens += tokens
+                total_effective_tokens += effective_tokens
                 total_samples += samples
                 window_tokens += tokens
+                window_effective_tokens += effective_tokens
                 window_samples += samples
                 window_steps += 1
+
+                if (
+                    self.config.training.clip_grad > 0
+                    and grad_norm is not None
+                    and float(grad_norm) > float(self.config.training.clip_grad)
+                ):
+                    window_clipped_steps += 1
 
                 prev_loss_ema = self._loss_ema if self._loss_ema is not None else loss_value
                 beta = float(self.config.monitoring.loss_ema_beta)
@@ -331,11 +768,41 @@ class Trainer:
 
                     if self.writer is not None:
                         self.writer.add_scalar("Loss/train", float(self._loss_ema), global_step)
+                        self.writer.add_scalar("Loss/train_raw", float(loss_value), global_step)
                         self.writer.add_scalar(
                             "Health/loss_spike_ratio",
                             float(loss_spike_ratio),
                             global_step,
                         )
+                        try:
+                            loss_ema = float(self._loss_ema)
+                            if self._is_finite_scalar(loss_ema) and loss_ema < 50:
+                                train_ppl = float(math.exp(loss_ema))
+                            else:
+                                train_ppl = float("inf")
+                        except OverflowError:
+                            train_ppl = float("inf")
+                        self.writer.add_scalar("PPL/train", float(train_ppl), global_step)
+
+                        self.writer.add_scalar("Tokens/seen", float(total_tokens), global_step)
+                        self.writer.add_scalar(
+                            "Tokens/effective_seen",
+                            float(total_effective_tokens),
+                            global_step,
+                        )
+                        self.writer.add_scalar("Data/tokens_per_update", float(tokens), global_step)
+                        self.writer.add_scalar(
+                            "Data/effective_tokens_per_update",
+                            float(effective_tokens),
+                            global_step,
+                        )
+
+                        if window_steps > 0:
+                            clip_rate = float(window_clipped_steps) / float(window_steps)
+                        else:
+                            clip_rate = 0.0
+                        self.writer.add_scalar("Gradients/clip_rate", float(clip_rate), global_step)
+
                         self.writer.add_scalar("LR", lr_used, global_step)
                         self.writer.add_scalar("Time/step_seconds", step_seconds, global_step)
                         self.writer.add_scalar(
@@ -343,10 +810,29 @@ class Trainer:
                             float(data_wait_seconds),
                             global_step,
                         )
-                        data_wait_frac = (
-                            float(data_wait_seconds) / float(step_seconds) if step_seconds > 0 else 0.0
-                        )
+                        if step_seconds > 0:
+                            data_wait_frac = float(data_wait_seconds) / float(step_seconds)
+                        else:
+                            data_wait_frac = 0.0
                         self.writer.add_scalar("Time/data_wait_frac", data_wait_frac, global_step)
+                        compute_seconds_est = max(
+                            0.0,
+                            float(step_seconds) - float(data_wait_seconds),
+                        )
+                        if step_seconds > 0:
+                            compute_frac_est = float(compute_seconds_est) / float(step_seconds)
+                        else:
+                            compute_frac_est = 0.0
+                        self.writer.add_scalar(
+                            "Time/compute_seconds_est",
+                            float(compute_seconds_est),
+                            global_step,
+                        )
+                        self.writer.add_scalar(
+                            "Time/compute_frac_est",
+                            float(compute_frac_est),
+                            global_step,
+                        )
 
                     if global_step % 100 == 0:
                         if loss_spike_ratio > self.config.alerts.loss_spike_stop:
@@ -364,9 +850,10 @@ class Trainer:
                                 self.config.alerts.loss_spike_warn,
                             )
 
-                        data_wait_frac = (
-                            float(data_wait_seconds) / float(step_seconds) if step_seconds > 0 else 0.0
-                        )
+                        if step_seconds > 0:
+                            data_wait_frac = float(data_wait_seconds) / float(step_seconds)
+                        else:
+                            data_wait_frac = 0.0
                         if data_wait_frac > self.config.alerts.data_wait_frac_bad:
                             logger.warning(
                                 "Data wait frac BAD (step %d): %.3f > %.3f",
@@ -382,10 +869,22 @@ class Trainer:
                                 self.config.alerts.data_wait_frac_warn,
                             )
 
+                        if window_steps > 0:
+                            clip_rate = float(window_clipped_steps) / float(window_steps)
+                        else:
+                            clip_rate = 0.0
+                        if clip_rate > 0.05:
+                            logger.warning(
+                                "Grad clip rate warning (step %d): clip_rate=%.3f > 0.050",
+                                global_step,
+                                float(clip_rate),
+                            )
+
                     window_time = time.time() - window_start_time
                     if window_time > 0:
                         steps_per_second = window_steps / window_time
                         tokens_per_second = window_tokens / window_time
+                        effective_tokens_per_second = window_effective_tokens / window_time
                         samples_per_second = window_samples / window_time
                         if self.writer is not None:
                             self.writer.add_scalar(
@@ -399,13 +898,57 @@ class Trainer:
                                 global_step,
                             )
                             self.writer.add_scalar(
+                                "Throughput/effective_tokens_per_second",
+                                effective_tokens_per_second,
+                                global_step,
+                            )
+                            self.writer.add_scalar(
                                 "Throughput/samples_per_second",
                                 samples_per_second,
                                 global_step,
                             )
+                            achieved_tflops = compute_achieved_tflops(
+                                float(effective_tokens_per_second),
+                                int(self.model.num_parameters),
+                                flops_multiplier=float(self.config.monitoring.mfu_flops_multiplier),
+                            )
+                            self.writer.add_scalar(
+                                "Perf/achieved_tflops",
+                                float(achieved_tflops),
+                                global_step,
+                            )
+                            if self.config.monitoring.peak_tflops is not None:
+                                self.writer.add_scalar(
+                                    "Perf/mfu",
+                                    float(
+                                        compute_mfu(
+                                            float(achieved_tflops),
+                                            float(self.config.monitoring.peak_tflops),
+                                        )
+                                    ),
+                                    global_step,
+                                )
 
                     # Post-step weight evolution tracking (bounded by monitoring mode).
                     self._log_weight_norms(global_step)
+
+                    if (
+                        self.writer is not None
+                        and self._nvml is not None
+                        and self._nvml_handle is not None
+                        and self.device.type == "cuda"
+                    ):
+                        try:
+                            util = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                            mem = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                            self.writer.add_scalar("GPU/utilization", float(util.gpu), global_step)
+                            used_mb = float(mem.used) / (1024**2)
+                            total_bytes = float(mem.total)
+                            used_frac = float(mem.used) / total_bytes if total_bytes > 0 else 0.0
+                            self.writer.add_scalar("GPU/memory_used_mb", used_mb, global_step)
+                            self.writer.add_scalar("GPU/memory_used_frac", used_frac, global_step)
+                        except Exception:
+                            pass
 
                     if self.device.type == "cuda":
                         allocated_mb = torch.cuda.memory_allocated(self.device) / (1024**2)
@@ -415,8 +958,16 @@ class Trainer:
                         if self.writer is not None:
                             self.writer.add_scalar("Memory/allocated_mb", allocated_mb, global_step)
                             self.writer.add_scalar("Memory/reserved_mb", reserved_mb, global_step)
-                            self.writer.add_scalar("Memory/max_allocated_mb", max_allocated_mb, global_step)
-                            self.writer.add_scalar("Memory/max_reserved_mb", max_reserved_mb, global_step)
+                            self.writer.add_scalar(
+                                "Memory/max_allocated_mb",
+                                max_allocated_mb,
+                                global_step,
+                            )
+                            self.writer.add_scalar(
+                                "Memory/max_reserved_mb",
+                                max_reserved_mb,
+                                global_step,
+                            )
                             if self._cuda_total_mem_bytes is not None:
                                 reserved_bytes = torch.cuda.memory_reserved(self.device)
                                 reserved_frac = reserved_bytes / self._cuda_total_mem_bytes
@@ -448,8 +999,10 @@ class Trainer:
                                 )
 
                     window_tokens = 0
+                    window_effective_tokens = 0
                     window_samples = 0
                     window_steps = 0
+                    window_clipped_steps = 0
                     window_start_time = time.time()
 
                     if global_step % self.config.training.save_steps == 0 and global_step > 0:
@@ -470,6 +1023,13 @@ class Trainer:
                     and (global_step % self.config.training.eval_steps) == 0
                 ):
                     self.evaluate(self.val_loader, step=global_step)
+
+                if (
+                    self.config.monitoring.probe_steps > 0
+                    and global_step > 0
+                    and (global_step % int(self.config.monitoring.probe_steps)) == 0
+                ):
+                    self._run_fixed_probe(step=global_step)
 
                 if hist_this_step:
                     self._log_weight_histograms(global_step)
@@ -519,8 +1079,29 @@ class Trainer:
         labels = batch["labels"].to(self.device)
         tokens = input_ids.numel()
         samples = input_ids.size(0)
+        labels_used = labels[..., 1:]
+        effective_tokens = int((labels_used != -100).sum().item())
 
         hist_this_step = step > 0 and (step % self.histogram_steps == 0)
+
+        blocks_to_monitor: set[int] = set()
+        if log_this_step and self.monitoring_mode != "minimal":
+            if self.monitoring_mode == "debug":
+                blocks_to_monitor = set(range(len(self._attn_modules_by_block)))
+            else:
+                blocks_to_monitor = set(self._sentinel_blocks)
+            blocks_to_monitor = {
+                idx
+                for idx in blocks_to_monitor
+                if (
+                    0 <= idx < len(self._attn_modules_by_block)
+                    and self._attn_modules_by_block[idx] is not None
+                )
+            }
+        self._set_attention_monitoring(
+            blocks_to_monitor=blocks_to_monitor,
+            tau=float(self.config.monitoring.attn_tau),
+        )
 
         # Activation hooks run during forward; enable only for intended monitoring steps.
         self._activation_log_step = step
@@ -529,6 +1110,8 @@ class Trainer:
             and self.monitoring_mode != "minimal"
             and self.config.monitoring.activation_sites != "none"
         )
+        self._residual_log_step = step
+        self._residual_log_enabled = log_this_step and self.monitoring_mode != "minimal"
 
         if self.config.training.bf16 and torch.cuda.is_bf16_supported():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -562,7 +1145,6 @@ class Trainer:
             grad_norm = self._get_grad_norm()
 
         if log_this_step:
-            labels_used = labels[..., 1:]
             ignore_frac = float((labels_used == -100).sum().item()) / max(1, labels_used.numel())
 
             if self.writer is not None:
@@ -583,7 +1165,9 @@ class Trainer:
                         step,
                         ignore_frac,
                         self.config.alerts.ignore_frac_warn,
-                    )
+                        )
+
+            self._log_attention_metrics(step, blocks_to_monitor=blocks_to_monitor)
 
             if grad_norm is not None:
                 if self.config.monitoring.fail_fast_nonfinite:
@@ -649,9 +1233,10 @@ class Trainer:
 
         self.optimizer.step()
         self.scheduler.step()
+        self._check_opt_state_finite(step)
         self.optimizer.zero_grad()
 
-        return loss, grad_norm, tokens, samples
+        return loss, grad_norm, tokens, effective_tokens, samples
 
     @torch.no_grad()
     def evaluate(self, loader, *, step: int, max_batches: Optional[int] = None) -> dict[str, float]:
@@ -667,6 +1252,11 @@ class Trainer:
             return {}
 
         self._activation_log_enabled = False
+        self._residual_log_enabled = False
+        self._set_attention_monitoring(
+            blocks_to_monitor=set(),
+            tau=float(self.config.monitoring.attn_tau),
+        )
         self.model.eval()
 
         total_nll = 0.0
@@ -712,15 +1302,28 @@ class Trainer:
         except OverflowError:
             ppl = float("inf")
 
-        ignore_frac_val = float(total_ignored) / float(total_positions) if total_positions > 0 else 0.0
+        if total_positions > 0:
+            ignore_frac_val = float(total_ignored) / float(total_positions)
+        else:
+            ignore_frac_val = 0.0
 
         if self.writer is not None:
             self.writer.add_scalar("Loss/val", float(val_loss), step)
             self.writer.add_scalar("PPL/val", float(ppl), step)
             self.writer.add_scalar("Data/ignore_frac_val", float(ignore_frac_val), step)
+            if self._loss_ema is not None and self._is_finite_scalar(float(self._loss_ema)):
+                self.writer.add_scalar(
+                    "Eval/train_val_gap",
+                    float(val_loss) - float(self._loss_ema),
+                    step,
+                )
 
         self.model.train()
-        return {"val_loss": float(val_loss), "val_ppl": float(ppl), "ignore_frac_val": ignore_frac_val}
+        return {
+            "val_loss": float(val_loss),
+            "val_ppl": float(ppl),
+            "ignore_frac_val": ignore_frac_val,
+        }
 
     def _compute_loss(self, logits, labels):
         """
@@ -744,20 +1347,36 @@ class Trainer:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         model_path = os.path.join(checkpoint_dir, "model.pt")
-        torch.save(self.model.state_dict(), model_path)
-
         optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
-        torch.save(self.optimizer.state_dict(), optimizer_path)
-
         scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
-        torch.save(self.scheduler.state_dict(), scheduler_path)
-
-        import json
-        from dataclasses import asdict
-
         config_path = os.path.join(checkpoint_dir, "config.json")
-        with open(config_path, "w") as f:
-            json.dump(asdict(self.config), f, indent=2)
+
+        try:
+            torch.save(self.model.state_dict(), model_path)
+            torch.save(self.optimizer.state_dict(), optimizer_path)
+            torch.save(self.scheduler.state_dict(), scheduler_path)
+
+            import json
+            from dataclasses import asdict
+
+            with open(config_path, "w") as f:
+                json.dump(asdict(self.config), f, indent=2)
+
+            size_bytes = 0
+            for path in (model_path, optimizer_path, scheduler_path, config_path):
+                try:
+                    if os.path.exists(path):
+                        size_bytes += int(os.path.getsize(path))
+                except Exception:
+                    continue
+
+            if self.writer is not None:
+                self.writer.add_scalar("Checkpoint/ok", 1.0, step)
+                self.writer.add_scalar("Checkpoint/size_mb", float(size_bytes) / (1024**2), step)
+        except Exception:
+            if self.writer is not None:
+                self.writer.add_scalar("Checkpoint/ok", 0.0, step)
+            raise
 
         if final:
             logger.info("Final checkpoint saved at step %d to %s", step, checkpoint_dir)
@@ -927,7 +1546,10 @@ class Trainer:
             self.writer.add_scalar("Updates/ratio_max", float(ratio_max), step)
 
         if step % 100 == 0 and per_weight_ratios:
-            if ratio_p95 > alerts.update_ratio_warn_high or ratio_max > alerts.update_ratio_stop_high:
+            if (
+                ratio_p95 > alerts.update_ratio_warn_high
+                or ratio_max > alerts.update_ratio_stop_high
+            ):
                 logger.warning(
                     "Update ratio tail warning (step %d): p95=%.4g, max=%.4g",
                     step,
@@ -1117,9 +1739,17 @@ class Trainer:
 
             if name in self._prev_weight_norms:
                 prev_norm = self._prev_weight_norms[name]
-                change_pct = ((current_norm - prev_norm) / prev_norm) * 100 if prev_norm > 0 else 0.0
+                if prev_norm > 0:
+                    change_pct = ((current_norm - prev_norm) / prev_norm) * 100
+                else:
+                    change_pct = 0.0
                 changes.append(
-                    {"name": name, "prev_norm": prev_norm, "current_norm": current_norm, "change_pct": change_pct}
+                    {
+                        "name": name,
+                        "prev_norm": prev_norm,
+                        "current_norm": current_norm,
+                        "change_pct": change_pct,
+                    }
                 )
 
             self._prev_weight_norms[name] = current_norm
@@ -1160,4 +1790,3 @@ class Trainer:
 
         for name, param in named_params:
             self.writer.add_histogram(f"weights_hist/{name}", param.data, step)
-

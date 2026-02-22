@@ -61,11 +61,25 @@ class MonitoringConfig:
     sync_cuda_timing: bool = False
     fail_fast_nonfinite: bool = True
 
+    # Attention monitoring uses this tau threshold for comparisons (inspired by QK-Clip-like caps).
+    attn_tau: float = 100.0
+
     # Exponential moving average for loss spike detection.
     loss_ema_beta: float = 0.98
 
     # If None, Trainer derives (0, mid, last) from config.model.num_layers.
     sentinel_blocks: Optional[tuple[int, int, int]] = None
+
+    # Optimizer state safety checks.
+    opt_state_check_steps: int = 1000
+
+    # Fixed-probe monitoring (behavioral invariants).
+    probe_steps: int = 1000
+    probe_topk: int = 10
+
+    # MFU requires peak TFLOPs for the current device/system. If None, we log achieved TFLOPs only.
+    peak_tflops: Optional[float] = None
+    mfu_flops_multiplier: float = 6.0
 
 
 @dataclass
@@ -110,6 +124,15 @@ class AlertThresholdsConfig:
     activation_rms_bad_high: float = 4.0
     activation_max_abs_warn: float = 20.0
     activation_max_abs_bad: float = 50.0
+
+    # Attention vitals
+    max_attn_logit_warn: float = 200.0
+    max_attn_logit_crit: float = 1000.0
+    attn_entropy_norm_warn: float = 0.1
+
+    # Residual stream tails
+    residual_outlier_rate_warn: float = 1e-3
+    residual_outlier_rate_bad: float = 1e-2
 
     # Performance (input-bound + OOM risk) checks
     data_wait_frac_warn: float = 0.3

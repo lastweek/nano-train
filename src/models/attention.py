@@ -43,6 +43,18 @@ class MultiHeadAttention(nn.Module):
         # Scale factor
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
+        # Monitoring (opt-in; enabled/disabled by Trainer).
+        self._monitor_enabled: bool = False
+        self._monitor_tau: float = 100.0
+        self._monitor_stats: dict[str, float] | None = None
+
+    def set_monitoring(self, enabled: bool, *, tau: float = 100.0) -> None:
+        """Enable/disable internal attention monitoring and set tau for comparisons."""
+        self._monitor_enabled = bool(enabled)
+        self._monitor_tau = float(tau)
+        if not self._monitor_enabled:
+            self._monitor_stats = None
+
     def forward(self, x, attention_mask=None):
         """
         Args:
@@ -76,6 +88,29 @@ class MultiHeadAttention(nn.Module):
 
         # Softmax
         attn_probs = torch.softmax(attn_scores, dim=-1)  # (B, heads, S, S)
+
+        if self._monitor_enabled:
+            with torch.no_grad():
+                max_attn_logit = float(attn_scores.max().item())
+
+                probs = attn_probs
+                if probs.dtype not in (torch.float32, torch.float64):
+                    probs = probs.float()
+                probs_safe = probs.clamp_min(1e-12)
+                entropy = -(probs_safe * probs_safe.log()).sum(dim=-1)
+                attn_entropy = float(entropy.mean().item())
+                attn_entropy_norm = float(attn_entropy / math.log(seq_len)) if seq_len > 1 else 0.0
+
+                logits_gt_tau = attn_scores > float(self._monitor_tau)
+                frac_logits_gt_tau = float(logits_gt_tau.float().mean().item())
+
+                self._monitor_stats = {
+                    "max_attn_logit": max_attn_logit,
+                    "attn_entropy": attn_entropy,
+                    "attn_entropy_norm": attn_entropy_norm,
+                    "frac_logits_gt_tau": frac_logits_gt_tau,
+                }
+
         attn_probs = self.dropout(attn_probs)
 
         # Apply attention to values
