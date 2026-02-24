@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.pyo
+.pycache/
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 # IDE
@@ -17,3 +18,6 @@ Thumbs.db
 docs/training_monitoring.html
 # Data
 data/*.csv
+
+.venv*/
+outputs/

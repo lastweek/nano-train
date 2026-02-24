@@ -1,41 +1,43 @@
 #!/usr/bin/env python3
 """
-Simple HTTP server to view TensorBoard logs without installing tensorflow.
+Start TensorBoard for nano-train logs.
 
-Usage:
-    python scripts/view_logs.py
-
-Then open http://localhost:8000 in your browser.
+This is a convenience wrapper around `scripts/start_tensorboard.sh`, which can bootstrap a local
+TensorBoard install without requiring TensorFlow.
 """
 
-import http.server
-import os
-import sys
-import webbrowser
+from __future__ import annotations
+
+import argparse
+import subprocess
 from pathlib import Path
 
-def main():
-    log_dir = Path("logs")
-    if not log_dir.exists():
-        print(f"Error: {log_dir} directory not found")
-        print("Run training first to generate logs")
-        sys.exit(1)
 
-    port = 8000
-    print(f"\n🔍 Starting log viewer server...")
-    print(f"Log directory: {log_dir.absolute()}")
-    print(f"URL: http://localhost:{port}")
-    print("\nPress Ctrl+C to stop\n")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Start TensorBoard for nano-train logs.")
+    parser.add_argument("--logdir", default="outputs", help="Log directory passed to TensorBoard.")
+    parser.add_argument("--port", default="6006", help="Port to bind TensorBoard to.")
+    parser.add_argument("--host", default="localhost", help="Host to bind TensorBoard to.")
+    args = parser.parse_args()
 
-    # Try to open browser automatically
-    try:
-        webbrowser.open(f"http://localhost:{port}")
-    except:
-        pass
+    repo_root = Path(__file__).resolve().parent.parent
+    start_script = repo_root / "scripts" / "start_tensorboard.sh"
+    if not start_script.exists():
+        raise FileNotFoundError(f"Missing start script: {start_script}")
 
-    # Change to logs directory and serve
-    os.chdir(log_dir)
-    http.server.HTTPServer(('', port).serve_forever()
+    cmd = [
+        "bash",
+        str(start_script),
+        "--logdir",
+        str(args.logdir),
+        "--port",
+        str(args.port),
+        "--host",
+        str(args.host),
+    ]
+    return subprocess.call(cmd, cwd=repo_root)
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+

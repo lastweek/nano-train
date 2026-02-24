@@ -196,4 +196,129 @@ from utils import *  # Bad wildcard imports
 
 ---
 
+## Tutorial/Educational Code Guidelines
+
+When creating **tutorial code** for learning distributed training concepts, the goal is to create **easy-to-understand minimal code** that showcases how things work.
+
+### Tutorial Code Principles
+
+1. **Minimal Working Examples** - Start with the simplest code that demonstrates the concept
+2. **No Abstractions Initially** - Show raw primitives first, then layer abstractions
+3. **Progressive Complexity** - Build understanding step by step
+4. **Explicit Communication** - Make all-to-all, reduce, broadcast calls visible
+5. **Comment the "Why"** - Explain WHY we need each distributed operation
+
+### Tutorial Code Structure
+
+```python
+# TUTORIAL: This file demonstrates CONCEPT_X from scratch.
+# Goal: Show how CONCEPT_X works without relying on PyTorch's built-in X.
+# Learning: By implementing X manually, you understand the communication patterns.
+
+# Step 1: Show the problem (what we're solving)
+# Step 2: Show the solution (minimal working code)
+# Step 3: Test it (verify correctness)
+```
+
+### Example: DDP from Scratch
+
+**DO:**
+```python
+# TUTORIAL: Data Parallel from Scratch
+# This shows how gradients are synchronized across devices manually.
+# PyTorch DDP does this automatically, but we implement it here to learn.
+
+def all_reduce_gradients(model, rank, world_size):
+    """
+    Manually synchronize gradients across all processes.
+
+    Key concept: Each rank computes gradients on its data shard.
+    We need to AVERAGE gradients so all ranks have the same update.
+
+    Communication: All-to-All reduce (sum + average)
+    """
+    for param in model.parameters():
+        if param.grad is not None:
+            # 1. Sum gradients from all ranks
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            # 2. Average by dividing by world_size
+            param.grad.div_(world_size)
+```
+
+**DON'T (for tutorials):**
+```python
+# DON'T: Just wrap with DDP and call it a day
+# This hides the learning!
+model = DDP(model)  # Magic! No learning happens.
+```
+
+### Tutorial vs Production Code
+
+| Aspect | Tutorial Code | Production Code |
+| :--- | :--- | :--- |
+| **Goal** | Teach concepts | Optimize performance |
+| **Abstractions** | Minimize, show primitives | Use high-level APIs |
+| **Comments** | Explain "why" heavily | Explain non-obvious logic |
+| **Error Handling** | Minimal (keep it simple) | Comprehensive |
+| **Features** | One concept per file | Full-featured |
+
+### Tutorial File Convention
+
+Tutorial/educational files should be named clearly:
+
+- `train_ddp_from_scratch.py` - Manual DDP implementation
+- `train_ddp_torch.py` - Using PyTorch DDP
+- `examples/tutorial_*` - Educational examples
+
+Production files use standard naming:
+
+- `src/trainer.py` - Production trainer
+- `src/layers.py` - Core layer implementations
+
+---
+
+## File Organization Guidelines
+
+When deciding where to place code, follow these principles:
+
+### 1. Core Layers → `src/layers.py`
+
+Place fundamental layer implementations here:
+- `Linear` - Basic linear transformation
+- `LayerNorm` - Normalization
+- `Embedding` - Token embeddings
+- `Dropout` - Regularization
+- `GELU` - Activation function
+- `ColumnParallelLinear`, `RowParallelLinear` - Tensor parallelism variants
+
+**Key**: These are BUILDING BLOCKS that can be composed into larger components.
+
+### 2. Model Components → `src/models/`
+
+Place model-specific compositions here:
+- `attention.py` - Attention mechanisms
+- `mlp.py` - Feed-forward networks
+- `transformer.py` - Transformer blocks
+- `deepseek.py` - Specific model architectures
+
+**Key**: These are COMPOSITIONS that use layers from `src/layers.py`.
+
+### 3. Distributed Utilities → `src/distributed/`
+
+Place distributed training infrastructure here:
+- `device.py` - Device abstraction
+- `launch.py` - Process launchers
+
+**Key**: These are INFRASTRUCTURE for distributed training, not model components.
+
+### Examples
+
+| Code | Location | Why |
+|------|----------|-----|
+| `ColumnParallelLinear` | `src/layers.py` | It's a distributed variant of `Linear` layer |
+| `ParallelMLP` | `src/models/mlp.py` | It's a model composition using parallel layers |
+| `get_device_info()` | `src/distributed/device.py` | It's infrastructure, not a model component |
+
+---
+
 *Keep it simple, keep it clean.*

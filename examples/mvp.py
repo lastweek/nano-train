@@ -2,7 +2,7 @@
 Simple training script for MVP.
 
 Usage:
-    python examples/train_mvp.py
+    python examples/mvp.py
 
 This will train a 125M parameter model on the tiny Shakespeare dataset.
 The goal is to verify the loss decreases and the model learns.

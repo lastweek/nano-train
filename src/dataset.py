@@ -2,7 +2,6 @@
 Simple dataset and data loader for MVP.
 """
 
-import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
@@ -93,12 +92,14 @@ class TextDataset(Dataset):
         }
 
 
-def create_dataloader(dataset, batch_size, shuffle=True):
-    """Create simple dataloader."""
+def create_dataloader(dataset, batch_size, shuffle=True, sampler=None):
+    """Create simple dataloader with optional sampler override."""
+    use_shuffle = bool(shuffle) and sampler is None
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=use_shuffle,
+        sampler=sampler,
         num_workers=0,  # MVP: no multiprocessing
         drop_last=False,  # Don't drop last batch
     )

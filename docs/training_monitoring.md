@@ -22,14 +22,24 @@ python examples/train_mvp.py
 ### 2) View metrics in TensorBoard
 
 ```bash
-# Option A: helper script (if present in your checkout)
-./start_tensorboard.sh
+# Option A: helper script
+./scripts/start_tensorboard.sh
 
-# Option B: start TensorBoard directly
+# Option B: start TensorBoard directly (requires a modern `tensorboard` install)
 tensorboard --logdir=outputs --port=6006 --host=localhost
 ```
 
 Open `http://localhost:6006`.
+
+**Live updates**: nano-train flushes TensorBoard event files on log/eval/probe/hist steps by
+default. If the UI still feels “behind”, make sure you run TensorBoard with a small reload interval:
+
+```bash
+./scripts/start_tensorboard.sh --reload_interval 1
+```
+
+If plots still feel sparse, lower `Config.training.log_steps` (e.g. set it to `1`) so the trainer
+emits more points.
 
 ### 3) Where logs live (source of truth)
 

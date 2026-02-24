@@ -2,9 +2,9 @@
 Train a DeepSeek-V3-like routed-MoE model on the local text dataset.
 
 Usage:
-    python3 examples/train_deepseek.py
-    python3 examples/train_deepseek.py --no-meta-init
-    python3 examples/train_deepseek.py --model-preset tiny --no-meta-init
+    python3 examples/deepseek.py
+    python3 examples/deepseek.py --no-meta-init
+    python3 examples/deepseek.py --model-preset tiny --no-meta-init
 """
 
 import argparse

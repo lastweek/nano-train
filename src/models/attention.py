@@ -1,6 +1,7 @@
 """
 Multi-head attention implementation for MVP.
 
+Supports tensor parallelism via TPConfig parameter.
 Phase 5 will add RoPE, GQA, MQA.
 Phase 2 will integrate Flash Attention.
 """
@@ -9,38 +10,73 @@ import math
 import torch
 import torch.nn as nn
 
-from src.config import ModelConfig
-from src.layers import Linear, Dropout
+from src.config import ModelConfig, TPConfig
+from src.layers import Linear, Dropout, ColumnParallelLinear, RowParallelLinear
 
 
 class MultiHeadAttention(nn.Module):
-    """Standard multi-head self-attention (MHA)."""
+    """
+    Multi-head self-attention with optional tensor parallelism.
 
-    def __init__(self, config: ModelConfig):
+    If tp_config.enabled is True:
+        - QKV projection uses ColumnParallelLinear (split by heads)
+        - Output projection uses RowParallelLinear (split by heads)
+        Communication: 1 all-reduce per forward pass
+
+    If tp_config.enabled is False (default):
+        - Uses standard Linear layers
+        - No communication
+    """
+
+    def __init__(self, config: ModelConfig, tp_config: TPConfig = None):
         super().__init__()
+        tp_config = tp_config or TPConfig()
+
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
 
+        # TP configuration
+        self.tp_enabled = tp_config.enabled
+        self.tp_rank = tp_config.rank
+        self.tp_size = tp_config.size
+        self.tp_group = tp_config.group
+
         assert self.head_dim * self.num_heads == self.hidden_size, \
             "hidden_size must be divisible by num_attention_heads"
 
-        # QKV projections
-        # NATIVE: Our Linear in src/layers.py
-        # ORIGINAL: torch.nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=False)
-        # Single matrix multiply for efficiency: x @ [W_q, W_k, W_v].T
-        self.qkv_proj = Linear(config.hidden_size, 3 * config.hidden_size, bias=False)
+        if self.tp_enabled:
+            # For TP: each GPU gets num_heads // tp_size heads
+            assert self.num_heads % self.tp_size == 0, \
+                f"num_heads ({self.num_heads}) must be divisible by tp_size ({self.tp_size})"
 
-        # Output projection
-        # NATIVE: Our Linear in src/layers.py
-        # ORIGINAL: torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.out_proj = Linear(config.hidden_size, config.hidden_size, bias=False)
+            self.tp_num_heads = self.num_heads // self.tp_size
 
-        # NATIVE: Our Dropout in src/layers.py
-        # ORIGINAL: torch.nn.Dropout(config.dropout)
+            # ColumnParallelLinear expects the GLOBAL output size and returns a local shard.
+            self.qkv_proj = ColumnParallelLinear(
+                config.hidden_size,
+                3 * config.hidden_size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                tp_group=self.tp_group,
+                bias=False,
+            )
+
+            # RowParallelLinear expects the GLOBAL input size and consumes a local shard.
+            self.out_proj = RowParallelLinear(
+                config.hidden_size,
+                config.hidden_size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                tp_group=self.tp_group,
+                bias=False,
+            )
+        else:
+            # Standard Linear layers
+            self.qkv_proj = Linear(config.hidden_size, 3 * config.hidden_size, bias=False)
+            self.out_proj = Linear(config.hidden_size, config.hidden_size, bias=False)
+
         self.dropout = Dropout(config.dropout)
-
-        # Scale factor
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
         # Monitoring (opt-in; enabled/disabled by Trainer).
@@ -64,30 +100,31 @@ class MultiHeadAttention(nn.Module):
         Returns:
             output: (batch_size, seq_len, hidden_size)
         """
-        # INPUT: x (batch_size, seq_len, hidden_size)
         batch_size, seq_len, _ = x.shape
 
-        # Project QKV from hidden size to 3 * hidden size for a single matmul.
-        qkv = self.qkv_proj(x)  # (B, S, 3H) - single matmul for efficiency
-        # OUTPUT: qkv (B, S, 3H)
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        # QKV projection
+        qkv = self.qkv_proj(x)
+
+        if self.tp_enabled:
+            # TP mode: reshape for tp_num_heads
+            qkv = qkv.reshape(batch_size, seq_len, 3, self.tp_num_heads, self.head_dim)
+            num_heads = self.tp_num_heads
+        else:
+            # Standard mode: reshape for num_heads
+            qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+            num_heads = self.num_heads
+
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, S, dim)
 
-        # Extract Q, K, V from combined projections
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # Compute scaled dot-product attention scores.
-        # INPUT: q (B, heads, S, D), k (B, heads, S, D)
-        # OUTPUT: attn_scores (B, heads, S, S)
+        # Compute attention scores
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # Apply mask if provided
         if attention_mask is not None:
-            # Mask uses -inf to block future tokens in softmax.
             attn_scores = attn_scores + attention_mask
 
-        # Softmax
-        attn_probs = torch.softmax(attn_scores, dim=-1)  # (B, heads, S, S)
+        attn_probs = torch.softmax(attn_scores, dim=-1)
 
         if self._monitor_enabled:
             with torch.no_grad():
@@ -114,13 +151,15 @@ class MultiHeadAttention(nn.Module):
         attn_probs = self.dropout(attn_probs)
 
         # Apply attention to values
-        # INPUT: attn_probs (B, heads, S, S), v (B, heads, S, D)
-        # OUTPUT: attn_output (B, heads, S, D)
-        attn_output = torch.matmul(attn_probs, v) # (B, heads, S, dim)
-        attn_output = attn_output.permute(0, 2, 1, 3)  # (B, S, heads, dim)
-        attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)  # (B, S, H)
+        attn_output = torch.matmul(attn_probs, v)
+        attn_output = attn_output.permute(0, 2, 1, 3)
 
-        # Output projection back to hidden size.
-        output = self.out_proj(attn_output) # (B, S, H)
+        if self.tp_enabled:
+            attn_output = attn_output.reshape(batch_size, seq_len, self.tp_num_heads * self.head_dim)
+        else:
+            attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
+
+        # Output projection (all-reduce inside if TP mode)
+        output = self.out_proj(attn_output)
 
         return output

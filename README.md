@@ -84,9 +84,8 @@ python check_gpu.py  # Verify GPU setup
 pip install -r requirements.txt
 python examples/train_mvp.py
 
-# View logs:
-python3 scripts/view_logs.py  # Simple HTML viewer
-# or open: scripts/view_logs.html
+# View logs (TensorBoard):
+./scripts/start_tensorboard.sh
 ```
 
 ## 📊 Current Status
@@ -160,6 +159,11 @@ The [sync_and_run.sh](scripts/sync_and_run.sh) script automates:
 | Precision | BF16 primary | Better numerical stability than FP16 |
 | Configuration | OmegaConf + Hydra | Flexible, hierarchical configs |
 | Checkpointing | Sharded for training, full for inference | Balance storage and compatibility |
+
+## 📘 Learning Guides
+
+- [TP + DP Backward Flow](docs/tp_dp_communication.md) - communication domains, collectives,
+  and gradient flow in 2D parallel training.
 
 ## 📚 References
 

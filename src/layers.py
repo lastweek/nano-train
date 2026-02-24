@@ -19,6 +19,7 @@ Both produce identical outputs and gradients!
 
 import math
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
@@ -643,3 +644,206 @@ def clip_grad_norm(parameters, max_norm: float):
                 param.grad.data.mul_(clip_coef)
 
     return total_norm
+
+# =============================================================================
+# TENSOR PARALLELISM LAYERS
+# =============================================================================
+
+class _ReduceFromTensorParallelRegion(torch.autograd.Function):
+    """
+    TP reduce op used by row-parallel layers.
+
+    Forward: all-reduce sum to materialize full activations on every TP rank.
+    Backward: identity so each rank keeps its local gradient shard without
+    introducing an extra cross-rank sum.
+    """
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, tp_group):
+        output = input_.clone()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=tp_group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+class _CopyToTensorParallelRegion(torch.autograd.Function):
+    """
+    TP copy op used by column-parallel layers.
+
+    Forward: identity because input activations are replicated across TP ranks.
+    Backward: all-reduce sum so upstream replicated layers receive full dX.
+    """
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, tp_group):
+        ctx.tp_group = tp_group
+        return input_
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = grad_output.clone()
+        dist.all_reduce(grad_input, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+        return grad_input, None
+
+
+class ColumnParallelLinear(nn.Module):
+    """
+    Column-parallel linear (shard output features).
+
+    Weight shape is sharded on dim 0:
+        global W: [out_features, in_features]
+        local  W_i: [out_features / tp_size, in_features]
+
+    Communication pattern:
+    - Forward: no TP collective. Each rank produces a local output shard.
+    - Backward: TP all-reduce(sum) on dX via _CopyToTensorParallelRegion.
+      This is the canonical column-parallel rule.
+
+    Parameter gradients for local shards are computed locally. In TP+DP setups,
+    cross-replica gradient averaging is handled by DP groups outside this module.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        tp_rank: int,
+        tp_size: int,
+        bias: bool = True,
+        tp_group=None,
+    ):
+        """
+        Args:
+            in_features: Number of input features
+            out_features: Number of output features (must be divisible by tp_size)
+            tp_rank: Tensor parallel rank of this process (0 to tp_size-1)
+            tp_size: Total number of tensor parallel processes
+            bias: Whether to include bias term
+            tp_group: TP process group for collectives (defaults to WORLD)
+        """
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.tp_group = tp_group if tp_group is not None else dist.group.WORLD
+
+        # Each GPU stores out_features // tp_size outputs
+        assert out_features % tp_size == 0, f"out_features {out_features} must be divisible by tp_size {tp_size}"
+        self.shard_size = out_features // tp_size
+
+        # Weight shard: (shard_size, in_features)
+        # F.linear expects (out_features, in_features), so this is correct
+        self.weight = nn.Parameter(torch.empty(self.shard_size, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.shard_size))
+        else:
+            self.register_parameter('bias', None)
+
+        nn.init.normal_(self.weight, std=0.02)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply column parallel linear transformation.
+
+        Args:
+            x: Input tensor of shape (*, in_features) - same on all GPUs
+
+        Returns:
+            Tensor of shape (*, shard_size) - each GPU's output shard
+        """
+        if self.tp_size > 1:
+            x = _CopyToTensorParallelRegion.apply(x, self.tp_group)
+
+        if self.bias is not None:
+            return F.linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight)
+
+
+class RowParallelLinear(nn.Module):
+    """
+    Row-parallel linear (shard input features).
+
+    Weight shape is sharded on dim 1:
+        global W: [out_features, in_features]
+        local  W_i: [out_features, in_features / tp_size]
+
+    Communication pattern:
+    - Forward: TP all-reduce(sum) on partial outputs to materialize full Y on
+      each TP rank.
+    - Backward: no extra TP collective from this autograd edge. Each rank keeps
+      its local dX shard, and local shard parameter gradients are computed
+      locally.
+
+    In TP+DP setups, parameter gradients are synchronized across DP groups
+    outside this module.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        tp_rank: int,
+        tp_size: int,
+        bias: bool = True,
+        tp_group=None,
+    ):
+        """
+        Args:
+            in_features: Number of input features (must be divisible by tp_size)
+            out_features: Number of output features
+            tp_rank: Tensor parallel rank of this process (0 to tp_size-1)
+            tp_size: Total number of tensor parallel processes
+            bias: Whether to include bias term
+            tp_group: Process group for all-reduce (defaults to WORLD)
+        """
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.tp_group = tp_group if tp_group is not None else dist.group.WORLD
+
+        # Each GPU processes in_features // tp_size inputs
+        assert in_features % tp_size == 0, f"in_features {in_features} must be divisible by tp_size {tp_size}"
+        self.shard_size = in_features // tp_size
+
+        # Weight shard: (out_features, shard_size)
+        # F.linear expects (out_features, in_features), so this is correct
+        self.weight = nn.Parameter(torch.empty(out_features, self.shard_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+        nn.init.normal_(self.weight, std=0.02)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply row parallel linear transformation with all-reduce.
+
+        Args:
+            x: Input tensor of shape (*, shard_size) - sharded from column parallel
+
+        Returns:
+            Tensor of shape (*, out_features) - full output on all GPUs
+        """
+        # Compute partial output from local input/weight shards.
+        partial_output = F.linear(x, self.weight, None)
+
+        # Sum partial outputs across TP ranks.
+        if self.tp_size > 1:
+            partial_output = _ReduceFromTensorParallelRegion.apply(partial_output, self.tp_group)
+
+        # Bias is replicated, so it must be added once after reduction.
+        if self.bias is not None:
+            partial_output = partial_output + self.bias
+
+        return partial_output

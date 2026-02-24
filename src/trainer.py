@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
@@ -45,6 +46,59 @@ from src.scheduler import CosineAnnealingScheduler
 
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class _TrainTotals:
+    tokens: int = 0
+    effective_tokens: int = 0
+    samples: int = 0
+
+    def update(self, *, tokens: int, effective_tokens: int, samples: int) -> None:
+        self.tokens += int(tokens)
+        self.effective_tokens += int(effective_tokens)
+        self.samples += int(samples)
+
+
+@dataclass
+class _TrainWindow:
+    start_time: float
+    tokens: int = 0
+    effective_tokens: int = 0
+    samples: int = 0
+    steps: int = 0
+    clipped_steps: int = 0
+
+    def update(
+        self,
+        *,
+        tokens: int,
+        effective_tokens: int,
+        samples: int,
+        clipped: bool,
+    ) -> None:
+        self.tokens += int(tokens)
+        self.effective_tokens += int(effective_tokens)
+        self.samples += int(samples)
+        self.steps += 1
+        if clipped:
+            self.clipped_steps += 1
+
+    def reset(self, *, start_time: float) -> None:
+        self.start_time = float(start_time)
+        self.tokens = 0
+        self.effective_tokens = 0
+        self.samples = 0
+        self.steps = 0
+        self.clipped_steps = 0
+
+    def clip_rate(self) -> float:
+        if self.steps <= 0:
+            return 0.0
+        return float(self.clipped_steps) / float(self.steps)
+
+    def elapsed_seconds(self, *, now: float) -> float:
+        return max(0.0, float(now) - float(self.start_time))
 
 
 class Trainer:
@@ -149,11 +203,31 @@ class Trainer:
 
         # TensorBoard writer
         self.writer = None
+        self._writer_flush_failed = False
         if SummaryWriter is not None:
             log_path = os.path.join(config.log_dir, config.run_name)
-            self.writer = SummaryWriter(log_path)
+            tb_max_queue = max(
+                1,
+                int(getattr(config.monitoring, "tensorboard_max_queue", 10)),
+            )
+            tb_flush_secs = max(
+                1,
+                int(getattr(config.monitoring, "tensorboard_flush_secs", 120)),
+            )
+            try:
+                self.writer = SummaryWriter(
+                    log_path,
+                    max_queue=tb_max_queue,
+                    flush_secs=tb_flush_secs,
+                )
+            except TypeError:
+                self.writer = SummaryWriter(log_path)
+                logger.warning(
+                    "SummaryWriter does not support max_queue/flush_secs; using defaults "
+                    "(TensorBoard may update slowly)."
+                )
             logger.info("TensorBoard logs: %s", log_path)
-            logger.info("View with: python3 scripts/view_logs.py or open scripts/view_logs.html")
+            logger.info("View with: ./scripts/start_tensorboard.sh --logdir %s", log_path)
         else:
             logger.warning("TensorBoard not available. Install with: pip install tensorboard")
 
@@ -683,6 +757,358 @@ class Trainer:
     def _is_finite_scalar(x: float) -> bool:
         return math.isfinite(float(x))
 
+    def _flush_writer(self) -> None:
+        """Flush TensorBoard event files to disk (best-effort)."""
+        if self.writer is None:
+            return
+
+        flush = getattr(self.writer, "flush", None)
+        if flush is None:
+            return
+
+        try:
+            flush()
+        except Exception as exc:
+            if not self._writer_flush_failed:
+                logger.warning(
+                    "TensorBoard writer flush failed (will skip future warnings): %s",
+                    exc,
+                )
+                self._writer_flush_failed = True
+
+    def _maybe_sync_cuda_timing(self) -> None:
+        if self.device.type != "cuda":
+            return
+        if not self.config.monitoring.sync_cuda_timing:
+            return
+        torch.cuda.synchronize(self.device)
+
+    def _is_step_clipped(self, grad_norm: Optional[float]) -> bool:
+        if self.config.training.clip_grad <= 0:
+            return False
+        if grad_norm is None:
+            return False
+        return float(grad_norm) > float(self.config.training.clip_grad)
+
+    def _update_loss_ema(self, loss_value: float) -> tuple[float, float]:
+        prev_loss_ema = self._loss_ema if self._loss_ema is not None else float(loss_value)
+        beta = float(self.config.monitoring.loss_ema_beta)
+        self._loss_ema = (beta * float(prev_loss_ema)) + ((1.0 - beta) * float(loss_value))
+        loss_spike_ratio = float(loss_value) / max(1e-12, float(prev_loss_ema))
+        return float(self._loss_ema), float(loss_spike_ratio)
+
+    def _safe_ppl_from_loss(self, loss_value: float) -> float:
+        try:
+            if self._is_finite_scalar(loss_value) and float(loss_value) < 50:
+                return float(math.exp(float(loss_value)))
+        except OverflowError:
+            pass
+        return float("inf")
+
+    def _write_train_step_scalars(
+        self,
+        *,
+        step: int,
+        loss_ema: float,
+        loss_value: float,
+        loss_spike_ratio: float,
+        lr_used: float,
+        train_ppl: float,
+        totals: _TrainTotals,
+        tokens: int,
+        effective_tokens: int,
+        clip_rate: float,
+        step_seconds: float,
+        data_wait_seconds: float,
+    ) -> None:
+        if self.writer is None:
+            return
+
+        self.writer.add_scalar("Loss/train", float(loss_ema), step)
+        self.writer.add_scalar("Loss/train_raw", float(loss_value), step)
+        self.writer.add_scalar("Health/loss_spike_ratio", float(loss_spike_ratio), step)
+        self.writer.add_scalar("PPL/train", float(train_ppl), step)
+
+        self.writer.add_scalar("Tokens/seen", float(totals.tokens), step)
+        self.writer.add_scalar("Tokens/effective_seen", float(totals.effective_tokens), step)
+        self.writer.add_scalar("Data/tokens_per_update", float(tokens), step)
+        self.writer.add_scalar("Data/effective_tokens_per_update", float(effective_tokens), step)
+
+        self.writer.add_scalar("Gradients/clip_rate", float(clip_rate), step)
+
+        self.writer.add_scalar("LR", float(lr_used), step)
+        self.writer.add_scalar("Time/step_seconds", float(step_seconds), step)
+        self.writer.add_scalar("Time/data_wait_seconds", float(data_wait_seconds), step)
+
+        if step_seconds > 0:
+            data_wait_frac = float(data_wait_seconds) / float(step_seconds)
+        else:
+            data_wait_frac = 0.0
+        self.writer.add_scalar("Time/data_wait_frac", float(data_wait_frac), step)
+
+        compute_seconds_est = max(0.0, float(step_seconds) - float(data_wait_seconds))
+        if step_seconds > 0:
+            compute_frac_est = float(compute_seconds_est) / float(step_seconds)
+        else:
+            compute_frac_est = 0.0
+        self.writer.add_scalar("Time/compute_seconds_est", float(compute_seconds_est), step)
+        self.writer.add_scalar("Time/compute_frac_est", float(compute_frac_est), step)
+
+    def _warn_train_step(
+        self,
+        *,
+        step: int,
+        loss_spike_ratio: float,
+        data_wait_seconds: float,
+        step_seconds: float,
+        clip_rate: float,
+    ) -> None:
+        if step % 100 != 0:
+            return
+
+        if loss_spike_ratio > self.config.alerts.loss_spike_stop:
+            logger.warning(
+                "Loss spike ratio BAD (step %d): %.3f > %.3f",
+                step,
+                float(loss_spike_ratio),
+                self.config.alerts.loss_spike_stop,
+            )
+        elif loss_spike_ratio > self.config.alerts.loss_spike_warn:
+            logger.warning(
+                "Loss spike ratio warning (step %d): %.3f > %.3f",
+                step,
+                float(loss_spike_ratio),
+                self.config.alerts.loss_spike_warn,
+            )
+
+        if step_seconds > 0:
+            data_wait_frac = float(data_wait_seconds) / float(step_seconds)
+        else:
+            data_wait_frac = 0.0
+        if data_wait_frac > self.config.alerts.data_wait_frac_bad:
+            logger.warning(
+                "Data wait frac BAD (step %d): %.3f > %.3f",
+                step,
+                float(data_wait_frac),
+                self.config.alerts.data_wait_frac_bad,
+            )
+        elif data_wait_frac > self.config.alerts.data_wait_frac_warn:
+            logger.warning(
+                "Data wait frac warning (step %d): %.3f > %.3f",
+                step,
+                float(data_wait_frac),
+                self.config.alerts.data_wait_frac_warn,
+            )
+
+        if float(clip_rate) > 0.05:
+            logger.warning(
+                "Grad clip rate warning (step %d): clip_rate=%.3f > 0.050",
+                step,
+                float(clip_rate),
+            )
+
+    def _log_window_throughput_and_perf(self, *, step: int, window: _TrainWindow) -> None:
+        window_time = window.elapsed_seconds(now=time.time())
+        if window_time <= 0:
+            return
+
+        steps_per_second = float(window.steps) / float(window_time)
+        tokens_per_second = float(window.tokens) / float(window_time)
+        effective_tokens_per_second = float(window.effective_tokens) / float(window_time)
+        samples_per_second = float(window.samples) / float(window_time)
+
+        if self.writer is None:
+            return
+
+        self.writer.add_scalar("Throughput/steps_per_second", float(steps_per_second), step)
+        self.writer.add_scalar("Throughput/tokens_per_second", float(tokens_per_second), step)
+        self.writer.add_scalar(
+            "Throughput/effective_tokens_per_second",
+            float(effective_tokens_per_second),
+            step,
+        )
+        self.writer.add_scalar("Throughput/samples_per_second", float(samples_per_second), step)
+
+        achieved_tflops = compute_achieved_tflops(
+            float(effective_tokens_per_second),
+            int(self.model.num_parameters),
+            flops_multiplier=float(self.config.monitoring.mfu_flops_multiplier),
+        )
+        self.writer.add_scalar("Perf/achieved_tflops", float(achieved_tflops), step)
+        if self.config.monitoring.peak_tflops is not None:
+            peak_tflops = float(self.config.monitoring.peak_tflops)
+            self.writer.add_scalar(
+                "Perf/mfu",
+                float(compute_mfu(float(achieved_tflops), peak_tflops)),
+                step,
+            )
+
+    def _log_nvml_metrics(self, *, step: int) -> None:
+        if self.writer is None:
+            return
+        if self.device.type != "cuda":
+            return
+        if self._nvml is None or self._nvml_handle is None:
+            return
+
+        try:
+            util = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+            mem = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+            self.writer.add_scalar("GPU/utilization", float(util.gpu), step)
+            used_mb = float(mem.used) / (1024**2)
+            total_bytes = float(mem.total)
+            used_frac = float(mem.used) / total_bytes if total_bytes > 0 else 0.0
+            self.writer.add_scalar("GPU/memory_used_mb", float(used_mb), step)
+            self.writer.add_scalar("GPU/memory_used_frac", float(used_frac), step)
+        except Exception:
+            return
+
+    def _log_cuda_memory(self, *, step: int) -> None:
+        if self.device.type != "cuda":
+            return
+
+        allocated_mb = torch.cuda.memory_allocated(self.device) / (1024**2)
+        reserved_mb = torch.cuda.memory_reserved(self.device) / (1024**2)
+        max_allocated_mb = torch.cuda.max_memory_allocated(self.device) / (1024**2)
+        max_reserved_mb = torch.cuda.max_memory_reserved(self.device) / (1024**2)
+
+        if self.writer is not None:
+            self.writer.add_scalar("Memory/allocated_mb", float(allocated_mb), step)
+            self.writer.add_scalar("Memory/reserved_mb", float(reserved_mb), step)
+            self.writer.add_scalar("Memory/max_allocated_mb", float(max_allocated_mb), step)
+            self.writer.add_scalar("Memory/max_reserved_mb", float(max_reserved_mb), step)
+
+            if self._cuda_total_mem_bytes is not None:
+                reserved_bytes = torch.cuda.memory_reserved(self.device)
+                reserved_frac = reserved_bytes / self._cuda_total_mem_bytes
+                self.writer.add_scalar("Memory/reserved_frac", float(reserved_frac), step)
+
+        if step % 100 != 0:
+            return
+        if self._cuda_total_mem_bytes is None or self._cuda_total_mem_bytes <= 0:
+            return
+
+        reserved_bytes = torch.cuda.memory_reserved(self.device)
+        reserved_frac = reserved_bytes / self._cuda_total_mem_bytes
+        if reserved_frac > self.config.alerts.reserved_frac_bad:
+            logger.warning(
+                "Reserved frac BAD (step %d): %.3f > %.3f",
+                step,
+                float(reserved_frac),
+                self.config.alerts.reserved_frac_bad,
+            )
+        elif reserved_frac > self.config.alerts.reserved_frac_warn:
+            logger.warning(
+                "Reserved frac warning (step %d): %.3f > %.3f",
+                step,
+                float(reserved_frac),
+                self.config.alerts.reserved_frac_warn,
+            )
+
+    def _maybe_save_checkpoint(self, *, step: int) -> None:
+        if self.config.training.save_steps <= 0:
+            return
+        if step <= 0 or (step % int(self.config.training.save_steps)) != 0:
+            return
+
+        ckpt_start = time.time()
+        self.save_checkpoint(step)
+        ckpt_seconds = time.time() - ckpt_start
+        if self.writer is not None:
+            self.writer.add_scalar("Time/checkpoint_seconds", float(ckpt_seconds), step)
+
+    def _log_train_step(
+        self,
+        *,
+        progress: tqdm,
+        step: int,
+        lr_used: float,
+        loss_value: float,
+        loss_ema: float,
+        loss_spike_ratio: float,
+        tokens: int,
+        effective_tokens: int,
+        step_seconds: float,
+        data_wait_seconds: float,
+        totals: _TrainTotals,
+        window: _TrainWindow,
+    ) -> None:
+        progress.set_postfix({"loss_ema": f"{loss_ema:.4f}", "lr": f"{lr_used:.2e}"})
+
+        clip_rate = float(window.clip_rate())
+        train_ppl = float(self._safe_ppl_from_loss(float(loss_ema)))
+        self._write_train_step_scalars(
+            step=step,
+            loss_ema=float(loss_ema),
+            loss_value=float(loss_value),
+            loss_spike_ratio=float(loss_spike_ratio),
+            lr_used=float(lr_used),
+            train_ppl=float(train_ppl),
+            totals=totals,
+            tokens=int(tokens),
+            effective_tokens=int(effective_tokens),
+            clip_rate=float(clip_rate),
+            step_seconds=float(step_seconds),
+            data_wait_seconds=float(data_wait_seconds),
+        )
+        self._warn_train_step(
+            step=step,
+            loss_spike_ratio=float(loss_spike_ratio),
+            data_wait_seconds=float(data_wait_seconds),
+            step_seconds=float(step_seconds),
+            clip_rate=float(clip_rate),
+        )
+
+        self._log_window_throughput_and_perf(step=step, window=window)
+
+        # Post-step weight evolution tracking (bounded by monitoring mode).
+        self._log_weight_norms(step)
+        self._log_nvml_metrics(step=step)
+        self._log_cuda_memory(step=step)
+
+        # Reset the throughput window before checkpointing so the next window includes save stalls.
+        window.reset(start_time=time.time())
+        self._maybe_save_checkpoint(step=step)
+
+    def _finalize_training(
+        self,
+        *,
+        step: int,
+        totals: _TrainTotals,
+        elapsed_seconds: float,
+        final_loss: float,
+    ) -> None:
+        steps_per_second = float(step) / float(elapsed_seconds) if elapsed_seconds > 0 else 0.0
+        tokens_per_second = (
+            float(totals.tokens) / float(elapsed_seconds) if elapsed_seconds > 0 else 0.0
+        )
+        samples_per_second = (
+            float(totals.samples) / float(elapsed_seconds) if elapsed_seconds > 0 else 0.0
+        )
+
+        logger.info("Training completed!")
+        logger.info("Total time: %s", timedelta(seconds=int(elapsed_seconds)))
+        logger.info("Steps per second: %.2f", steps_per_second)
+        logger.info("Tokens per second: %.2f", tokens_per_second)
+        logger.info("Samples per second: %.2f", samples_per_second)
+        logger.info("Final loss: %.4f", float(final_loss))
+
+        if self.writer is None:
+            return
+
+        self.writer.add_scalar("Throughput/steps_per_second", float(steps_per_second), step)
+        self.writer.add_scalar("Throughput/tokens_per_second", float(tokens_per_second), step)
+        self.writer.add_scalar("Throughput/samples_per_second", float(samples_per_second), step)
+        self.writer.add_hparams(
+            {
+                "learning_rate": str(self.config.training.learning_rate),
+                "batch_size": str(self.config.training.batch_size),
+                "max_steps": str(self.config.training.max_steps),
+            },
+            {"final_loss": float(final_loss), "steps_per_second": float(steps_per_second)},
+        )
+        self.writer.close()
+
     def train(self):
         """Main training loop."""
         logger.info("Starting training for %d steps...", self.config.training.max_steps)
@@ -693,22 +1119,16 @@ class Trainer:
 
         self.model.train()
         global_step = 0
-        losses: list[float] = []
-        total_tokens = 0
-        total_effective_tokens = 0
-        total_samples = 0
-        window_tokens = 0
-        window_effective_tokens = 0
-        window_samples = 0
-        window_steps = 0
-        window_clipped_steps = 0
-        window_start_time = time.time()
+        last_loss: Optional[float] = None
+        totals = _TrainTotals()
+        window = _TrainWindow(start_time=time.time())
         prev_step_end_time = time.time()
-
         start_time = time.time()
 
         if self.config.monitoring.probe_steps > 0:
             self._run_fixed_probe(step=0)
+            if self.config.monitoring.tensorboard_flush_on_log:
+                self._flush_writer()
 
         while global_step < self.config.training.max_steps:
             epoch_progress = tqdm(self.train_loader, desc=f"Step {global_step}")
@@ -719,12 +1139,12 @@ class Trainer:
 
                 log_this_step = global_step % self.log_steps == 0
                 hist_this_step = global_step > 0 and (global_step % self.histogram_steps == 0)
+                did_log = bool(log_this_step or hist_this_step)
 
                 batch_ready_time = time.time()
                 data_wait_seconds = max(0.0, batch_ready_time - prev_step_end_time)
 
-                if self.device.type == "cuda" and self.config.monitoring.sync_cuda_timing:
-                    torch.cuda.synchronize(self.device)
+                self._maybe_sync_cuda_timing()
                 step_start = time.time()
 
                 lr_used = float(self.optimizer.param_groups[0]["lr"])
@@ -735,286 +1155,41 @@ class Trainer:
                     log_this_step=log_this_step,
                 )
 
-                if self.device.type == "cuda" and self.config.monitoring.sync_cuda_timing:
-                    torch.cuda.synchronize(self.device)
+                self._maybe_sync_cuda_timing()
                 step_seconds = time.time() - step_start
 
                 loss_value = float(loss.detach().cpu().item())
-                losses.append(loss_value)
-                total_tokens += tokens
-                total_effective_tokens += effective_tokens
-                total_samples += samples
-                window_tokens += tokens
-                window_effective_tokens += effective_tokens
-                window_samples += samples
-                window_steps += 1
+                last_loss = float(loss_value)
 
-                if (
-                    self.config.training.clip_grad > 0
-                    and grad_norm is not None
-                    and float(grad_norm) > float(self.config.training.clip_grad)
-                ):
-                    window_clipped_steps += 1
+                totals.update(
+                    tokens=int(tokens),
+                    effective_tokens=int(effective_tokens),
+                    samples=int(samples),
+                )
+                window.update(
+                    tokens=int(tokens),
+                    effective_tokens=int(effective_tokens),
+                    samples=int(samples),
+                    clipped=bool(self._is_step_clipped(grad_norm)),
+                )
 
-                prev_loss_ema = self._loss_ema if self._loss_ema is not None else loss_value
-                beta = float(self.config.monitoring.loss_ema_beta)
-                self._loss_ema = (beta * float(prev_loss_ema)) + ((1.0 - beta) * loss_value)
-                loss_spike_ratio = loss_value / max(1e-12, float(prev_loss_ema))
+                loss_ema, loss_spike_ratio = self._update_loss_ema(loss_value)
 
                 if log_this_step:
-                    epoch_progress.set_postfix(
-                        {"loss_ema": f"{self._loss_ema:.4f}", "lr": f"{lr_used:.2e}"}
+                    self._log_train_step(
+                        progress=epoch_progress,
+                        step=global_step,
+                        lr_used=float(lr_used),
+                        loss_value=float(loss_value),
+                        loss_ema=float(loss_ema),
+                        loss_spike_ratio=float(loss_spike_ratio),
+                        tokens=int(tokens),
+                        effective_tokens=int(effective_tokens),
+                        step_seconds=float(step_seconds),
+                        data_wait_seconds=float(data_wait_seconds),
+                        totals=totals,
+                        window=window,
                     )
-
-                    if self.writer is not None:
-                        self.writer.add_scalar("Loss/train", float(self._loss_ema), global_step)
-                        self.writer.add_scalar("Loss/train_raw", float(loss_value), global_step)
-                        self.writer.add_scalar(
-                            "Health/loss_spike_ratio",
-                            float(loss_spike_ratio),
-                            global_step,
-                        )
-                        try:
-                            loss_ema = float(self._loss_ema)
-                            if self._is_finite_scalar(loss_ema) and loss_ema < 50:
-                                train_ppl = float(math.exp(loss_ema))
-                            else:
-                                train_ppl = float("inf")
-                        except OverflowError:
-                            train_ppl = float("inf")
-                        self.writer.add_scalar("PPL/train", float(train_ppl), global_step)
-
-                        self.writer.add_scalar("Tokens/seen", float(total_tokens), global_step)
-                        self.writer.add_scalar(
-                            "Tokens/effective_seen",
-                            float(total_effective_tokens),
-                            global_step,
-                        )
-                        self.writer.add_scalar("Data/tokens_per_update", float(tokens), global_step)
-                        self.writer.add_scalar(
-                            "Data/effective_tokens_per_update",
-                            float(effective_tokens),
-                            global_step,
-                        )
-
-                        if window_steps > 0:
-                            clip_rate = float(window_clipped_steps) / float(window_steps)
-                        else:
-                            clip_rate = 0.0
-                        self.writer.add_scalar("Gradients/clip_rate", float(clip_rate), global_step)
-
-                        self.writer.add_scalar("LR", lr_used, global_step)
-                        self.writer.add_scalar("Time/step_seconds", step_seconds, global_step)
-                        self.writer.add_scalar(
-                            "Time/data_wait_seconds",
-                            float(data_wait_seconds),
-                            global_step,
-                        )
-                        if step_seconds > 0:
-                            data_wait_frac = float(data_wait_seconds) / float(step_seconds)
-                        else:
-                            data_wait_frac = 0.0
-                        self.writer.add_scalar("Time/data_wait_frac", data_wait_frac, global_step)
-                        compute_seconds_est = max(
-                            0.0,
-                            float(step_seconds) - float(data_wait_seconds),
-                        )
-                        if step_seconds > 0:
-                            compute_frac_est = float(compute_seconds_est) / float(step_seconds)
-                        else:
-                            compute_frac_est = 0.0
-                        self.writer.add_scalar(
-                            "Time/compute_seconds_est",
-                            float(compute_seconds_est),
-                            global_step,
-                        )
-                        self.writer.add_scalar(
-                            "Time/compute_frac_est",
-                            float(compute_frac_est),
-                            global_step,
-                        )
-
-                    if global_step % 100 == 0:
-                        if loss_spike_ratio > self.config.alerts.loss_spike_stop:
-                            logger.warning(
-                                "Loss spike ratio BAD (step %d): %.3f > %.3f",
-                                global_step,
-                                float(loss_spike_ratio),
-                                self.config.alerts.loss_spike_stop,
-                            )
-                        elif loss_spike_ratio > self.config.alerts.loss_spike_warn:
-                            logger.warning(
-                                "Loss spike ratio warning (step %d): %.3f > %.3f",
-                                global_step,
-                                float(loss_spike_ratio),
-                                self.config.alerts.loss_spike_warn,
-                            )
-
-                        if step_seconds > 0:
-                            data_wait_frac = float(data_wait_seconds) / float(step_seconds)
-                        else:
-                            data_wait_frac = 0.0
-                        if data_wait_frac > self.config.alerts.data_wait_frac_bad:
-                            logger.warning(
-                                "Data wait frac BAD (step %d): %.3f > %.3f",
-                                global_step,
-                                data_wait_frac,
-                                self.config.alerts.data_wait_frac_bad,
-                            )
-                        elif data_wait_frac > self.config.alerts.data_wait_frac_warn:
-                            logger.warning(
-                                "Data wait frac warning (step %d): %.3f > %.3f",
-                                global_step,
-                                data_wait_frac,
-                                self.config.alerts.data_wait_frac_warn,
-                            )
-
-                        if window_steps > 0:
-                            clip_rate = float(window_clipped_steps) / float(window_steps)
-                        else:
-                            clip_rate = 0.0
-                        if clip_rate > 0.05:
-                            logger.warning(
-                                "Grad clip rate warning (step %d): clip_rate=%.3f > 0.050",
-                                global_step,
-                                float(clip_rate),
-                            )
-
-                    window_time = time.time() - window_start_time
-                    if window_time > 0:
-                        steps_per_second = window_steps / window_time
-                        tokens_per_second = window_tokens / window_time
-                        effective_tokens_per_second = window_effective_tokens / window_time
-                        samples_per_second = window_samples / window_time
-                        if self.writer is not None:
-                            self.writer.add_scalar(
-                                "Throughput/steps_per_second",
-                                steps_per_second,
-                                global_step,
-                            )
-                            self.writer.add_scalar(
-                                "Throughput/tokens_per_second",
-                                tokens_per_second,
-                                global_step,
-                            )
-                            self.writer.add_scalar(
-                                "Throughput/effective_tokens_per_second",
-                                effective_tokens_per_second,
-                                global_step,
-                            )
-                            self.writer.add_scalar(
-                                "Throughput/samples_per_second",
-                                samples_per_second,
-                                global_step,
-                            )
-                            achieved_tflops = compute_achieved_tflops(
-                                float(effective_tokens_per_second),
-                                int(self.model.num_parameters),
-                                flops_multiplier=float(self.config.monitoring.mfu_flops_multiplier),
-                            )
-                            self.writer.add_scalar(
-                                "Perf/achieved_tflops",
-                                float(achieved_tflops),
-                                global_step,
-                            )
-                            if self.config.monitoring.peak_tflops is not None:
-                                self.writer.add_scalar(
-                                    "Perf/mfu",
-                                    float(
-                                        compute_mfu(
-                                            float(achieved_tflops),
-                                            float(self.config.monitoring.peak_tflops),
-                                        )
-                                    ),
-                                    global_step,
-                                )
-
-                    # Post-step weight evolution tracking (bounded by monitoring mode).
-                    self._log_weight_norms(global_step)
-
-                    if (
-                        self.writer is not None
-                        and self._nvml is not None
-                        and self._nvml_handle is not None
-                        and self.device.type == "cuda"
-                    ):
-                        try:
-                            util = self._nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
-                            mem = self._nvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
-                            self.writer.add_scalar("GPU/utilization", float(util.gpu), global_step)
-                            used_mb = float(mem.used) / (1024**2)
-                            total_bytes = float(mem.total)
-                            used_frac = float(mem.used) / total_bytes if total_bytes > 0 else 0.0
-                            self.writer.add_scalar("GPU/memory_used_mb", used_mb, global_step)
-                            self.writer.add_scalar("GPU/memory_used_frac", used_frac, global_step)
-                        except Exception:
-                            pass
-
-                    if self.device.type == "cuda":
-                        allocated_mb = torch.cuda.memory_allocated(self.device) / (1024**2)
-                        reserved_mb = torch.cuda.memory_reserved(self.device) / (1024**2)
-                        max_allocated_mb = torch.cuda.max_memory_allocated(self.device) / (1024**2)
-                        max_reserved_mb = torch.cuda.max_memory_reserved(self.device) / (1024**2)
-                        if self.writer is not None:
-                            self.writer.add_scalar("Memory/allocated_mb", allocated_mb, global_step)
-                            self.writer.add_scalar("Memory/reserved_mb", reserved_mb, global_step)
-                            self.writer.add_scalar(
-                                "Memory/max_allocated_mb",
-                                max_allocated_mb,
-                                global_step,
-                            )
-                            self.writer.add_scalar(
-                                "Memory/max_reserved_mb",
-                                max_reserved_mb,
-                                global_step,
-                            )
-                            if self._cuda_total_mem_bytes is not None:
-                                reserved_bytes = torch.cuda.memory_reserved(self.device)
-                                reserved_frac = reserved_bytes / self._cuda_total_mem_bytes
-                                self.writer.add_scalar(
-                                    "Memory/reserved_frac",
-                                    float(reserved_frac),
-                                    global_step,
-                                )
-                        if (
-                            global_step % 100 == 0
-                            and self._cuda_total_mem_bytes is not None
-                            and self._cuda_total_mem_bytes > 0
-                        ):
-                            reserved_bytes = torch.cuda.memory_reserved(self.device)
-                            reserved_frac = reserved_bytes / self._cuda_total_mem_bytes
-                            if reserved_frac > self.config.alerts.reserved_frac_bad:
-                                logger.warning(
-                                    "Reserved frac BAD (step %d): %.3f > %.3f",
-                                    global_step,
-                                    float(reserved_frac),
-                                    self.config.alerts.reserved_frac_bad,
-                                )
-                            elif reserved_frac > self.config.alerts.reserved_frac_warn:
-                                logger.warning(
-                                    "Reserved frac warning (step %d): %.3f > %.3f",
-                                    global_step,
-                                    float(reserved_frac),
-                                    self.config.alerts.reserved_frac_warn,
-                                )
-
-                    window_tokens = 0
-                    window_effective_tokens = 0
-                    window_samples = 0
-                    window_steps = 0
-                    window_clipped_steps = 0
-                    window_start_time = time.time()
-
-                    if global_step % self.config.training.save_steps == 0 and global_step > 0:
-                        ckpt_start = time.time()
-                        self.save_checkpoint(global_step)
-                        ckpt_seconds = time.time() - ckpt_start
-                        if self.writer is not None:
-                            self.writer.add_scalar(
-                                "Time/checkpoint_seconds",
-                                float(ckpt_seconds),
-                                global_step,
-                            )
 
                 if (
                     self.val_loader is not None
@@ -1023,6 +1198,7 @@ class Trainer:
                     and (global_step % self.config.training.eval_steps) == 0
                 ):
                     self.evaluate(self.val_loader, step=global_step)
+                    did_log = True
 
                 if (
                     self.config.monitoring.probe_steps > 0
@@ -1030,41 +1206,27 @@ class Trainer:
                     and (global_step % int(self.config.monitoring.probe_steps)) == 0
                 ):
                     self._run_fixed_probe(step=global_step)
+                    did_log = True
 
                 if hist_this_step:
                     self._log_weight_histograms(global_step)
+                    did_log = True
+
+                if did_log and self.config.monitoring.tensorboard_flush_on_log:
+                    self._flush_writer()
 
                 prev_step_end_time = time.time()
                 global_step += 1
 
         self.save_checkpoint(global_step, final=True)
 
-        elapsed_time = time.time() - start_time
-        steps_per_second = global_step / elapsed_time if elapsed_time > 0 else 0.0
-        tokens_per_second = total_tokens / elapsed_time if elapsed_time > 0 else 0.0
-        samples_per_second = total_samples / elapsed_time if elapsed_time > 0 else 0.0
-        final_loss = losses[-1] if losses else float("nan")
-
-        logger.info("Training completed!")
-        logger.info("Total time: %s", timedelta(seconds=int(elapsed_time)))
-        logger.info("Steps per second: %.2f", steps_per_second)
-        logger.info("Tokens per second: %.2f", tokens_per_second)
-        logger.info("Samples per second: %.2f", samples_per_second)
-        logger.info("Final loss: %.4f", final_loss)
-
-        if self.writer is not None:
-            self.writer.add_scalar("Throughput/steps_per_second", steps_per_second, global_step)
-            self.writer.add_scalar("Throughput/tokens_per_second", tokens_per_second, global_step)
-            self.writer.add_scalar("Throughput/samples_per_second", samples_per_second, global_step)
-            self.writer.add_hparams(
-                {
-                    "learning_rate": str(self.config.training.learning_rate),
-                    "batch_size": str(self.config.training.batch_size),
-                    "max_steps": str(self.config.training.max_steps),
-                },
-                {"final_loss": final_loss, "steps_per_second": steps_per_second},
-            )
-            self.writer.close()
+        elapsed_seconds = time.time() - start_time
+        self._finalize_training(
+            step=int(global_step),
+            totals=totals,
+            elapsed_seconds=float(elapsed_seconds),
+            final_loss=float(last_loss) if last_loss is not None else float("nan"),
+        )
 
     def training_step(self, batch, step: int, log_this_step: bool):
         """
@@ -1165,7 +1327,7 @@ class Trainer:
                         step,
                         ignore_frac,
                         self.config.alerts.ignore_frac_warn,
-                        )
+                    )
 
             self._log_attention_metrics(step, blocks_to_monitor=blocks_to_monitor)
 

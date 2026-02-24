@@ -6,7 +6,8 @@ For Phase 1+: Will upgrade to OmegaConf + Hydra.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
+import torch.distributed as dist
 
 
 @dataclass
@@ -19,6 +20,38 @@ class ModelConfig:
     max_position_embeddings: int = 2048
     vocab_size: int = 50257
     dropout: float = 0.1
+
+
+@dataclass
+class TPConfig:
+    """
+    Tensor Parallel configuration.
+
+    When enabled, model weights are sharded across multiple GPUs.
+    Each GPU stores 1/tp_size of the parameters.
+    """
+
+    # Enable tensor parallelism
+    enabled: bool = False
+
+    # TP rank of this process (0 to tp_size-1)
+    rank: int = 0
+
+    # Total number of TP processes
+    size: int = 1
+
+    # Process group for all-reduce operations
+    # If None, uses dist.group.WORLD
+    group: Optional[Any] = None
+
+    def __post_init__(self):
+        """Validate configuration."""
+        if self.enabled:
+            assert self.size > 1, "tp_size must be > 1 when TP is enabled"
+            assert 0 <= self.rank < self.size, f"tp_rank must be in [0, {self.size-1}]"
+
+            if self.group is None:
+                self.group = dist.group.WORLD
 
 
 @dataclass
@@ -60,6 +93,12 @@ class MonitoringConfig:
     activation_sites: Literal["none", "sentinel", "all_lns"] = "sentinel"
     sync_cuda_timing: bool = False
     fail_fast_nonfinite: bool = True
+
+    # TensorBoard writer buffering. Smaller values make runs feel more "live" at the cost of a bit
+    # more overhead.
+    tensorboard_max_queue: int = 1
+    tensorboard_flush_secs: int = 1
+    tensorboard_flush_on_log: bool = True
 
     # Attention monitoring uses this tau threshold for comparisons (inspired by QK-Clip-like caps).
     attn_tau: float = 100.0
@@ -142,6 +181,40 @@ class AlertThresholdsConfig:
 
 
 @dataclass
+class DistributedConfig:
+    """
+    Distributed training configuration.
+
+    Supports both CPU development (gloo backend) and GPU production (nccl backend).
+    The same code works on both - only the backend changes.
+    """
+
+    # World size (number of devices/processes)
+    # If None, auto-detect from available devices
+    world_size: Optional[int] = None
+
+    # Distributed backend
+    # - "auto": Auto-detect based on CUDA availability
+    # - "gloo": CPU-compatible (for development)
+    # - "nccl": GPU-optimized (for production)
+    backend: Literal["auto", "gloo", "nccl"] = "auto"
+
+    # Master address and port for process group
+    master_addr: str = "localhost"
+    master_port: int = 29500
+
+    # Device placement
+    device: Optional[Literal["cpu", "cuda"]] = None  # Auto-detect
+
+    # DDP settings
+    find_unused_parameters: bool = False  # More efficient if False
+    broadcast_buffers: bool = False
+
+    # Gradient bucketing for communication efficiency
+    bucket_cap_mb: int = 25
+
+
+@dataclass
 class Config:
     """Main configuration class."""
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -149,6 +222,7 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     alerts: AlertThresholdsConfig = field(default_factory=AlertThresholdsConfig)
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)
 
     # Output
     output_dir: str = "outputs"

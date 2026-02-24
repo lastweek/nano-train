@@ -1,35 +1,68 @@
 """
 MLP implementation for MVP.
 
+Supports tensor parallelism via TPConfig parameter.
 Phase 7 will add MoE support.
 """
 
 import torch
 import torch.nn as nn
 
-from src.config import ModelConfig
-from src.layers import Linear, Dropout, GELU
+from src.config import ModelConfig, TPConfig
+from src.layers import Linear, Dropout, GELU, ColumnParallelLinear, RowParallelLinear
 
 
 class MLP(nn.Module):
-    """Standard feed-forward network (FFN)."""
+    """
+    Feed-forward network with optional tensor parallelism.
 
-    def __init__(self, config: ModelConfig):
+    If tp_config.enabled is True:
+        - fc1 uses ColumnParallelLinear (split intermediate dimension)
+        - fc2 uses RowParallelLinear (split intermediate dimension)
+        Communication: 1 all-reduce per forward pass
+
+    If tp_config.enabled is False (default):
+        - Uses standard Linear layers
+        - No communication
+    """
+
+    def __init__(self, config: ModelConfig, tp_config: TPConfig = None):
         super().__init__()
-        # NATIVE: Our Linear in src/layers.py
-        # ORIGINAL: torch.nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc1 = Linear(config.hidden_size, config.intermediate_size)
+        tp_config = tp_config or TPConfig()
 
-        # NATIVE: Our Linear in src/layers.py
-        # ORIGINAL: torch.nn.Linear(config.intermediate_size, config.hidden_size)
-        self.fc2 = Linear(config.intermediate_size, config.hidden_size)
+        self.tp_enabled = tp_config.enabled
+        self.tp_rank = tp_config.rank
+        self.tp_size = tp_config.size
+        self.tp_group = tp_config.group
 
-        # NATIVE: Our Dropout in src/layers.py
-        # ORIGINAL: torch.nn.Dropout(config.dropout)
+        if self.tp_enabled:
+            # For TP: each GPU gets intermediate_size // tp_size
+            assert config.intermediate_size % self.tp_size == 0, \
+                f"intermediate_size ({config.intermediate_size}) must be divisible by tp_size ({self.tp_size})"
+
+            # ColumnParallelLinear expects GLOBAL out_features and returns local shard.
+            self.fc1 = ColumnParallelLinear(
+                config.hidden_size,
+                config.intermediate_size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                tp_group=self.tp_group,
+            )
+
+            # RowParallelLinear expects GLOBAL in_features and consumes local shard.
+            self.fc2 = RowParallelLinear(
+                config.intermediate_size,
+                config.hidden_size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                tp_group=self.tp_group,
+            )
+        else:
+            # Standard Linear layers
+            self.fc1 = Linear(config.hidden_size, config.intermediate_size)
+            self.fc2 = Linear(config.intermediate_size, config.hidden_size)
+
         self.dropout = Dropout(config.dropout)
-
-        # NATIVE: Our GELU in src/layers.py
-        # ORIGINAL: torch.nn.GELU()
         self.act = GELU()
 
     def forward(self, x):
@@ -40,11 +73,9 @@ class MLP(nn.Module):
         Returns:
             output: (batch_size, seq_len, hidden_size)
         """
-        # Project to intermediate size for non-linear mixing.
-        x = self.fc1(x)  # (B, S, intermediate)
+        x = self.fc1(x)
         x = self.act(x)
         x = self.dropout(x)
-        # Project back to hidden size.
-        x = self.fc2(x)  # (B, S, hidden)
+        x = self.fc2(x)  # All-reduce inside if TP mode
         x = self.dropout(x)
         return x
