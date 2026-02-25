@@ -1,212 +1,158 @@
-# Logging System
+# Logging Guide
+
+**Purpose**: Document the repo logging API and practical logging patterns for training and
+infrastructure code.
+
+**Audience**: Contributors editing `src/` modules and `examples/` scripts.
+
+**Prerequisites**: Basic familiarity with Python's `logging` module.
+
+**Related Docs**:
+- [Training Monitoring Quickstart](training_monitoring_quickstart.md)
+- [Training Monitoring Metrics Reference](training_monitoring_metrics_reference.md)
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Basic Setup](#basic-setup)
+- [Configuration](#configuration)
+- [Example Usage by Context](#example-usage-by-context)
+- [Log Levels](#log-levels)
+- [Best Practices](#best-practices)
+- [Migration Pattern from `print()`](#migration-pattern-from-print)
+- [Troubleshooting](#troubleshooting)
 
 ## Overview
 
-Nano-train uses a production-grade logging system built on Python's standard `logging` module with color-coded console output.
+nano-train uses a centralized logging helper in `src/logging.py`.
 
-## Features
+Core entry points:
+- `setup_logging(...)`: initialize handlers and level at the program entrypoint.
+- `get_logger(name)`: create module-level loggers with consistent format.
 
-- **Color-coded output** for easy readability in terminals
-- **Structured log format** with timestamps, levels, and module names
-- **Configurable log levels** (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-- **Optional file logging** for persisting logs
-- **Module-specific loggers** for better filtering
-
-## Usage
-
-### Basic Setup
+## Basic Setup
 
 ```python
-from src.logging import setup_logging, get_logger
+from src.logging import get_logger
+from src.logging import setup_logging
 
-# Setup at application entry point
 setup_logging(log_level="INFO")
-
-# Get logger for your module
 logger = get_logger(__name__)
 
-# Use logger
 logger.info("Training started")
-logger.debug(f"Batch shape: {batch.shape}")
 logger.warning("Low GPU memory")
-logger.error("Training failed")
 ```
 
-### Log Levels
-
-| Level | Usage | Output |
-|--------|--------|---------|
-| DEBUG | Detailed debugging information | Shown only when level=DEBUG |
-| INFO | General informational messages | Default level |
-| WARNING | Warning messages (not critical) | Always shown |
-| ERROR | Error messages | Always shown |
-| CRITICAL | Critical failures | Always shown |
-
-### Configuration Options
+## Configuration
 
 ```python
-from src.core.logging import setup_logging
+from src.logging import setup_logging
 
 setup_logging(
-    log_level="INFO",              # Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    log_file="output/training.log", # Optional file path for logging
-    use_colors=True,                # Enable/disable color-coded output
-    log_format=None                 # Custom format (default: timestamp | level | module: message)
+    log_level="INFO",                 # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    log_file="output/training.log",   # optional file sink
+    use_colors=True,                   # console colors
+    log_format=None,                   # optional custom format string
 )
 ```
 
-### Custom Log Format
+Custom format example:
 
 ```python
-custom_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+custom_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 setup_logging(log_level="INFO", log_format=custom_format)
 ```
 
-## Examples
+## Example Usage by Context
 
-### In Modules
+### Module Code
 
 ```python
-# src/models/transformer.py
-from src.core.logging import get_logger
+from src.logging import get_logger
 
 logger = get_logger(__name__)
 
 class TransformerModel(nn.Module):
     def __init__(self, config):
-        logger.info(f"Initializing model with {config.num_layers} layers")
-        ...
+        super().__init__()
+        logger.info("init layers=%d", config.num_layers)
 ```
 
-### In Training Scripts
+### Training Entrypoint
 
 ```python
-# examples/train_mvp.py
-from src.core.logging import setup_logging, get_logger
+from src.logging import get_logger
+from src.logging import setup_logging
 
-# Setup at the start
-setup_logging(log_level="INFO", log_file="output/training.log")
+setup_logging(log_level="INFO", log_file="output/train.log")
 logger = get_logger(__name__)
-
-def main():
-    logger.info("Starting training...")
-    logger.info(f"Device: {device}")
-    logger.info(f"Model parameters: {model.num_parameters:,}")
 ```
 
-### In Tests
+### Tests
 
 ```python
-# tests/test_layers.py
-from src.core.logging import setup_logging, get_logger
+from src.logging import get_logger
+from src.logging import setup_logging
 
-# Use DEBUG level for detailed test output
 setup_logging(log_level="DEBUG")
 logger = get_logger(__name__)
-
-def test_linear():
-    logger.debug("Testing Linear layer...")
-    ...
 ```
 
-## Log Format
+## Log Levels
 
-Default format:
-```
-2026-02-13 13:58:43 | INFO     | src.trainer: Starting training for 1000 steps...
-2026-02-13 13:58:43 | INFO     | src.trainer: Model parameters: 125,000,000
-2026-02-13 13:58:43 | WARNING  | src.trainer: Low GPU memory: 2GB remaining
-2026-02-13 13:58:43 | ERROR    | src.trainer: Training failed: CUDA out of memory
-```
-
-## Color Coding
-
-| Level | Color |
-|--------|--------|
-| DEBUG | Grey |
-| INFO | Blue |
-| WARNING | Yellow |
-| ERROR | Red |
-| CRITICAL | Bold Red |
-
-## File Logging
-
-To persist logs to a file:
-
-```python
-setup_logging(
-    log_level="INFO",
-    log_file="output/training.log"
-)
-```
-
-Logs will be appended to the file without color codes (for better readability in log files).
+| Level | Use Case |
+|---|---|
+| `DEBUG` | Detailed diagnostics and shape tracing |
+| `INFO` | Normal training progress and config |
+| `WARNING` | Non-fatal problems worth attention |
+| `ERROR` | Operation failed, run may continue or abort |
+| `CRITICAL` | Irrecoverable failure |
 
 ## Best Practices
 
-1. **Use appropriate log levels**
-   - DEBUG: Detailed diagnostics (shapes, values, algorithm steps)
-   - INFO: High-level progress (training started, checkpoint saved)
-   - WARNING: Non-critical issues (high memory usage, slow iteration)
-   - ERROR: Failures (training crashed, CUDA OOM)
-
-2. **Use structured messages**
-   ```python
-   logger.info(f"Training step {step}/{max_steps}")
-   logger.error(f"Failed to load checkpoint: {checkpoint_path}")
-   ```
-
-3. **Avoid expensive operations in debug logs**
-   ```python
-   # BAD: Expensive string formatting even if not logged
-   logger.debug(f"Tensor stats: {torch.expensive_computation(tensor)}")
-
-   # GOOD: Lazy evaluation
-   if logger.isEnabledFor(logging.DEBUG):
-       logger.debug(f"Tensor stats: {torch.expensive_computation(tensor)}")
-   ```
-
-4. **Use module-level loggers**
-   ```python
-   # In each module
-   logger = get_logger(__name__)  # Returns 'src.models.transformer'
-   ```
-
-## Migration from print()
-
-Replace `print()` statements with appropriate log levels:
+1. Call `setup_logging(...)` once at the main entrypoint.
+2. Use `logger = get_logger(__name__)` at module scope.
+3. Keep `INFO` signal dense and `DEBUG` signal high-detail.
+4. Use lazy guarded debug blocks for expensive computations.
 
 ```python
-# BEFORE
-print(f"Loading data from {path}...")
-print(f"Vocab size: {vocab_size}")
+import logging
+
+if logger.isEnabledFor(logging.DEBUG):
+    logger.debug("Tensor stats: %s", expensive_stats(tensor))
+```
+
+5. Prefer structured wording with stable prefixes for grepability.
+
+## Migration Pattern from `print()`
+
+```python
+# before
+print(f"Loading data from {path}")
 print(f"ERROR: {error}")
 
-# AFTER
-logger.info(f"Loading data from {path}...")
-logger.info(f"Vocab size: {vocab_size}")
-logger.error(f"Failed to load: {error}")
+# after
+logger.info("Loading data from %s", path)
+logger.error("Failed to load: %s", error)
 ```
 
 ## Troubleshooting
 
-### No output for DEBUG messages
+### DEBUG messages do not appear
 
-Make sure you set the log level to DEBUG:
-```python
-setup_logging(log_level="DEBUG")
-```
+Set `log_level="DEBUG"` in `setup_logging(...)`.
 
-### Colors not showing
+### File logs are not created
 
-Ensure your terminal supports ANSI color codes. Most modern terminals do.
+Ensure the output directory exists and is writable.
 
-### Logs not writing to file
-
-Check directory exists and is writable:
 ```python
 import os
-log_dir = "output"
-os.makedirs(log_dir, exist_ok=True)
-setup_logging(log_file=f"{log_dir}/training.log")
+
+os.makedirs("output", exist_ok=True)
+setup_logging(log_file="output/training.log")
 ```
+
+### Color codes look wrong
+
+Set `use_colors=False` for terminals without ANSI support.

@@ -1,4 +1,30 @@
-# Model Info Dumping Utility
+# Model Info Utility
+
+**Purpose**: Reference for `dump_model_info()` usage, outputs, integration patterns, and
+practical troubleshooting.
+
+**Audience**: Developers using model introspection reports during training and debugging.
+
+**Prerequisites**: Familiarity with PyTorch modules and nano-train logging setup.
+
+**Related Docs**:
+- [Model Info Appendix](model_info_appendix.md)
+- [Logging Guide](logging.md)
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Usage](#usage)
+- [Output Format](#output-format)
+- [Examples](#examples)
+- [Return Value](#return-value)
+- [Dependencies](#dependencies)
+- [Integration with Training](#integration-with-training)
+- [Performance Notes](#performance-notes)
+- [Troubleshooting](#troubleshooting)
+- [Testing](#testing)
+- [API Reference](#api-reference)
 
 ## Overview
 
@@ -176,7 +202,7 @@ The generated markdown is organized as:
 3. Roofline Analysis
 4. Sensitivity Analysis
 5. Architectural Limits
-6. Appendix pointers (full appendix detail remains in `docs/model_info.md`)
+6. Appendix pointers (full appendix detail remains in `docs/model_info_appendix.md`)
 
 ## Output Format
 
@@ -418,7 +444,7 @@ python tests/test_model_info.py
 
 Run the demonstration:
 ```bash
-python examples/demo_model_info.py
+python examples/model_info.py
 ```
 
 ## API Reference
@@ -445,35 +471,3 @@ dump_model_info(
 
 **Raises:**
 - No exceptions raised (all errors caught and logged)
-
-## Appendix A: Detailed Derivations
-
-### Dense Linear Layer
-
-- Input shape: `[B,S,In]`, weight shape: `[In,Out]`
-- FLOPs:
-  - `F_linear = 2 * B * S * In * Out`
-
-### MLA Attention FLOPs (Prefill)
-
-- Terms:
-  - `F_Q = 2 * B * S * H * r_q`
-  - `F_K = 2 * B * S * H * r_kv`
-  - `F_attn_score = 2 * B * h * S^2 * d_eff`
-  - `d_eff = d_nope + d_rope`
-- For DeepSeek-style MLA, use model-config dims (`H`, `h`, `r_q`, `r_kv`, `d_nope`, `d_rope`, `d_v`).
-
-### MoE FLOPs Per Token
-
-- One expert MLP:
-  - `F_expert = 6 * H * d_moe`
-- Routed total:
-  - `F_MoE = B * S * top_k * 6 * H * d_moe`
-
-## Appendix B: Full Debugging Checklist
-
-- Verify `T_comp` uses `F_realizable` as a peak-equivalent compute cost (i.e., `T_comp = F_realizable / P_peak`).
-- Verify WRF is applied consistently in prefill and decode paths.
-- Verify KV bytes are counted per layer and multiplied by layer count.
-- Verify temporary buffer bytes are not double-counted as activations.
-- Verify dtype byte assumptions are consistent across weights/acts/KV.

@@ -1,6 +1,10 @@
 # Nano-Train: A Distributed LLM Training Framework
 
-A production-grade distributed LLM training framework from scratch, targeting models like DeepSeek-R1 (671B MoE parameters). The framework will implement state-of-the-art parallelism strategies (tensor, pipeline, data, sequence, and expert parallelism), memory optimizations, and training infrastructure similar to Megatron-LM but with a cleaner, more modular architecture.
+A production-grade distributed LLM training framework from scratch, targeting
+models like DeepSeek-R1 (671B MoE parameters). The framework will implement
+state-of-the-art parallelism strategies (tensor, pipeline, data, sequence, and
+expert parallelism), memory optimizations, and training infrastructure similar
+to Megatron-LM but with a cleaner, more modular architecture.
 
 ## 🎯 Goal
 
@@ -162,10 +166,13 @@ The [sync_and_run.sh](scripts/sync_and_run.sh) script automates:
 
 ## 📘 Learning Guides
 
+- [Docs Index](docs/README.md) - organized navigation across guides, operations, and reference docs.
 - [TP + DP Backward Flow](docs/tp_dp_communication.md) - communication domains, collectives,
   and gradient flow in 2D parallel training.
 - [TP + EP + DP Communication](docs/ep_tp_dp_communication.md) - expert dispatch/return
   all-to-all flow, gradient synchronization domains, and expert TP=1 rationale.
+- [DeepSeekMoE Aux Losses](docs/deepseek_moe_aux_losses.md) - expert/device load-balance
+  objectives from DeepSeekMoE, plus mapping to this repo's current implementation.
 
 ## 📚 References
 

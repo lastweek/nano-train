@@ -1,4 +1,27 @@
-# TP + DP Backward Flow in LLM Training (Summary)
+# TP + DP Backward Flow in LLM Training
+
+**Purpose**: Explain where TP and DP communication happens during forward/backward and what
+must be synchronized for mathematically correct training.
+
+**Audience**: Readers learning canonical TP+DP training flow.
+
+**Prerequisites**: Familiarity with linear-layer forward/backward equations and all-reduce.
+
+**Related Docs**:
+- [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
+- [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
+
+## Table of Contents
+
+- [1) Mental model: a 2D process grid](#1-mental-model-a-2d-process-grid)
+- [2) Anchor identities (single linear layer)](#2-anchor-identities-single-linear-layer)
+- [3) Two standard TP sharding patterns](#3-two-standard-tp-sharding-patterns)
+- [4) How DP fits: gradients vs activation-gradients](#4-how-dp-fits-gradients-vs-activation-gradients)
+- [5) Optimizer step (who updates what)](#5-optimizer-step-who-updates-what)
+- [6) Concrete TP=2, DP=2 example (world=4)](#6-concrete-tp2-dp2-example-world4)
+- [7) Where pipeline parallel (PP) fits (quick note)](#7-where-pipeline-parallel-pp-fits-quick-note)
+- [8) Who reduces what (cheat sheet)](#8-who-reduces-what-cheat-sheet)
+- [9) Practical implementation notes](#9-practical-implementation-notes)
 
 This note summarizes how tensor parallel (TP) and data parallel (DP) interact during
 forward/backward in modern LLM training, focusing on where gradients live and which

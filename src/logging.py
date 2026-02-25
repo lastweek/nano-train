@@ -132,7 +132,7 @@ def get_logger(name: str) -> logging.Logger:
     Get a named logger for a module.
 
     Usage:
-        from src.core.logging import get_logger
+        from src.logging import get_logger
         logger = get_logger(__name__)
 
         logger.info("Training started")
@@ -155,7 +155,7 @@ def quick_setup(level: str = "INFO") -> None:
     Quick setup for logging in scripts.
 
     Usage:
-        from src.core.logging import quick_setup
+        from src.logging import quick_setup
         quick_setup("INFO")
     """
     setup_logging(log_level=level)

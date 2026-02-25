@@ -5055,7 +5055,7 @@ def _render_appendix_derivations_pointer() -> List[str]:
     lines.append("## Appendix A: Full FLOP Derivations")
     lines.append("")
     lines.append(
-        "- Detailed derivations are documented in `docs/model_info.md` "
+        "- Detailed derivations are documented in `docs/model_info_appendix.md` "
         "(see the derivation appendix section)."
     )
     return lines
@@ -5067,7 +5067,7 @@ def _render_debugging_checklist_pointer() -> List[str]:
     lines.append("## Appendix B: Common Failure Modes / Debugging Checklist")
     lines.append("")
     lines.append(
-        "- Full debugging checklist is documented in `docs/model_info.md` "
+        "- Full debugging checklist is documented in `docs/model_info_appendix.md` "
         "(see the checklist appendix section)."
     )
     return lines

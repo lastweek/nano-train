@@ -1,74 +1,28 @@
-# Training Monitoring v2: Stability/Precision vs Performance
+# Training Monitoring Metrics Reference
 
-**Purpose**: nano-train monitoring is designed to answer two different questions:
+**Purpose**: Define monitoring metrics, formulas, heuristics, and diagnosis rules used by
+nano-train.
 
-1) **Training stability / numerical precision**: are updates finite, well-scaled, and flowing
-through depth?
-2) **Training performance**: are we compute- or input-bound, and are we trending toward OOM or
-regressions?
+**Audience**: Contributors debugging training stability, optimization quality, and
+performance regressions.
+
+**Prerequisites**: Basic understanding of optimization, gradients, and TensorBoard.
+
+**Related Docs**:
+- [EP Training Monitoring Quickstart](training_monitoring_quickstart.md)
+- [Logging Guide](logging.md)
+
+## Table of Contents
+
+- [Notation / Glossary](#notation--glossary)
+- [Metric Table A — Training Stability / Precision](#metric-table-a--training-stability--precision-numerics--optimization)
+- [Metric Table B — Training Performance](#metric-table-b--training-performance-time--throughput--memory)
+- [Interpretation Rules (fast diagnosis)](#interpretation-rules-fast-diagnosis)
+- [Tuning Knobs and what to watch](#tuning-knobs-config-driven-and-what-to-watch)
+- [Known Limitations (current MVP)](#known-limitations-current-mvp)
+- [Roadmap (high-signal next additions)](#roadmap-high-signal-next-additions)
 
 **Last Updated**: 2026-02-22
-
----
-
-## Quickstart
-
-### 1) Run training (writes TensorBoard event files)
-
-```bash
-python examples/train_mvp.py
-```
-
-### 2) View metrics in TensorBoard
-
-```bash
-# Option A: helper script
-./scripts/start_tensorboard.sh
-
-# Option B: start TensorBoard directly (requires a modern `tensorboard` install)
-tensorboard --logdir=outputs --port=6006 --host=localhost
-```
-
-Open `http://localhost:6006`.
-
-**Live updates**: nano-train flushes TensorBoard event files on log/eval/probe/hist steps by
-default. If the UI still feels “behind”, make sure you run TensorBoard with a small reload interval:
-
-```bash
-./scripts/start_tensorboard.sh --reload_interval 1
-```
-
-If plots still feel sparse, lower `Config.training.log_steps` (e.g. set it to `1`) so the trainer
-emits more points.
-
-### 3) Where logs live (source of truth)
-
-Event files are written to:
-
-```
-{config.log_dir}/{config.run_name}/
-```
-
-Defaults (see `../src/config.py`):
-- `Config.log_dir = "outputs"`
-- `Config.run_name = "nano_train_mvp"`
-
-So by default: `outputs/nano_train_mvp/`.
-
----
-
-## Monitoring Modes (bounded by default)
-
-Configured via `Config.monitoring.mode` (see `../src/config.py`):
-
-- `minimal`: performance + core scalars only (no per-parameter or histogram work).
-- `standard` (default): **bounded** monitoring. The number of time series scales with
-  **#layers**, not **#parameter tensors**.
-- `debug`: opt-in deep dive; enables per-parameter scalars/histograms (expensive).
-
-**Histogram cadence** is controlled by `Config.monitoring.histogram_steps` (default: `1000`).
-
----
 
 ## Notation / Glossary
 

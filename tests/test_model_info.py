@@ -336,10 +336,16 @@ def test_dump_model_info_basic():
         assert "`C_kv` mapping" in report_str
         assert "MFU_est" in report_str
         assert "F_theory" in report_str
-        assert "Detailed derivations are documented in `docs/model_info.md`" in report_str
-        assert "Full debugging checklist is documented in `docs/model_info.md`" in report_str
+        assert (
+            "Detailed derivations are documented in "
+            "`docs/model_info_appendix.md`"
+        ) in report_str
+        assert (
+            "Full debugging checklist is documented in "
+            "`docs/model_info_appendix.md`"
+        ) in report_str
 
-        docs_text = Path("docs/model_info.md").read_text(encoding="utf-8")
+        docs_text = Path("docs/model_info_appendix.md").read_text(encoding="utf-8")
         assert "## Appendix A: Detailed Derivations" in docs_text
         assert "F_linear = 2 * B * S * In * Out" in docs_text
         assert "## Appendix B: Full Debugging Checklist" in docs_text
