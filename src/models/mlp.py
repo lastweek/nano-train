@@ -5,11 +5,18 @@ Supports tensor parallelism via TPConfig parameter.
 Phase 7 will add MoE support.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
-from src.config import ModelConfig, TPConfig
-from src.layers import Linear, Dropout, GELU, ColumnParallelLinear, RowParallelLinear
+from src.config import ModelConfig
+from src.config import TPConfig
+from src.layers import ColumnParallelLinear
+from src.layers import Dropout
+from src.layers import GELU
+from src.layers import Linear
+from src.layers import RowParallelLinear
 
 
 class MLP(nn.Module):
@@ -26,7 +33,7 @@ class MLP(nn.Module):
         - No communication
     """
 
-    def __init__(self, config: ModelConfig, tp_config: TPConfig = None):
+    def __init__(self, config: ModelConfig, tp_config: Optional[TPConfig] = None) -> None:
         super().__init__()
         tp_config = tp_config or TPConfig()
 
@@ -37,8 +44,11 @@ class MLP(nn.Module):
 
         if self.tp_enabled:
             # For TP: each GPU gets intermediate_size // tp_size
-            assert config.intermediate_size % self.tp_size == 0, \
-                f"intermediate_size ({config.intermediate_size}) must be divisible by tp_size ({self.tp_size})"
+            if config.intermediate_size % self.tp_size != 0:
+                raise ValueError(
+                    f"intermediate_size ({config.intermediate_size}) must be divisible by "
+                    f"tp_size ({self.tp_size})"
+                )
 
             # ColumnParallelLinear expects GLOBAL out_features and returns local shard.
             self.fc1 = ColumnParallelLinear(
@@ -65,7 +75,7 @@ class MLP(nn.Module):
         self.dropout = Dropout(config.dropout)
         self.act = GELU()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (batch_size, seq_len, hidden_size)
@@ -73,6 +83,9 @@ class MLP(nn.Module):
         Returns:
             output: (batch_size, seq_len, hidden_size)
         """
+        if x.dim() != 3:
+            raise ValueError("x must have shape [batch_size, seq_len, hidden_size]")
+
         x = self.fc1(x)
         x = self.act(x)
         x = self.dropout(x)

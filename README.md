@@ -164,6 +164,8 @@ The [sync_and_run.sh](scripts/sync_and_run.sh) script automates:
 
 - [TP + DP Backward Flow](docs/tp_dp_communication.md) - communication domains, collectives,
   and gradient flow in 2D parallel training.
+- [TP + EP + DP Communication](docs/ep_tp_dp_communication.md) - expert dispatch/return
+  all-to-all flow, gradient synchronization domains, and expert TP=1 rationale.
 
 ## 📚 References
 

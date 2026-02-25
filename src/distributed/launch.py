@@ -13,9 +13,9 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from pathlib import Path
+from typing import Optional
 
-import torch
 import torch.multiprocessing as mp
 
 from src.distributed.device import DeviceInfo, get_device_info, print_device_info
@@ -24,17 +24,18 @@ from src.distributed.device import DeviceInfo, get_device_info, print_device_inf
 @dataclass
 class LaunchConfig:
     """Configuration for launching distributed training."""
+
     world_size: int
     backend: str
     script_path: str
-    script_args: List[str]
+    script_args: list[str]
 
 
 def launch_multiprocessing(
     script_path: str,
     world_size: int,
     backend: str = "gloo",
-    script_args: Optional[List[str]] = None,
+    script_args: Optional[list[str]] = None,
 ) -> None:
     """
     Launch training using multiprocessing (for CPU development).
@@ -55,6 +56,11 @@ def launch_multiprocessing(
         ...     backend="gloo"
         ... )
     """
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if not Path(script_path).exists():
+        raise FileNotFoundError(f"script_path does not exist: {script_path}")
+
     if script_args is None:
         script_args = []
 
@@ -80,9 +86,9 @@ def launch_multiprocessing(
 def _train_worker(
     rank: int,
     world_size: int,
-    backend: str,
+    _backend: str,
     script_path: str,
-    script_args: List[str],
+    script_args: list[str],
 ) -> None:
     """
     Worker function that runs in each process.
@@ -109,22 +115,28 @@ def _train_worker(
     # Get the module name from the script path
     script_module = os.path.basename(script_path).replace(".py", "")
 
-    # Import the module and run its main function
+    # Import the module and run its main function.
+    # We inject script_args into sys.argv so scripts that parse CLI args via
+    # argparse behave the same way they do under torchrun/python invocations.
     import importlib
+
     module = importlib.import_module(script_module)
 
-    # Check if the module has a main function
-    if hasattr(module, "main"):
-        # Call main() with the provided args
-        module.main()
-    else:
+    if not hasattr(module, "main"):
         raise AttributeError(f"Script {script_path} must have a main() function")
+
+    original_argv = sys.argv
+    try:
+        sys.argv = [script_path, *script_args]
+        module.main()
+    finally:
+        sys.argv = original_argv
 
 
 def get_launch_command(
     world_size: int,
     script_path: str,
-    script_args: Optional[List[str]] = None,
+    script_args: Optional[list[str]] = None,
     use_torchrun: bool = True,
 ) -> str:
     """

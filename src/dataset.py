@@ -2,8 +2,16 @@
 Simple dataset and data loader for MVP.
 """
 
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+from typing import TypedDict
+
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torch.utils.data import Sampler
 from tqdm import tqdm
 
 from src.logging import get_logger
@@ -13,20 +21,32 @@ from src.logging import get_logger
 logger = get_logger(__name__)
 
 
+class Batch(TypedDict):
+    input_ids: torch.Tensor
+    labels: torch.Tensor
+
+
 class TextDataset(Dataset):
     """Simple text dataset for language modeling."""
 
-    def __init__(self, text_path, max_seq_length=256):
+    def __init__(self, text_path: str, max_seq_length: int = 256) -> None:
         """
         Args:
             text_path: Path to text file
             max_seq_length: Maximum sequence length (reduced from 1024 to 256 for MVP)
         """
+        if max_seq_length < 2:
+            raise ValueError("max_seq_length must be at least 2")
+
+        path = Path(text_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Dataset file not found: {text_path}")
+
         self.max_seq_length = max_seq_length
 
         # Load text
-        logger.info(f"Loading data from {text_path}...")
-        with open(text_path, 'r', encoding='utf-8') as f:
+        logger.info("Loading data from %s...", text_path)
+        with path.open("r", encoding="utf-8") as f:
             text = f.read()
 
         # Create character-level vocab for MVP (simple but works)
@@ -39,15 +59,15 @@ class TextDataset(Dataset):
         self.char_to_idx = {ch: i for i, ch in enumerate(self.chars)}
         self.idx_to_char = {i: ch for i, ch in enumerate(self.chars)}
 
-        logger.info(f"Vocab size: {self.vocab_size}")
-        logger.info(f"Text length: {len(text)} characters")
+        logger.info("Vocab size: %d", self.vocab_size)
+        logger.info("Text length: %d characters", len(text))
 
         # Encode text into integer ids. Length equals number of characters.
         encoded = [self.char_to_idx[ch] for ch in tqdm(text, desc="Encoding text")]
 
         # Create overlapping sequences to improve data utilization on tiny text.
         self.sequences = []
-        stride = max_seq_length // 2  # Use stride to create more sequences
+        stride = max(1, max_seq_length // 2)  # Use stride to create more sequences
 
         for i in range(0, len(encoded) - max_seq_length + 1, stride):
             self.sequences.append(encoded[i:i + max_seq_length])
@@ -58,12 +78,12 @@ class TextDataset(Dataset):
             seq_len = min(max_seq_length, len(encoded))
             self.sequences.append(encoded[:seq_len] + [self.pad_id] * (max_seq_length - seq_len))
 
-        logger.info(f"Total sequences: {len(self.sequences)}")
+        logger.info("Total sequences: %d", len(self.sequences))
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.sequences)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Batch:
         """
         Return a sequence with input_ids and labels.
 
@@ -87,13 +107,21 @@ class TextDataset(Dataset):
         labels[labels == self.pad_id] = -100
 
         return {
-            'input_ids': input_ids,
-            'labels': labels
+            "input_ids": input_ids,
+            "labels": labels,
         }
 
 
-def create_dataloader(dataset, batch_size, shuffle=True, sampler=None):
+def create_dataloader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool = True,
+    sampler: Optional[Sampler] = None,
+) -> DataLoader:
     """Create simple dataloader with optional sampler override."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
     use_shuffle = bool(shuffle) and sampler is None
     return DataLoader(
         dataset,

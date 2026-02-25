@@ -9,6 +9,8 @@ This document defines the coding standards for the nano-train project. All code 
 3. **Explicit Over Implicit** - Make logic clear and visible
 4. **Test-Driven** - Use tests to validate implementations
 5. **Documentation** - Document non-obvious code with clear comments
+6. **Upgrade Existing Modules First** - Prefer improving reusable core modules
+   over example-only retrofits so the main codebase evolves incrementally.
 
 ## Python Code Style
 
@@ -105,23 +107,121 @@ nano_train/
 - **Clear commit messages** - describe what and why
 - **Don't commit cache/files** - use .gitignore
 
+## AI Infra Python Coding Standards
+
+This section applies to AI infrastructure code paths (distributed training,
+training loops, orchestration, and model-parallel integrations). It uses a
+balanced profile: strong defaults with documented exceptions when needed.
+
+### 1. Design and Readability (Balanced)
+- Prefer incremental upgrades to existing modules over example-only forks.
+- Keep functions focused; extract helper units for validation, topology,
+  logging, and synchronization.
+- For distributed setup/results, prefer named structures (for example,
+  dataclass/context objects) over long positional tuples.
+- Public classes/functions must include concise docstrings, including
+  shape/parallel-domain notes for distributed code paths.
+
+### 2. Typing Policy
+- Public functions/classes must include type hints.
+- New or modified infra code should avoid `Any` unless justified in a short
+  code comment.
+- `mypy` runs in CI with progressive strictness; avoid blanket strict mandates
+  across the entire repo unless explicitly adopted.
+
+### 3. Distributed Training Safety Rules (PyTorch)
+- Use `torchrun` and explicit launcher patterns; avoid ad-hoc rank/env
+  assumptions.
+- Ensure process-group lifecycle correctness (init once, destroy once,
+  rank-safe behavior).
+- Keep collective ordering identical across ranks in gradient synchronization.
+- Log TP/EP/DP rank topology once from rank 0 for traceability.
+- Seed strategy must be explicit and documented for parallel contexts.
+
+### 4. Reproducibility and Checkpointing
+- Record run config and seed in logs for every training entrypoint.
+- Training scripts that touch infra loops must include resumable checkpoint
+  design.
+- State determinism limits explicitly when full determinism is not guaranteed.
+
+### 5. Observability and Failures
+- Use structured, rank-aware logging in training loops.
+- Raise explicit `ValueError`/`RuntimeError` with actionable context for
+  invalid parallel configs.
+- Do not swallow distributed exceptions; fail fast with clear diagnostics.
+
+### 6. Testing Expectations
+- Every new or changed distributed tutorial path must include:
+  - single-rank smoke coverage
+  - the smallest relevant multi-rank smoke coverage
+- Model refactors in `src/models` must add at least one focused unit test to
+  lock wiring/behavior.
+- Keep tests minimal and targeted; avoid over-broad suites for small edits.
+
+### Enforcement (CI + pre-commit)
+- For changed AI infra code, required gates are:
+  - `ruff check`
+  - `ruff format --check`
+  - `mypy` on affected modules (or configured target)
+  - `pytest` for impacted tests/smokes
+- Local pre-commit hooks are required for the same checks where applicable.
+- If formatter tooling is migrated, use the equivalent configured formatter
+  check command and keep CI/pre-commit parity.
+
+### Source References
+- PEP 8: https://peps.python.org/pep-0008/
+- PEP 257: https://peps.python.org/pep-0257/
+- PEP 484: https://peps.python.org/pep-0484/
+- PyTorch DDP API:
+  https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html
+- PyTorch DDP design note: https://docs.pytorch.org/docs/2.9/notes/ddp.html
+- `torchrun` / Elastic launcher:
+  https://docs.pytorch.org/docs/2.9/elastic/run.html
+- PyTorch multiprocessing best practices:
+  https://docs.pytorch.org/docs/2.8/notes/multiprocessing.html
+- PyTorch reproducibility:
+  https://docs.pytorch.org/docs/stable/notes/randomness.html
+- PyTorch AMP examples:
+  https://docs.pytorch.org/docs/stable/notes/amp_examples.html
+- PyTorch save/load tutorial:
+  https://docs.pytorch.org/tutorials/beginner/basics/saveloadrun_tutorial.html
+- PyTorch activation checkpointing:
+  https://docs.pytorch.org/docs/stable/checkpoint
+- pytest good practices:
+  https://docs.pytest.org/en/stable/explanation/goodpractices.html
+- Ruff docs: https://docs.astral.sh/ruff/
+- Ruff formatter: https://docs.astral.sh/ruff/formatter/
+- mypy gradual typing guidance:
+  https://mypy.readthedocs.io/en/stable/existing_code.html
+- pre-commit: https://pre-commit.com/
+- Hydra structured config intro:
+  https://hydra.cc/docs/1.1/tutorials/structured_config/intro/
+- Hydra ConfigStore API:
+  https://hydra.cc/docs/1.2/tutorials/structured_config/config_store/
+- Pydantic settings:
+  https://docs.pydantic.dev/usage/settings/
+- OpenTelemetry Python instrumentation:
+  https://opentelemetry.io/docs/languages/python/instrumentation/
+
 ## Linting
 
-This project uses standard Python linting tools. Run before committing:
+This project uses CI-aligned linting and validation gates. Run before
+committing:
 
 ```bash
-# Check code style
-black --check .
-
-# Check imports
-isort --check-only .
+# AI infra gate checks (required for infra-related changes)
+ruff check .
+ruff format --check .
 
 # Type checking
-mypy nano_train/
+mypy src/  # or affected modules
 
-# Run all checks
-pytest tests/
+# Run impacted tests/smokes
+pytest tests/  # scope to impacted tests when appropriate
 ```
+
+If formatter/import tooling is migrated, use the equivalent configured check
+command in both CI and pre-commit.
 
 ### Quick Reference
 

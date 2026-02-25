@@ -732,7 +732,10 @@ class ColumnParallelLinear(nn.Module):
         self.tp_group = tp_group if tp_group is not None else dist.group.WORLD
 
         # Each GPU stores out_features // tp_size outputs
-        assert out_features % tp_size == 0, f"out_features {out_features} must be divisible by tp_size {tp_size}"
+        if out_features % tp_size != 0:
+            raise ValueError(
+                f"out_features {out_features} must be divisible by tp_size {tp_size}"
+            )
         self.shard_size = out_features // tp_size
 
         # Weight shard: (shard_size, in_features)
@@ -810,7 +813,10 @@ class RowParallelLinear(nn.Module):
         self.tp_group = tp_group if tp_group is not None else dist.group.WORLD
 
         # Each GPU processes in_features // tp_size inputs
-        assert in_features % tp_size == 0, f"in_features {in_features} must be divisible by tp_size {tp_size}"
+        if in_features % tp_size != 0:
+            raise ValueError(
+                f"in_features {in_features} must be divisible by tp_size {tp_size}"
+            )
         self.shard_size = in_features // tp_size
 
         # Weight shard: (out_features, shard_size)

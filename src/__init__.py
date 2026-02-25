@@ -38,6 +38,9 @@ def _configure_pycache_prefix() -> None:
 _configure_pycache_prefix()
 del _configure_pycache_prefix
 
-from src.config import Config, DataConfig, ModelConfig, TrainingConfig
+from src.config import Config
+from src.config import DataConfig
+from src.config import ModelConfig
+from src.config import TrainingConfig
 
 __all__ = ["Config", "ModelConfig", "TrainingConfig", "DataConfig"]

@@ -11,6 +11,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models.deepseek import DeepSeekModel, DeepSeekModelConfig
+from src.models.deepseek import DeepSeekParallelContext
+from src.models.moe import ExpertParallelMoE
 
 
 def test_forward_shape():
@@ -107,6 +109,47 @@ def test_meta_init_avoids_storage():
         model = DeepSeekModel(cfg)
 
     assert all(param.device.type == "meta" for param in model.parameters())
+
+
+def test_parallel_context_wires_tp_dense_and_ep_moe() -> None:
+    """Parallel context should build TP dense FFNs and EP MoE blocks in DeepSeekModel."""
+    cfg = DeepSeekModelConfig(
+        vocab_size=64,
+        hidden_size=96,
+        num_hidden_layers=3,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        q_lora_rank=48,
+        kv_lora_rank=32,
+        qk_nope_head_dim=12,
+        qk_rope_head_dim=8,
+        v_head_dim=12,
+        intermediate_size=192,
+        moe_intermediate_size=160,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        first_k_dense_replace=1,
+        n_group=2,
+        topk_group=1,
+        max_position_embeddings=64,
+    )
+    parallel_context = DeepSeekParallelContext(
+        tp_rank=0,
+        tp_size=2,
+        ep_rank=0,
+        ep_size=2,
+        capacity_factor=1.0,
+    )
+    model = DeepSeekModel(cfg, parallel_context=parallel_context)
+
+    dense_blocks = [block for block in model.blocks if block.ffn_type == "dense"]
+    moe_blocks = [block for block in model.blocks if block.ffn_type == "moe"]
+
+    assert dense_blocks
+    assert moe_blocks
+    assert all(getattr(block.ffn, "use_tp", False) for block in dense_blocks)
+    assert all(isinstance(block.ffn.moe, ExpertParallelMoE) for block in moe_blocks)
 
 
 def run_all_tests():

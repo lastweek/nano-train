@@ -5,8 +5,10 @@ For MVP: Simple dataclass-based configuration.
 For Phase 1+: Will upgrade to OmegaConf + Hydra.
 """
 
-from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Literal
+from typing import Optional
 import torch.distributed as dist
 
 
@@ -42,13 +44,15 @@ class TPConfig:
 
     # Process group for all-reduce operations
     # If None, uses dist.group.WORLD
-    group: Optional[Any] = None
+    group: Optional[object] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate configuration."""
         if self.enabled:
-            assert self.size > 1, "tp_size must be > 1 when TP is enabled"
-            assert 0 <= self.rank < self.size, f"tp_rank must be in [0, {self.size-1}]"
+            if self.size <= 1:
+                raise ValueError("tp_size must be > 1 when TP is enabled")
+            if self.rank < 0 or self.rank >= self.size:
+                raise ValueError(f"tp_rank must be in [0, {self.size - 1}]")
 
             if self.group is None:
                 self.group = dist.group.WORLD

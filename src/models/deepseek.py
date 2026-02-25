@@ -6,15 +6,25 @@ configuration fields, but remains a compact approximation for local training:
 - MLA-style low-rank query/KV projections with split NoPE/RoPE QK dimensions
 - Dense-first then MoE decoder blocks
 - Routed experts with configurable top-k behavior and optional group routing
+- Optional parallel context for TP dense FFN and EP routed MoE
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from dataclasses import field
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from src.layers import Dropout, Embedding, Linear
+from src.layers import ColumnParallelLinear
+from src.layers import Dropout
+from src.layers import Embedding
+from src.layers import Linear
+from src.layers import RowParallelLinear
+from src.models.moe import ExpertMLP
+from src.models.moe import ExpertParallelMoE
+from src.models.moe import LocalRoutedMoE
 
 
 @dataclass
@@ -115,6 +125,38 @@ class DeepSeekModelConfig:
             raise ValueError("scoring_func must be 'sigmoid' or 'softmax'")
 
 
+@dataclass
+class DeepSeekParallelContext:
+    """
+    Optional model parallel context for TP and EP integration.
+
+    Defaults keep behavior identical to the single-process baseline.
+    """
+
+    tp_rank: int = 0
+    tp_size: int = 1
+    tp_group: Optional[object] = None
+    ep_rank: int = 0
+    ep_size: int = 1
+    ep_group: Optional[object] = None
+    capacity_factor: float = 1.0
+    expert_tp_size: int = 1
+
+    def __post_init__(self) -> None:
+        if self.tp_size <= 0:
+            raise ValueError("tp_size must be positive")
+        if self.ep_size <= 0:
+            raise ValueError("ep_size must be positive")
+        if self.tp_rank < 0 or self.tp_rank >= self.tp_size:
+            raise ValueError("tp_rank must be in [0, tp_size)")
+        if self.ep_rank < 0 or self.ep_rank >= self.ep_size:
+            raise ValueError("ep_rank must be in [0, ep_size)")
+        if self.capacity_factor <= 0:
+            raise ValueError("capacity_factor must be positive")
+        if self.expert_tp_size != 1:
+            raise ValueError("DeepSeek routed experts currently require expert_tp_size=1")
+
+
 class RMSNorm(nn.Module):
     """RMSNorm used by DeepSeek-style decoder blocks."""
 
@@ -132,17 +174,57 @@ class RMSNorm(nn.Module):
 class GatedMLP(nn.Module):
     """SwiGLU-style feed-forward block."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int, dropout: float):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        dropout: float,
+        parallel_context: Optional[DeepSeekParallelContext] = None,
+    ):
         super().__init__()
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
-        self.dropout = Dropout(dropout)
+        self.parallel_context = parallel_context or DeepSeekParallelContext()
+        self.use_tp = self.parallel_context.tp_size > 1
+
+        if self.use_tp:
+            self.gate_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                tp_rank=self.parallel_context.tp_rank,
+                tp_size=self.parallel_context.tp_size,
+                tp_group=self.parallel_context.tp_group,
+                bias=True,
+            )
+            self.up_proj = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                tp_rank=self.parallel_context.tp_rank,
+                tp_size=self.parallel_context.tp_size,
+                tp_group=self.parallel_context.tp_group,
+                bias=True,
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                tp_rank=self.parallel_context.tp_rank,
+                tp_size=self.parallel_context.tp_size,
+                tp_group=self.parallel_context.tp_group,
+                bias=True,
+            )
+            self.dropout = Dropout(dropout)
+        else:
+            self.mlp = ExpertMLP(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dropout=dropout,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gated = torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x)
-        out = self.down_proj(gated)
-        return self.dropout(out)
+        if self.use_tp:
+            gated = F.silu(self.gate_proj(x)) * self.up_proj(x)
+            out = self.down_proj(gated)
+            return self.dropout(out)
+
+        return self.mlp(x)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -262,130 +344,77 @@ class MultiHeadLatentAttention(nn.Module):
 
 
 class RoutedMoE(nn.Module):
-    """Token-level routed MoE with optional shared experts."""
+    """Token-level routed MoE wrapper backed by reusable LocalRoutedMoE infra."""
 
-    def __init__(self, config: DeepSeekModelConfig):
+    def __init__(
+        self,
+        config: DeepSeekModelConfig,
+        parallel_context: Optional[DeepSeekParallelContext] = None,
+    ):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_experts = config.n_routed_experts
-        self.top_k = config.num_experts_per_tok
-        self.scoring_func = config.scoring_func
-        self.norm_topk_prob = config.norm_topk_prob
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
+        self.parallel_context = parallel_context or DeepSeekParallelContext()
+        shared_kwargs = {
+            "hidden_size": config.hidden_size,
+            "expert_intermediate_size": config.moe_intermediate_size,
+            "num_experts": config.n_routed_experts,
+            "top_k": config.num_experts_per_tok,
+            "dropout": config.dropout,
+            "n_shared_experts": config.n_shared_experts,
+            "scoring_func": config.scoring_func,
+            "n_group": config.n_group,
+            "topk_group": config.topk_group,
+            "norm_topk_prob": config.norm_topk_prob,
+            "routed_scaling_factor": config.routed_scaling_factor,
+            "capacity_factor": self.parallel_context.capacity_factor,
+        }
 
-        self.router = Linear(self.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                GatedMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    dropout=config.dropout,
-                )
-                for _ in range(self.num_experts)
-            ]
-        )
-        self.shared_experts = nn.ModuleList(
-            [
-                GatedMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    dropout=config.dropout,
-                )
-                for _ in range(config.n_shared_experts)
-            ]
-        )
-
-    def _score_experts(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.scoring_func == "sigmoid":
-            return torch.sigmoid(logits)
-        return torch.softmax(logits, dim=-1)
-
-    def _apply_group_routing(self, scores: torch.Tensor) -> torch.Tensor:
-        if self.n_group <= 1 or self.topk_group >= self.n_group:
-            return scores
-
-        tokens = scores.size(0)
-        experts_per_group = self.num_experts // self.n_group
-        grouped = scores.view(tokens, self.n_group, experts_per_group)
-        group_scores = grouped.max(dim=-1).values
-        selected_groups = torch.topk(group_scores, k=self.topk_group, dim=-1).indices
-
-        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
-        group_mask.scatter_(1, selected_groups, True)
-        expert_mask = group_mask.unsqueeze(-1).expand(-1, -1, experts_per_group).reshape(tokens, -1)
-
-        if self.scoring_func == "sigmoid":
-            return torch.where(expert_mask, scores, torch.zeros_like(scores))
-        neg_inf = torch.full_like(scores, float("-inf"))
-        return torch.where(expert_mask, scores, neg_inf)
+        if self.parallel_context.ep_size > 1:
+            self.moe = ExpertParallelMoE(
+                **shared_kwargs,
+                ep_rank=self.parallel_context.ep_rank,
+                ep_size=self.parallel_context.ep_size,
+                ep_group=self.parallel_context.ep_group,
+                expert_tp_size=self.parallel_context.expert_tp_size,
+            )
+        else:
+            self.moe = LocalRoutedMoE(**shared_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, S, H)
-        batch_size, seq_len, hidden_size = x.shape
-        tokens = x.view(-1, hidden_size)
-
-        logits = self.router(tokens)
-        scores = self._score_experts(logits)
-        routed_scores = self._apply_group_routing(scores)
-        topk_weights, topk_indices = torch.topk(routed_scores, k=self.top_k, dim=-1)
-
-        if self.scoring_func == "sigmoid" and self.norm_topk_prob:
-            topk_weights = topk_weights / torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-9)
-        elif self.scoring_func == "softmax":
-            topk_weights = torch.softmax(topk_weights, dim=-1)
-        topk_weights = topk_weights * self.routed_scaling_factor
-
-        output = torch.zeros_like(tokens)
-        for expert_idx, expert in enumerate(self.experts):
-            selected = (topk_indices == expert_idx).nonzero(as_tuple=False)
-            if selected.numel() == 0:
-                continue
-            token_indices = selected[:, 0]
-            slot_indices = selected[:, 1]
-            expert_input = tokens[token_indices]
-            expert_out = expert(expert_input)
-            weights = topk_weights[token_indices, slot_indices].unsqueeze(-1)
-            output[token_indices] += expert_out * weights
-
-        if self.shared_experts:
-            shared = torch.zeros_like(tokens)
-            for expert in self.shared_experts:
-                shared += expert(tokens)
-            output += shared / len(self.shared_experts)
-
-        return output.view(batch_size, seq_len, hidden_size)
+        return self.moe(x)
 
 
 class DeepSeekDecoderBlock(nn.Module):
     """DeepSeek-like decoder block with MLA and dense/MoE FFN."""
 
-    def __init__(self, config: DeepSeekModelConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: DeepSeekModelConfig,
+        layer_idx: int,
+        parallel_context: Optional[DeepSeekParallelContext] = None,
+    ):
         super().__init__()
+        self.parallel_context = parallel_context or DeepSeekParallelContext()
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn = MultiHeadLatentAttention(config)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         use_dense = layer_idx < config.first_k_dense_replace
-        if use_dense:
+        use_moe = (
+            not use_dense
+            and (layer_idx - config.first_k_dense_replace) % max(1, config.moe_layer_freq) == 0
+        )
+
+        if use_moe:
+            self.ffn = RoutedMoE(config, parallel_context=self.parallel_context)
+            self.ffn_type = "moe"
+        else:
             self.ffn = GatedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 dropout=config.dropout,
+                parallel_context=self.parallel_context,
             )
             self.ffn_type = "dense"
-        else:
-            if (layer_idx - config.first_k_dense_replace) % max(1, config.moe_layer_freq) == 0:
-                self.ffn = RoutedMoE(config)
-                self.ffn_type = "moe"
-            else:
-                self.ffn = GatedMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.intermediate_size,
-                    dropout=config.dropout,
-                )
-                self.ffn_type = "dense"
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
         residual = x
@@ -403,14 +432,38 @@ class DeepSeekDecoderBlock(nn.Module):
 class DeepSeekModel(nn.Module):
     """DeepSeek-V3-like causal decoder language model."""
 
-    def __init__(self, config: DeepSeekModelConfig):
+    def __init__(
+        self,
+        config: DeepSeekModelConfig,
+        parallel_context: Optional[DeepSeekParallelContext] = None,
+    ):
         super().__init__()
         self.config = config
+        self.parallel_context = parallel_context or DeepSeekParallelContext()
+
+        if (
+            self.parallel_context.tp_size > 1
+            and config.intermediate_size % self.parallel_context.tp_size != 0
+        ):
+            raise ValueError("intermediate_size must be divisible by tp_size for TP dense FFN")
+        if (
+            self.parallel_context.ep_size > 1
+            and config.n_routed_experts % self.parallel_context.ep_size != 0
+        ):
+            raise ValueError("n_routed_experts must be divisible by ep_size for EP MoE")
+
         self.token_embeddings = Embedding(config.vocab_size, config.hidden_size)
         self.dropout = Dropout(config.dropout)
 
         self.blocks = nn.ModuleList(
-            [DeepSeekDecoderBlock(config, i) for i in range(config.num_hidden_layers)]
+            [
+                DeepSeekDecoderBlock(
+                    config,
+                    i,
+                    parallel_context=self.parallel_context,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
         )
         self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -430,7 +483,12 @@ class DeepSeekModel(nn.Module):
         elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
 
-    def _create_causal_mask(self, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
+    def _create_causal_mask(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
         mask = torch.triu(mask, diagonal=1)
         return mask.view(1, 1, seq_len, seq_len).expand(batch_size, -1, -1, -1)

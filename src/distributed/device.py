@@ -11,6 +11,7 @@ The key insight: same code, different backend.
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -82,11 +83,10 @@ def get_device_info(
         )
     elif backend == "gloo" and cuda_available:
         # Allow gloo on GPU (for testing), but warn
-        import warnings
         warnings.warn(
             "Using 'gloo' backend with CUDA available. "
             "Consider using 'nccl' for better performance on GPUs.",
-            UserWarning
+            UserWarning,
         )
 
     # Determine world size
@@ -125,13 +125,14 @@ def get_device(device_type: Literal["cpu", "cuda"], rank: int = 0) -> torch.devi
     """
     if device_type == "cpu":
         return torch.device("cpu")
-    elif device_type == "cuda":
+    if device_type == "cuda":
         return torch.device(f"cuda:{rank}")
-    else:
-        raise ValueError(f"Unknown device type: {device_type}")
+    raise ValueError(f"Unknown device type: {device_type}")
 
 
-def get_backend(backend: Optional[Literal["gloo", "nccl", "auto"]] = None) -> str:
+def get_backend(
+    backend: Optional[Literal["gloo", "nccl", "auto"]] = None,
+) -> Literal["gloo", "nccl"]:
     """
     Get the appropriate distributed backend.
 

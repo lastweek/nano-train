@@ -2,10 +2,25 @@
 """
 TP/DP tutorial script that reuses nano-train building blocks.
 
-This script demonstrates one canonical training pipeline with three modes:
+This script demonstrates one canonical training pipeline with three primary modes:
 1) single rank: world_size=1
-2) TP-only: world_size>1 and tp_size=world_size
-3) TP+DP: world_size>1 and 1<tp_size<world_size
+2) TP-only: dp_size=1 and tp_size>1
+3) TP+DP: dp_size>1 and tp_size>1
+
+Note:
+    The same code path also runs when tp_size=1 and dp_size>1 (DP-only edge case).
+
+Run examples:
+    # single rank
+    python3 examples/tp.py --tp_size 1 --max_steps 2 --epochs 1
+
+    # TP-only (world=4, tp=4, dp=1)
+    python3 examples/launch.py --world-size 4 --backend gloo \
+        --script examples/tp.py --script-args --tp_size 4 --max_steps 2 --epochs 1
+
+    # TP+DP (world=4, tp=2, dp=2)
+    python3 examples/launch.py --world-size 4 --backend gloo \
+        --script examples/tp.py --script-args --tp_size 2 --max_steps 2 --epochs 1
 
 Core learning reference:
     docs/tp_dp_communication.md

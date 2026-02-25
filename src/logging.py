@@ -18,14 +18,15 @@ from typing import Optional
 # ANSI color codes for terminal output
 class Colors:
     """ANSI color codes for different log levels."""
-    GREY = '\033[90m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BOLD_RED = '\033[91m\033[1m'
-    RESET = '\033[0m'
+
+    GREY = "\033[90m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    BOLD_RED = "\033[91m\033[1m"
+    RESET = "\033[0m"
 
 
 class ColorFormatter(logging.Formatter):
@@ -39,24 +40,38 @@ class ColorFormatter(logging.Formatter):
         logging.CRITICAL: Colors.BOLD_RED,
     }
 
-    def __init__(self, fmt: Optional[str] = None, datefmt: Optional[str] = None, use_colors: bool = True):
+    def __init__(
+        self,
+        fmt: Optional[str] = None,
+        datefmt: Optional[str] = None,
+        use_colors: bool = True,
+    ) -> None:
         """Initialize formatter with optional color support."""
         super().__init__(fmt, datefmt)
         self.use_colors = use_colors
 
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         """Format log record with colors if enabled."""
-        if self.use_colors and record.levelno in self.COLORS:
-            levelname = record.levelname
-            record.levelname = f"{self.COLORS[record.levelno]}{levelname}{Colors.RESET}"
-        return super().format(record)
+        if not (self.use_colors and record.levelno in self.COLORS):
+            return super().format(record)
+
+        # Restore the original levelname to avoid leaking ANSI codes to
+        # other handlers that may format the same record instance.
+        original_levelname = record.levelname
+        try:
+            record.levelname = (
+                f"{self.COLORS[record.levelno]}{original_levelname}{Colors.RESET}"
+            )
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
 
 
 def setup_logging(
     log_level: str = "INFO",
     log_file: Optional[str] = None,
     use_colors: bool = True,
-    log_format: Optional[str] = None
+    log_format: Optional[str] = None,
 ) -> None:
     """
     Configure root logger for nano-train.
@@ -68,12 +83,18 @@ def setup_logging(
         log_format: Custom format string (default: timestamp + level + module + message)
     """
     # Convert string level to logging constant
-    level = getattr(logging, log_level.upper(), logging.INFO)
+    normalized_level = log_level.upper()
+    if not hasattr(logging, normalized_level):
+        raise ValueError(
+            f"Unsupported log level: {log_level}. "
+            "Expected one of DEBUG, INFO, WARNING, ERROR, CRITICAL."
+        )
+    level = int(getattr(logging, normalized_level))
 
     # Default format: timestamp | level | module: message
     if log_format is None:
-        log_format = '%(asctime)s | %(levelname)-8s | %(name)s: %(message)s'
-        date_format = '%Y-%m-%d %H:%M:%S'
+        log_format = "%(asctime)s | %(levelname)-8s | %(name)s: %(message)s"
+        date_format = "%Y-%m-%d %H:%M:%S"
     else:
         date_format = None
 
@@ -98,7 +119,7 @@ def setup_logging(
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler = logging.FileHandler(log_file, mode="a")
         file_handler.setLevel(level)
         # File output doesn't use colors
         file_formatter = logging.Formatter(log_format, datefmt=date_format)

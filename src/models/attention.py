@@ -7,11 +7,17 @@ Phase 2 will integrate Flash Attention.
 """
 
 import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
-from src.config import ModelConfig, TPConfig
-from src.layers import Linear, Dropout, ColumnParallelLinear, RowParallelLinear
+from src.config import ModelConfig
+from src.config import TPConfig
+from src.layers import ColumnParallelLinear
+from src.layers import Dropout
+from src.layers import Linear
+from src.layers import RowParallelLinear
 
 
 class MultiHeadAttention(nn.Module):
@@ -28,7 +34,7 @@ class MultiHeadAttention(nn.Module):
         - No communication
     """
 
-    def __init__(self, config: ModelConfig, tp_config: TPConfig = None):
+    def __init__(self, config: ModelConfig, tp_config: Optional[TPConfig] = None) -> None:
         super().__init__()
         tp_config = tp_config or TPConfig()
 
@@ -42,13 +48,16 @@ class MultiHeadAttention(nn.Module):
         self.tp_size = tp_config.size
         self.tp_group = tp_config.group
 
-        assert self.head_dim * self.num_heads == self.hidden_size, \
-            "hidden_size must be divisible by num_attention_heads"
+        if self.head_dim * self.num_heads != self.hidden_size:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
 
         if self.tp_enabled:
             # For TP: each GPU gets num_heads // tp_size heads
-            assert self.num_heads % self.tp_size == 0, \
-                f"num_heads ({self.num_heads}) must be divisible by tp_size ({self.tp_size})"
+            if self.num_heads % self.tp_size != 0:
+                raise ValueError(
+                    f"num_heads ({self.num_heads}) must be divisible by tp_size "
+                    f"({self.tp_size})"
+                )
 
             self.tp_num_heads = self.num_heads // self.tp_size
 
@@ -91,7 +100,11 @@ class MultiHeadAttention(nn.Module):
         if not self._monitor_enabled:
             self._monitor_stats = None
 
-    def forward(self, x, attention_mask=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (batch_size, seq_len, hidden_size)
@@ -100,6 +113,9 @@ class MultiHeadAttention(nn.Module):
         Returns:
             output: (batch_size, seq_len, hidden_size)
         """
+        if x.dim() != 3:
+            raise ValueError("x must have shape [batch_size, seq_len, hidden_size]")
+
         batch_size, seq_len, _ = x.shape
 
         # QKV projection
@@ -155,7 +171,11 @@ class MultiHeadAttention(nn.Module):
         attn_output = attn_output.permute(0, 2, 1, 3)
 
         if self.tp_enabled:
-            attn_output = attn_output.reshape(batch_size, seq_len, self.tp_num_heads * self.head_dim)
+            attn_output = attn_output.reshape(
+                batch_size,
+                seq_len,
+                self.tp_num_heads * self.head_dim,
+            )
         else:
             attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
 

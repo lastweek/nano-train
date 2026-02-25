@@ -27,8 +27,8 @@ Usage:
 
 from src.distributed.device import (
     DeviceInfo,
-    get_backend,
     get_device,
+    get_backend,
     get_device_info,
     print_device_info,
     validate_world_size,

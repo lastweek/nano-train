@@ -5,13 +5,21 @@ Supports tensor parallelism via TPConfig parameter.
 Phase 2 will add gradient checkpointing.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
-from src.config import ModelConfig, TPConfig
+from src.config import ModelConfig
+from src.config import TPConfig
+from src.layers import ColumnParallelLinear
+from src.layers import Dropout
+from src.layers import Embedding
+from src.layers import LayerNorm
+from src.layers import RowParallelLinear
 from src.models.attention import MultiHeadAttention
 from src.models.mlp import MLP
-from src.layers import Linear, LayerNorm, Embedding, Dropout, ColumnParallelLinear
+from src.layers import Linear
 
 
 class TransformerBlock(nn.Module):
@@ -21,7 +29,12 @@ class TransformerBlock(nn.Module):
     Passes tp_config to attention and MLP sub-layers.
     """
 
-    def __init__(self, config: ModelConfig, layer_idx: int, tp_config: TPConfig = None):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_idx: int,
+        tp_config: Optional[TPConfig] = None,
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
 
@@ -31,7 +44,11 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(config, tp_config)
         self.mlp_norm = LayerNorm(config.hidden_size)
 
-    def forward(self, x, attention_mask=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (batch_size, seq_len, hidden_size)
@@ -40,6 +57,9 @@ class TransformerBlock(nn.Module):
         Returns:
             output: (batch_size, seq_len, hidden_size)
         """
+        if x.dim() != 3:
+            raise ValueError("x must have shape [batch_size, seq_len, hidden_size]")
+
         # Pre-norm attention block
         residual = x
         x = self.attn_norm(x)
@@ -69,7 +89,7 @@ class TransformerModel(nn.Module):
         - No communication
     """
 
-    def __init__(self, config: ModelConfig, tp_config: TPConfig = None):
+    def __init__(self, config: ModelConfig, tp_config: Optional[TPConfig] = None) -> None:
         super().__init__()
         tp_config = tp_config or TPConfig()
 
@@ -98,8 +118,11 @@ class TransformerModel(nn.Module):
         # LM head
         if self.tp_enabled:
             # Column Parallel: split vocab dimension
-            assert config.vocab_size % self.tp_size == 0, \
-                f"vocab_size ({config.vocab_size}) must be divisible by tp_size ({self.tp_size})"
+            if config.vocab_size % self.tp_size != 0:
+                raise ValueError(
+                    f"vocab_size ({config.vocab_size}) must be divisible by "
+                    f"tp_size ({self.tp_size})"
+                )
 
             # ColumnParallelLinear expects GLOBAL vocab size and returns local shard.
             self.lm_head = ColumnParallelLinear(
@@ -120,12 +143,11 @@ class TransformerModel(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
 
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights following GPT-2 style."""
-        if isinstance(module, (Linear, type(self.lm_head))):
-            if hasattr(module, 'weight'):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if hasattr(module, 'bias') and module.bias is not None:
+        if isinstance(module, (Linear, ColumnParallelLinear, RowParallelLinear)):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -133,7 +155,11 @@ class TransformerModel(nn.Module):
             torch.nn.init.ones_(module.weight)
             torch.nn.init.zeros_(module.bias)
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             input_ids: (batch_size, seq_len)
@@ -144,6 +170,9 @@ class TransformerModel(nn.Module):
                     If TP enabled: sharded on vocab dim (vocab_size/tp_size)
                     If TP disabled: full vocab_size
         """
+        if input_ids.dim() != 2:
+            raise ValueError("input_ids must have shape [batch_size, seq_len]")
+
         batch_size, seq_len = input_ids.shape
 
         # Position ids for absolute position embeddings
@@ -172,21 +201,26 @@ class TransformerModel(nn.Module):
 
         return logits
 
-    def _create_causal_mask(self, batch_size, seq_len, device):
+    def _create_causal_mask(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
         """Create causal attention mask for autoregressive generation."""
         mask = torch.tril(torch.ones(seq_len, seq_len, device=device))
         mask = mask.view(1, 1, seq_len, seq_len)
         mask = mask.expand(batch_size, -1, -1, -1)
-        attention_mask = mask.masked_fill(mask == 0, float('-inf'))
+        attention_mask = mask.masked_fill(mask == 0, float("-inf"))
         return attention_mask
 
     @property
-    def num_parameters(self):
+    def num_parameters(self) -> int:
         """Return total number of parameters on this GPU."""
         return sum(p.numel() for p in self.parameters())
 
     @property
-    def num_parameters_global(self):
+    def num_parameters_global(self) -> int:
         """
         Return total number of parameters across all TP GPUs.
 

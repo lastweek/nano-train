@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-Launch script for distributed training on CPU or GPU.
+Launch helper for distributed training scripts on CPU or GPU.
 
-This script handles:
-- CPU development: Spawns multiple processes using multiprocessing
-- GPU production: Can be used with torchrun for better performance
+Execution patterns:
+- Local development: spawn multiple ranks with torch.multiprocessing.
+- torchrun jobs: load the target script in the current rank process.
 
 Usage:
-    # CPU development (4 processes, DDP)
-    python examples/launch.py --world_size 4 --script examples/ddp.py
+    # TP tutorial on 4 ranks (TP-only)
+    python3 examples/launch.py --world-size 4 --backend gloo \
+        --script examples/tp.py --script-args --tp_size 4
 
-    # CPU development (4 processes, TP-only)
-    python examples/launch.py --world_size 4 --script examples/tp.py -- --tp_size 4
+    # TP tutorial on 4 ranks (TP=2, DP=2)
+    python3 examples/launch.py --world-size 4 --backend gloo \
+        --script examples/tp.py --script-args --tp_size 2
 
-    # CPU development (4 processes, TP=2 + DP=2)
-    python examples/launch.py --world_size 4 --script examples/tp.py -- --tp_size 2
+    # EP tutorial on 8 ranks (TP=2, EP=2, DP=2)
+    python3 examples/launch.py --world-size 8 --backend gloo \
+        --script examples/ep.py --script-args --tp_size 2 --ep_size 2
 
-    # GPU production (4 GPUs)
+    # Multi-GPU NCCL (recommended launch path)
     torchrun --nproc_per_node=4 examples/tp.py --tp_size 2
 
-Note: Use '--' to separate launcher args from script args.
+Pass target-script flags after `--script-args`.
 """
 
 import argparse
@@ -72,7 +75,7 @@ def parse_args():
         "--script-args",
         nargs=argparse.REMAINDER,
         default=[],
-        help="Additional arguments to pass to the training script (use '--' before script args).",
+        help="Arguments passed through to the target script after --script-args.",
     )
     return parser.parse_args()
 
@@ -97,7 +100,7 @@ def spawn_worker(rank: int, world_size: int, backend: str, script_path: str, scr
         world_size: Total number of processes
         backend: Distributed backend ('gloo' or 'nccl')
         script_path: Path to training script
-        script_args: Additional arguments to pass to training script (after '--')
+        script_args: Additional arguments to pass to the target script.
     """
     import importlib
 
@@ -181,13 +184,13 @@ def main():
         logger.info("To launch for real, remove --dry-run flag")
         return
 
-    # Launch training
+    # Launch training.
     if info.device_type == "cpu" or args.backend == "gloo":
-        # CPU development: Use multiprocessing
+        # Local launcher path: spawn all ranks from this process.
         logger.info("Using multiprocessing for CPU development")
         launch_multiprocessing(info.world_size, info.backend, args.script, args.script_args)
     else:
-        # GPU production: This script is being run by torchrun
+        # torchrun path: one OS process already exists per rank.
         logger.info("Running as part of torchrun distributed job")
         rank = int(os.environ.get("RANK", "0"))
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
