@@ -1,4 +1,4 @@
-"""Logic tests for examples/ep.py argument handling and gradient sync rules."""
+"""Logic tests for examples/train_4p.py argument handling and gradient sync rules."""
 
 from __future__ import annotations
 
@@ -13,20 +13,20 @@ import torch
 import torch.nn as nn
 
 
-def _load_ep_module() -> ModuleType:
+def _load_train_4p_module() -> ModuleType:
     repo_root = Path(__file__).parent.parent
-    module_path = repo_root / "examples" / "ep.py"
-    module_name = "ep_example_test_module"
+    module_path = repo_root / "examples" / "train_4p.py"
+    module_name = "train_4p_example_test_module"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("Failed to load examples/ep.py for tests")
+        raise RuntimeError("Failed to load examples/train_4p.py for tests")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
-EP_MODULE = _load_ep_module()
+EP_MODULE = _load_train_4p_module()
 
 
 class _TinyModel(nn.Module):
@@ -51,6 +51,9 @@ def _build_args_for_validate(
     seq_len: int = 16,
     num_microbatches: int = 1,
     dropout: float = 0.0,
+    use_distributed_optimizer: bool = False,
+    data_parallel_sharding_strategy: str = "no_shard",
+    num_distributed_optimizer_instances: int = 1,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         tensor_model_parallel_size=tensor_model_parallel_size,
@@ -66,11 +69,14 @@ def _build_args_for_validate(
         seq_len=seq_len,
         num_microbatches=num_microbatches,
         dropout=dropout,
+        use_distributed_optimizer=use_distributed_optimizer,
+        data_parallel_sharding_strategy=data_parallel_sharding_strategy,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
 
 
 def test_parse_args_requires_canonical_parallel_flags(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["ep.py"])
+    monkeypatch.setattr(sys, "argv", ["train_4p.py"])
     with pytest.raises(SystemExit):
         EP_MODULE.parse_args()
 
@@ -80,13 +86,16 @@ def test_parse_args_accepts_canonical_parallel_flags(monkeypatch) -> None:
         sys,
         "argv",
         [
-            "ep.py",
+            "train_4p.py",
             "--tensor-model-parallel-size",
             "1",
             "--pipeline-model-parallel-size",
             "2",
             "--expert-model-parallel-size",
             "4",
+            "--use-distributed-optimizer",
+            "--data-parallel-sharding-strategy",
+            "optim",
         ],
     )
     args = EP_MODULE.parse_args()
@@ -94,6 +103,8 @@ def test_parse_args_accepts_canonical_parallel_flags(monkeypatch) -> None:
     assert args.pipeline_model_parallel_size == 2
     assert args.expert_model_parallel_size == 4
     assert args.expert_tensor_parallel_size == 1
+    assert args.use_distributed_optimizer is True
+    assert args.data_parallel_sharding_strategy == "optim"
 
 
 def test_parse_pp_layer_splits_parses_csv() -> None:
@@ -167,6 +178,52 @@ def test_validate_args_dropout_requires_single_model_parallel() -> None:
         dropout=0.1,
     )
     with pytest.raises(ValueError, match="dropout must be 0.0"):
+        EP_MODULE.validate_args(args, world_size=4, pp_layer_splits=None)
+
+
+def test_validate_args_sharded_strategy_requires_dist_opt() -> None:
+    args = _build_args_for_validate(
+        use_distributed_optimizer=False,
+        data_parallel_sharding_strategy="optim",
+    )
+    with pytest.raises(
+        ValueError,
+        match="use_distributed_optimizer must be enabled",
+    ):
+        EP_MODULE.validate_args(args, world_size=4, pp_layer_splits=None)
+
+
+def test_validate_args_rejects_unsupported_stage3() -> None:
+    args = _build_args_for_validate(
+        use_distributed_optimizer=True,
+        data_parallel_sharding_strategy="optim_grads_params",
+    )
+    with pytest.raises(ValueError, match="ZeRO-3"):
+        EP_MODULE.validate_args(args, world_size=4, pp_layer_splits=None)
+
+
+def test_validate_args_rejects_dist_opt_instances_gt1() -> None:
+    args = _build_args_for_validate(
+        use_distributed_optimizer=True,
+        data_parallel_sharding_strategy="optim",
+        num_distributed_optimizer_instances=2,
+    )
+    with pytest.raises(
+        ValueError,
+        match="num_distributed_optimizer_instances must be 1",
+    ):
+        EP_MODULE.validate_args(args, world_size=4, pp_layer_splits=None)
+
+
+def test_validate_args_rejects_dist_opt_with_no_shard() -> None:
+    args = _build_args_for_validate(
+        use_distributed_optimizer=True,
+        data_parallel_sharding_strategy="no_shard",
+    )
+    with pytest.raises(
+        ValueError,
+        match="When use_distributed_optimizer is set",
+    ):
         EP_MODULE.validate_args(args, world_size=4, pp_layer_splits=None)
 
 

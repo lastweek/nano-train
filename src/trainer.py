@@ -4,6 +4,7 @@ Training loop for MVP.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -1393,7 +1394,10 @@ class Trainer:
         if hist_this_step:
             self._log_gradient_histograms(step)
 
-        self.optimizer.step()
+        if hasattr(self.optimizer, "step_with_ready_grads"):
+            self.optimizer.step_with_ready_grads()
+        else:
+            self.optimizer.step()
         self.scheduler.step()
         self._check_opt_state_finite(step)
         self.optimizer.zero_grad()
@@ -1509,23 +1513,65 @@ class Trainer:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         model_path = os.path.join(checkpoint_dir, "model.pt")
-        optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
         scheduler_path = os.path.join(checkpoint_dir, "scheduler.pt")
         config_path = os.path.join(checkpoint_dir, "config.json")
+        optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
+        optimizer_nonparam_path = os.path.join(checkpoint_dir, "optimizer_nonparam.pt")
+        optimizer_manifest_path = os.path.join(checkpoint_dir, "optimizer_manifest.json")
 
         try:
             torch.save(self.model.state_dict(), model_path)
-            torch.save(self.optimizer.state_dict(), optimizer_path)
             torch.save(self.scheduler.state_dict(), scheduler_path)
-
-            import json
             from dataclasses import asdict
+
+            if hasattr(self.optimizer, "save_parameter_state"):
+                rank = int(os.environ.get("RANK", "0"))
+                world_size = int(os.environ.get("WORLD_SIZE", "1"))
+                torch.save(self.optimizer.state_dict(), optimizer_nonparam_path)
+                self.optimizer.save_parameter_state(
+                    checkpoint_dir=checkpoint_dir,
+                    rank=rank,
+                    world_size=world_size,
+                )
+                if hasattr(self.optimizer, "build_checkpoint_manifest"):
+                    manifest = self.optimizer.build_checkpoint_manifest(
+                        rank=rank,
+                        world_size=world_size,
+                    )
+                else:
+                    manifest = {
+                        "format_version": 1,
+                        "optimizer_type": type(self.optimizer).__name__,
+                        "rank": rank,
+                        "world_size": world_size,
+                        "files": {
+                            "nonparam": os.path.basename(optimizer_nonparam_path),
+                            "shard": f"optimizer_shard_rank{rank}.pt",
+                        },
+                    }
+                with open(optimizer_manifest_path, "w") as manifest_file:
+                    json.dump(manifest, manifest_file, indent=2)
+            else:
+                torch.save(self.optimizer.state_dict(), optimizer_path)
 
             with open(config_path, "w") as f:
                 json.dump(asdict(self.config), f, indent=2)
 
             size_bytes = 0
-            for path in (model_path, optimizer_path, scheduler_path, config_path):
+            tracked_paths = [model_path, scheduler_path, config_path]
+            if hasattr(self.optimizer, "save_parameter_state"):
+                rank = int(os.environ.get("RANK", "0"))
+                tracked_paths.extend(
+                    [
+                        optimizer_nonparam_path,
+                        optimizer_manifest_path,
+                        os.path.join(checkpoint_dir, f"optimizer_shard_rank{rank}.pt"),
+                    ]
+                )
+            else:
+                tracked_paths.append(optimizer_path)
+
+            for path in tracked_paths:
                 try:
                     if os.path.exists(path):
                         size_bytes += int(os.path.getsize(path))

@@ -16,7 +16,10 @@ operational task.
 2. [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
 3. [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
 4. [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
-5. [EP Training Monitoring Quickstart](training_monitoring_quickstart.md)
+5. [Megatron ZeRO-1/2 Design](megatron_zero1_zero2_design.md)
+6. [ZeRO-1/2 Intuitive Summary](zero1_zero2_intuitive_summary.md)
+7. [ZeRO-1/2 Quickstart](zero1_zero2_quickstart.md)
+8. [EP Training Monitoring Quickstart](training_monitoring_quickstart.md)
 
 ## Learning Guides
 
@@ -26,6 +29,9 @@ operational task.
 - [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
 - [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
 - [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
+- [Megatron ZeRO-1/2 Design](megatron_zero1_zero2_design.md)
+- [ZeRO-1/2 Intuitive Summary](zero1_zero2_intuitive_summary.md)
+- [ZeRO-1/2 Quickstart](zero1_zero2_quickstart.md)
 
 ## Operations
 

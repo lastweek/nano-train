@@ -14,7 +14,7 @@ Model used:
 
 Run examples:
     # single rank
-    python3 examples/ep.py \
+    python3 examples/train_4p.py \
         --tensor-model-parallel-size 1 \
         --pipeline-model-parallel-size 1 \
         --expert-model-parallel-size 1 \
@@ -22,7 +22,7 @@ Run examples:
 
     # EP-only (world=2, tensor=1, pipeline=1, expert=2, data=1)
     python3 examples/launch.py --world-size 2 --backend gloo \
-        --script examples/ep.py --script-args \
+        --script examples/train_4p.py --script-args \
         --tensor-model-parallel-size 1 \
         --pipeline-model-parallel-size 1 \
         --expert-model-parallel-size 2 \
@@ -30,7 +30,7 @@ Run examples:
 
     # PP-only 1F1B (world=2, tensor=1, pipeline=2, expert=1, data=1)
     python3 examples/launch.py --world-size 2 --backend gloo \
-        --script examples/ep.py --script-args \
+        --script examples/train_4p.py --script-args \
         --tensor-model-parallel-size 1 \
         --pipeline-model-parallel-size 2 \
         --expert-model-parallel-size 1 \
@@ -39,12 +39,54 @@ Run examples:
 
     # PP+EP+DP (world=16, tensor=1, pipeline=2, expert=4, data=2)
     python3 examples/launch.py --world-size 16 --backend gloo \
-        --script examples/ep.py --script-args \
+        --script examples/train_4p.py --script-args \
         --tensor-model-parallel-size 1 \
         --pipeline-model-parallel-size 2 \
         --expert-model-parallel-size 4 \
         --num_microbatches 2 \
         --max_steps 1
+
+    # ZeRO-1 with PP+EP+DP (world=8, tensor=1, pipeline=2, expert=2, data=2)
+    python3 examples/launch.py --world-size 8 --backend gloo \
+        --script examples/train_4p.py --script-args \
+        --tensor-model-parallel-size 1 \
+        --pipeline-model-parallel-size 2 \
+        --expert-model-parallel-size 2 \
+        --num_microbatches 2 \
+        --use-distributed-optimizer \
+        --data-parallel-sharding-strategy optim \
+        --max_steps 1
+
+    # ZeRO-2 with PP+EP+DP (world=8, tensor=1, pipeline=2, expert=2, data=2)
+    python3 examples/launch.py --world-size 8 --backend gloo \
+        --script examples/train_4p.py --script-args \
+        --tensor-model-parallel-size 1 \
+        --pipeline-model-parallel-size 2 \
+        --expert-model-parallel-size 2 \
+        --num_microbatches 2 \
+        --use-distributed-optimizer \
+        --data-parallel-sharding-strategy optim_grads \
+        --max_steps 1
+
+    # Add ZeRO debug logs (first step + first 12 params)
+    #   --zero-debug --zero-debug-max-steps 1 --zero-debug-max-params 12
+
+    # ZeRO-1 with TP+PP+DP (EP disabled: expert=1), world=8
+    python3 examples/launch.py --world-size 8 --backend gloo \
+        --script examples/train_4p.py --script-args \
+        --tensor-model-parallel-size 2 \
+        --pipeline-model-parallel-size 2 \
+        --expert-model-parallel-size 1 \
+        --num_microbatches 2 \
+        --use-distributed-optimizer \
+        --data-parallel-sharding-strategy optim \
+        --max_steps 1
+
+Note:
+    This tutorial currently disallows tensor-model-parallel-size>1 together
+    with expert-model-parallel-size>1 (see validate_args guard). So a fully
+    "TP+PP+EP+DP with TP>1 and EP>1" ZeRO command is intentionally blocked.
+    Use one of the runnable commands above.
 
 Core learning references:
     docs/ep_tp_dp_communication.md
@@ -74,6 +116,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.dataset import create_dataloader
 from src.distributed.topology import ModelParallelTopology
 from src.distributed.topology import initialize_model_parallel
+from src.distributed.zero import DistributedOptimizerConfig
+from src.distributed.zero import MegatronZeroOptimizer
 from src.layers import ColumnParallelLinear
 from src.layers import RowParallelLinear
 from src.logging import get_logger
@@ -206,6 +250,40 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Reserved virtual PP setting (not used in this tutorial)",
     )
+    parser.add_argument(
+        "--use-distributed-optimizer",
+        action="store_true",
+        help="Enable Megatron-style ZeRO optimizer path",
+    )
+    parser.add_argument(
+        "--data-parallel-sharding-strategy",
+        type=str,
+        default="no_shard",
+        help="Megatron-style DP sharding strategy: no_shard | optim | optim_grads",
+    )
+    parser.add_argument(
+        "--num-distributed-optimizer-instances",
+        type=int,
+        default=1,
+        help="Number of distributed optimizer instances (v1 supports only 1)",
+    )
+    parser.add_argument(
+        "--zero-debug",
+        action="store_true",
+        help="Enable verbose ZeRO debug logging in distributed optimizer",
+    )
+    parser.add_argument(
+        "--zero-debug-max-steps",
+        type=int,
+        default=1,
+        help="Number of early optimizer steps to emit ZeRO debug counters",
+    )
+    parser.add_argument(
+        "--zero-debug-max-params",
+        type=int,
+        default=8,
+        help="Number of parameter shard mappings to print at ZeRO init",
+    )
 
     parser.add_argument(
         "--num_microbatches",
@@ -326,6 +404,50 @@ def _validate_tutorial_guards(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_zero_optimizer_settings(args: argparse.Namespace) -> None:
+    """Validate Megatron-style distributed optimizer flags."""
+    valid_strategies = {"no_shard", "optim", "optim_grads", "optim_grads_params"}
+    strategy = args.data_parallel_sharding_strategy
+    zero_debug = bool(getattr(args, "zero_debug", False))
+    zero_debug_max_steps = int(getattr(args, "zero_debug_max_steps", 1))
+    zero_debug_max_params = int(getattr(args, "zero_debug_max_params", 8))
+    if strategy not in valid_strategies:
+        raise ValueError(
+            "data_parallel_sharding_strategy must be one of "
+            "no_shard, optim, optim_grads, optim_grads_params"
+        )
+
+    if strategy == "optim_grads_params":
+        raise ValueError(
+            "optim_grads_params (ZeRO-3) is out of scope in this tutorial. "
+            "Use no_shard, optim, or optim_grads."
+        )
+
+    if args.num_distributed_optimizer_instances != 1:
+        raise ValueError(
+            "num_distributed_optimizer_instances must be 1 in this tutorial implementation"
+        )
+
+    if strategy != "no_shard" and not args.use_distributed_optimizer:
+        raise ValueError(
+            "use_distributed_optimizer must be enabled when sharding strategy is not no_shard"
+        )
+
+    if args.use_distributed_optimizer and strategy == "no_shard":
+        raise ValueError(
+            "When use_distributed_optimizer is set, select sharding strategy optim or optim_grads"
+        )
+
+    if zero_debug and not args.use_distributed_optimizer:
+        raise ValueError("zero_debug requires use_distributed_optimizer=True")
+
+    if zero_debug_max_steps < 1:
+        raise ValueError("zero_debug_max_steps must be >= 1")
+
+    if zero_debug_max_params < 1:
+        raise ValueError("zero_debug_max_params must be >= 1")
+
+
 def _validate_pipeline_batching(
     args: argparse.Namespace,
     pp_layer_splits: Optional[tuple[int, ...]],
@@ -360,6 +482,7 @@ def validate_args(
     _validate_parallel_factorization(args, world_size)
     _validate_model_dimension_compatibility(args)
     _validate_tutorial_guards(args)
+    _validate_zero_optimizer_settings(args)
     _validate_pipeline_batching(args, pp_layer_splits)
 
 
@@ -658,6 +781,35 @@ def gather_moe_metrics(model: nn.Module, device: torch.device) -> tuple[torch.Te
     return aux_loss, avg_drop
 
 
+def _apply_optimizer_step(
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | MegatronZeroOptimizer,
+    use_distributed_optimizer: bool,
+    shard_info: ParamShardInfo,
+    data_parallel_size: int,
+    expert_data_parallel_size: int,
+    data_parallel_group,
+    expert_data_parallel_group,
+) -> None:
+    """Apply one optimizer step using either ZeRO path or manual grad-sync path."""
+    if use_distributed_optimizer:
+        if not isinstance(optimizer, MegatronZeroOptimizer):
+            raise TypeError("Expected MegatronZeroOptimizer when use_distributed_optimizer=True")
+        optimizer.step_with_ready_grads()
+        return
+
+    synchronize_gradients(
+        model=model,
+        shard_info=shard_info,
+        data_parallel_size=data_parallel_size,
+        expert_data_parallel_size=expert_data_parallel_size,
+        data_parallel_group=data_parallel_group,
+        expert_data_parallel_group=expert_data_parallel_group,
+    )
+    optimizer.step()
+
+
 # Tensor notation used by comments below:
 # B: DP-local batch, S: sequence length, H: hidden size
 # B_local: per-rank batch used in forward (equals B in this tutorial)
@@ -667,7 +819,8 @@ def gather_moe_metrics(model: nn.Module, device: torch.device) -> tuple[torch.Te
 
 def train_step_non_pipeline(
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | MegatronZeroOptimizer,
+    use_distributed_optimizer: bool,
     batch: dict[str, torch.Tensor],
     device: torch.device,
     data_parallel_size: int,
@@ -697,16 +850,16 @@ def train_step_non_pipeline(
     loss = task_loss + (aux_loss_coef * moe_aux_loss)
     loss.backward()
 
-    synchronize_gradients(
+    _apply_optimizer_step(
         model=model,
+        optimizer=optimizer,
+        use_distributed_optimizer=use_distributed_optimizer,
         shard_info=shard_info,
         data_parallel_size=data_parallel_size,
         expert_data_parallel_size=expert_data_parallel_size,
         data_parallel_group=data_parallel_group,
         expert_data_parallel_group=expert_data_parallel_group,
     )
-
-    optimizer.step()
     return (
         float(task_loss.item()),
         float(moe_aux_loss.item()),
@@ -1048,7 +1201,8 @@ def _finalize_pipeline_sends(state: _PipelineStepState) -> None:
 
 def train_step_pipeline(
     model: DeepSeekModel,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | MegatronZeroOptimizer,
+    use_distributed_optimizer: bool,
     batch: Optional[dict[str, torch.Tensor]],
     parallel: ModelParallelTopology,
     num_microbatches: int,
@@ -1116,16 +1270,16 @@ def train_step_pipeline(
     )
     _finalize_pipeline_sends(state)
 
-    synchronize_gradients(
+    _apply_optimizer_step(
         model=model,
+        optimizer=optimizer,
+        use_distributed_optimizer=use_distributed_optimizer,
         shard_info=shard_info,
         data_parallel_size=parallel.data_parallel_size,
         expert_data_parallel_size=parallel.expert_data_parallel_size,
         data_parallel_group=parallel.data_parallel_group,
         expert_data_parallel_group=parallel.expert_data_parallel_group,
     )
-
-    optimizer.step()
 
     objective_count = num_microbatches if model.is_last_pp_stage else 0
     return (
@@ -1224,7 +1378,7 @@ def _build_model_stack(
     args: argparse.Namespace,
     parallel: ModelParallelTopology,
     pp_layer_splits: Optional[tuple[int, ...]],
-) -> tuple[DeepSeekModel, torch.optim.Optimizer, ParamShardInfo]:
+) -> tuple[DeepSeekModel, torch.optim.Optimizer | MegatronZeroOptimizer, ParamShardInfo]:
     """Build model/context, synchronize initialization, and construct optimizer."""
     # Seed by (pp_rank, tp_rank, ep_rank) so shards initialize differently before sync.
     seed_offset = (
@@ -1267,11 +1421,32 @@ def _build_model_stack(
         parallel=parallel,
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    if args.use_distributed_optimizer:
+        optimizer = MegatronZeroOptimizer(
+            model=model,
+            config=DistributedOptimizerConfig(
+                use_distributed_optimizer=True,
+                data_parallel_sharding_strategy=args.data_parallel_sharding_strategy,
+                num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                learning_rate=args.lr,
+                weight_decay=args.weight_decay,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                use_reduce_scatter=True,
+                debug=args.zero_debug,
+                debug_max_steps=args.zero_debug_max_steps,
+                debug_max_params=args.zero_debug_max_params,
+            ),
+            data_parallel_group=parallel.data_parallel_group,
+            expert_data_parallel_group=parallel.expert_data_parallel_group,
+            expert_param_ids=shard_info.expert_model_parallel_sharded_param_ids,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
     return model, optimizer, shard_info
 
 
@@ -1327,13 +1502,23 @@ def _log_training_start(
         parallel.context_parallel_rank,
         parallel.context_parallel_size,
     )
+    logger.info(
+        "Distributed optimizer: enabled=%s strategy=%s dist_opt_instances=%d "
+        "zero_debug=%s zero_debug_max_steps=%d zero_debug_max_params=%d",
+        args.use_distributed_optimizer,
+        args.data_parallel_sharding_strategy,
+        args.num_distributed_optimizer_instances,
+        args.zero_debug,
+        args.zero_debug_max_steps,
+        args.zero_debug_max_params,
+    )
     logger.info("Starting training: epochs=%d, max_steps=%d", args.epochs, args.max_steps)
 
 
 def _run_non_pipeline_training(
     args: argparse.Namespace,
     model: DeepSeekModel,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | MegatronZeroOptimizer,
     train_loader,
     sampler: Optional[DistributedSampler],
     parallel: ModelParallelTopology,
@@ -1358,6 +1543,7 @@ def _run_non_pipeline_training(
             task_loss, aux_loss, total_loss, drop_fraction = train_step_non_pipeline(
                 model=model,
                 optimizer=optimizer,
+                use_distributed_optimizer=args.use_distributed_optimizer,
                 batch=batch,
                 device=parallel.device,
                 data_parallel_size=parallel.data_parallel_size,
@@ -1412,7 +1598,7 @@ def _run_non_pipeline_training(
 def _run_pipeline_training(
     args: argparse.Namespace,
     model: DeepSeekModel,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | MegatronZeroOptimizer,
     train_loader,
     sampler: Optional[DistributedSampler],
     parallel: ModelParallelTopology,
@@ -1442,6 +1628,7 @@ def _run_pipeline_training(
         task_sum, aux_sum, drop_sum, objective_count, drop_count = train_step_pipeline(
             model=model,
             optimizer=optimizer,
+            use_distributed_optimizer=args.use_distributed_optimizer,
             batch=step_batch,
             parallel=parallel,
             num_microbatches=args.num_microbatches,

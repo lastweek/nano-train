@@ -217,6 +217,11 @@ class DistributedConfig:
     # Gradient bucketing for communication efficiency
     bucket_cap_mb: int = 25
 
+    # Megatron-style distributed optimizer / ZeRO sharding.
+    use_distributed_optimizer: bool = False
+    data_parallel_sharding_strategy: Literal["no_shard", "optim", "optim_grads"] = "no_shard"
+    num_distributed_optimizer_instances: int = 1
+
 
 @dataclass
 class Config:

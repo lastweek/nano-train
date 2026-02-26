@@ -1,7 +1,7 @@
 # TP + EP + DP Communication Guide (Megatron Naming)
 
 **Purpose**: Explain communication domains and gradient synchronization rules in
-`examples/ep.py` when `pipeline_model_parallel_size == 1`.
+`examples/train_4p.py` when `pipeline_model_parallel_size == 1`.
 
 **Audience**: Readers learning where expert parallelism adds communication.
 
@@ -34,7 +34,7 @@ Each rank has coordinates:
 
 ## 2) Communication domains
 
-`examples/ep.py` uses these groups:
+`examples/train_4p.py` uses these groups:
 
 - `tensor_model_parallel_group`: fixed `(dp, ep)`, varying `tp`
 - `expert_model_parallel_group`: fixed `(dp, tp)`, varying `ep`

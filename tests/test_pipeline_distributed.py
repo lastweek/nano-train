@@ -15,6 +15,9 @@ import torch.multiprocessing as mp
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.distributed.topology import initialize_model_parallel
+from src.distributed.zero import DataParallelShardingStrategy
+from src.distributed.zero import DistributedOptimizerConfig
+from src.distributed.zero import MegatronZeroOptimizer
 from src.models.deepseek import DeepSeekModel
 from src.models.deepseek import DeepSeekModelConfig
 from src.models.deepseek import DeepSeekParallelContext
@@ -173,6 +176,89 @@ def _pp_ep_worker(rank: int, world_size: int, port: int) -> None:
     dist.destroy_process_group()
 
 
+class _PipelineScalarModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight
+
+
+def _pp_ep_zero_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    strategy: DataParallelShardingStrategy,
+) -> None:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+
+    setup = initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=2,
+        expert_model_parallel_size=2,
+    )
+    model = _PipelineScalarModel()
+    optimizer = MegatronZeroOptimizer(
+        model=model,
+        config=DistributedOptimizerConfig(
+            use_distributed_optimizer=True,
+            data_parallel_sharding_strategy=strategy,
+            learning_rate=1e-2,
+            weight_decay=0.0,
+            betas=(0.0, 0.0),
+            eps=1e-8,
+        ),
+        data_parallel_group=setup.data_parallel_group,
+        expert_data_parallel_group=setup.expert_data_parallel_group,
+        expert_param_ids=set(),
+    )
+
+    if setup.pipeline_model_parallel_rank == 0:
+        x = torch.tensor([2.0], dtype=torch.float32, requires_grad=True)
+        out = model(x)
+        dst = setup.rank_from_coords(
+            data_parallel_rank=setup.data_parallel_rank,
+            pipeline_model_parallel_rank=1,
+            tensor_model_parallel_rank=setup.tensor_model_parallel_rank,
+            expert_model_parallel_rank=setup.expert_model_parallel_rank,
+            context_parallel_rank=setup.context_parallel_rank,
+        )
+        dist.send(out.detach(), dst=dst, tag=401)
+        grad_back = torch.empty_like(out)
+        dist.recv(grad_back, src=dst, tag=402)
+        torch.autograd.backward(out, grad_back)
+    else:
+        src = setup.rank_from_coords(
+            data_parallel_rank=setup.data_parallel_rank,
+            pipeline_model_parallel_rank=0,
+            tensor_model_parallel_rank=setup.tensor_model_parallel_rank,
+            expert_model_parallel_rank=setup.expert_model_parallel_rank,
+            context_parallel_rank=setup.context_parallel_rank,
+        )
+        recv = torch.empty(1, dtype=torch.float32, requires_grad=True)
+        dist.recv(recv, src=src, tag=401)
+        out = model(recv)
+        loss = out.sum()
+        loss.backward()
+        if recv.grad is None:
+            raise RuntimeError("Expected recv.grad on PP last stage")
+        dist.send(recv.grad.detach(), dst=src, tag=402)
+
+    optimizer.step_with_ready_grads()
+    has_grad = torch.tensor(
+        1 if model.weight.grad is not None else 0,
+        dtype=torch.long,
+    )
+    dist.all_reduce(has_grad, op=dist.ReduceOp.SUM)
+    assert has_grad.item() == world_size
+    dist.destroy_process_group()
+
+
 def test_pipeline_distributed_smoke_world2() -> None:
     """Pipeline forward/backward should run on world=2 with pp=2."""
     world_size = 2
@@ -185,3 +271,27 @@ def test_pipeline_ep_distributed_smoke_world4() -> None:
     world_size = 4
     port = _free_port()
     mp.spawn(_pp_ep_worker, args=(world_size, port), nprocs=world_size, join=True)
+
+
+def test_pipeline_ep_zero_distributed_smoke_world4_optim() -> None:
+    """PP+EP with ZeRO-1 should run on world=4 with pp=2, ep=2."""
+    world_size = 4
+    port = _free_port()
+    mp.spawn(
+        _pp_ep_zero_worker,
+        args=(world_size, port, "optim"),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def test_pipeline_ep_zero_distributed_smoke_world4_optim_grads() -> None:
+    """PP+EP with ZeRO-2 should run on world=4 with pp=2, ep=2."""
+    world_size = 4
+    port = _free_port()
+    mp.spawn(
+        _pp_ep_zero_worker,
+        args=(world_size, port, "optim_grads"),
+        nprocs=world_size,
+        join=True,
+    )

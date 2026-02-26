@@ -135,18 +135,20 @@ Use this as the source of truth for "what changed when".
 | 2026-02-13 | `8044208` | MVP stack refactor + model efficiency reporting | `src/trainer.py`, `src/utils/model_info.py`, `docs/model_info.md` |
 | 2026-02-19 | `9c12e7e` | Monitoring v2 stability/perf metrics | `src/trainer.py`, `src/config.py`, `src/monitoring.py`, `docs/training_monitoring_metrics_reference.md` |
 | 2026-02-24 | `5206984` | Canonical TP + DP tutorial pipeline | `examples/tp.py`, `src/layers.py`, `docs/tp_dp_communication.md` |
-| 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/ep.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
+| 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/train_4p.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
 | 2026-02-25 | `5855268` | Docs IA/readability overhaul | `docs/README.md`, `docs/*.md`, `README.md`, `src/utils/model_info.py` |
+| 2026-02-26 | `TBD (this commit)` | 4P training entrypoint + ZeRO-1/2 integration and debug visibility | `examples/train_4p.py`, `src/distributed/zero.py`, `src/trainer.py`, `src/config.py`, `docs/zero1_zero2_*.md`, `tests/test_zero_*.py` |
 
 ### Planned Next Milestones
 
 | Status | Milestone | Expected Focus Files |
 |---|---|---|
-| In Progress | 4D TP+PP+EP+DP tutorial path | `examples/ep.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/pp_tp_ep_dp_communication.md` |
-| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/ep.py`, `src/models/moe.py`, `tests/test_ep_script_logic.py` |
+| In Progress | Canonical TP+EP mapping (remove TP+EP guard, avoid expert replication) | `examples/train_4p.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md`, `docs/pp_tp_ep_dp_communication.md` |
+| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/train_4p.py`, `src/models/moe.py`, `tests/test_train_4p_script_logic.py` |
 | Planned | DeepSeek parallel context cleanup and simplification | `src/models/deepseek.py`, `tests/test_deepseek_model.py` |
-| Planned | TP/EP learning script consistency pass | `examples/tp.py`, `examples/ep.py`, `docs/ep_tp_dp_communication.md` |
-| Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/ep.py`, `docs/deepseek_moe_aux_losses.md` |
+| Planned | TP/EP learning script consistency pass | `examples/tp.py`, `examples/train_4p.py`, `docs/ep_tp_dp_communication.md` |
+| Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/train_4p.py`, `docs/deepseek_moe_aux_losses.md` |
+| Planned | Checkpoint resume path for ZeRO sharded optimizer in trainer | `src/trainer.py`, `src/distributed/zero.py`, `docs/zero1_zero2_quickstart.md` |
 
 ## 🗺️ Roadmap
 
@@ -201,6 +203,12 @@ The [sync_and_run.sh](scripts/sync_and_run.sh) script automates:
   non-interleaved 1F1B pipeline schedule, stage-to-stage communication, and label transfer.
 - [DeepSeekMoE Aux Losses](docs/deepseek_moe_aux_losses.md) - expert/device load-balance
   objectives from DeepSeekMoE, plus mapping to this repo's current implementation.
+- [Megatron ZeRO-1/2 Design](docs/megatron_zero1_zero2_design.md) - implementation-level
+  design of Megatron distributed optimizer + DDP interactions, and how to map them into this repo.
+- [ZeRO-1/2 Intuitive Summary](docs/zero1_zero2_intuitive_summary.md) - small-tensor mental model
+  for `all-reduce`, `reduce-scatter`, `all-gather`, and what ZeRO-1 vs ZeRO-2 partition.
+- [ZeRO-1/2 Quickstart](docs/zero1_zero2_quickstart.md) - runnable commands for baseline,
+  ZeRO-1 (`optim`), and ZeRO-2 (`optim_grads`) with `examples/train_4p.py`.
 
 ## 📚 References
 

@@ -8,7 +8,7 @@ This module provides utilities for distributed training that work on both:
 Key components:
 - device: Device abstraction layer
 - launch: Process launcher
-- zero: ZeRO optimizer sharding (to be implemented)
+- zero: ZeRO optimizer sharding helpers
 
 Usage:
     from src.distributed import get_device_info, launch_multiprocessing
@@ -48,6 +48,12 @@ from src.distributed.topology import (
     init_parallel_4d,
     rank_from_coords,
 )
+from src.distributed.zero import (
+    DataParallelShardingStrategy,
+    DistributedOptimizerConfig,
+    MegatronZeroOptimizer,
+    is_zero_optimizer,
+)
 
 __all__ = [
     # Device info
@@ -70,4 +76,9 @@ __all__ = [
     "rank_from_coords",
     "initialize_model_parallel",
     "init_parallel_4d",
+    # ZeRO
+    "DataParallelShardingStrategy",
+    "DistributedOptimizerConfig",
+    "MegatronZeroOptimizer",
+    "is_zero_optimizer",
 ]

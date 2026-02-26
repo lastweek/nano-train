@@ -15,9 +15,9 @@ Usage:
     python3 examples/launch.py --world-size 4 --backend gloo \
         --script examples/tp.py --script-args --tensor-model-parallel-size 2
 
-    # EP tutorial on 8 ranks (Tensor MP=2, Expert MP=2, Data Parallel=2)
+    # 4P tutorial on 8 ranks (Tensor MP=2, Expert MP=2, Data Parallel=2)
     python3 examples/launch.py --world-size 8 --backend gloo \
-        --script examples/ep.py --script-args \
+        --script examples/train_4p.py --script-args \
         --tensor-model-parallel-size 2 \
         --pipeline-model-parallel-size 1 \
         --expert-model-parallel-size 2
