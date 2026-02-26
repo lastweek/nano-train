@@ -12,14 +12,15 @@ operational task.
 
 ## Start Here
 
-1. [TP + DP Communication Guide](tp_dp_communication.md)
-2. [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
-3. [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
-4. [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
-5. [Megatron ZeRO-1/2 Design](megatron_zero1_zero2_design.md)
-6. [ZeRO-1/2 Intuitive Summary](zero1_zero2_intuitive_summary.md)
-7. [ZeRO-1/2 Quickstart](zero1_zero2_quickstart.md)
-8. [EP Training Monitoring Quickstart](training_monitoring_quickstart.md)
+1. [Runtime Core Design](runtime_core_design.md)
+2. [TP + DP Communication Guide](tp_dp_communication.md)
+3. [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
+4. [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
+5. [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
+6. [Megatron ZeRO-1/2 Design](megatron_zero1_zero2_design.md)
+7. [ZeRO-1/2 Intuitive Summary](zero1_zero2_intuitive_summary.md)
+8. [ZeRO-1/2 Quickstart](zero1_zero2_quickstart.md)
+9. [EP Training Monitoring Quickstart](training_monitoring_quickstart.md)
 
 ## Learning Guides
 
@@ -41,6 +42,7 @@ operational task.
 
 ## Reference
 
+- [Runtime Core Design](runtime_core_design.md)
 - [Model Info Utility](model_info.md)
 - [Model Info Appendix](model_info_appendix.md)
 

@@ -60,98 +60,118 @@ python3 examples/launch.py --world-size 4 --backend gloo \
 | `examples/launch.py` | Multi-process launcher for local distributed runs |
 | `src/distributed/topology.py` | Parallel group/rank topology setup |
 | `src/distributed/zero.py` | Megatron-style ZeRO-1/2 optimizer implementation |
+| `src/runtime/engine.py` | Runtime orchestration engine (mode dispatch + loops) |
+| `src/runtime/contracts.py` | Runtime component contracts (`providers`, `schedule`, `optimizer`, `checkpoint`) |
 | `src/trainer.py` | Shared trainer loop and checkpoint integration hooks |
+
+## Runtime Core
+
+`examples/train_4p.py`, `examples/tp.py`, `examples/ddp.py`, and `examples/mvp.py`
+now use a thin-script pattern:
+
+- Script owns CLI and component wiring.
+- `src/runtime/engine.py` owns orchestration flow.
+- Model/data/optimizer/schedule/checkpoint behavior is provided through components.
+  Example-specific component implementations live in each script under `examples/`.
+- See [Runtime Core Design](docs/runtime_core_design.md) for architecture, API,
+  responsibilities, and script usage patterns.
 
 ## Architecture Diagram
 
+See `docs/runtime_core_design.md` for full API and extension details.
+
 ```mermaid
-flowchart TB
-    subgraph E["Entry Points (`examples/`)"]
-        E1["train_4p.py\nCanonical TP/PP/EP/DP + ZeRO tutorial"]
-        E2["tp.py\nTP-only and TP+DP tutorial"]
-        E3["launch.py\nMulti-process launcher"]
-        E4["mvp.py / deepseek.py / ddp.py\nFocused demos"]
+flowchart TD
+    subgraph E["Entry Scripts (`examples/`)"]
+        E1["train_4p.py"]
+        E2["tp.py"]
+        E3["ddp.py"]
+        E4["mvp.py"]
+        E5["Parse args + assemble RuntimeComponents"]
     end
 
-    subgraph O["Orchestration (`src/`)"]
-        O1["trainer.py\nTraining loop + checkpoint hooks"]
-        O2["config.py\nTyped runtime config"]
-        O3["dataset.py\nDataset + dataloader helpers"]
-        O4["logging.py\nStructured logging"]
-        O5["optimizer.py + scheduler.py\nOptimization policies"]
+    subgraph C["Component Bundle (`RuntimeComponents`)"]
+        C0["RuntimeComponents"]
+        C1["RuntimeBootstrap"]
+        C2["ModelProvider"]
+        C3["DataProvider"]
+        C4["OptimizerRuntime"]
+        C5["ScheduleSelector"]
+        C6["ScheduleStrategy"]
+        C7["CheckpointManager"]
     end
 
-    subgraph D["Distributed Runtime (`src/distributed/`)"]
-        D1["device.py\nDevice/backend selection"]
-        D2["topology.py\nTP/PP/EP/DP process groups"]
-        D3["zero.py\nMegatron-style ZeRO-1/2"]
+    subgraph R["Runtime Engine (`src/runtime/engine.py`)"]
+        R0["RuntimeEngine.run(...)"]
+        R1["build_context"]
+        R2["build model/data"]
+        R3["init optimizer state"]
+        R4["select schedule"]
+        R5["load checkpoint"]
+        R6["step loop"]
+        R7["checkpoint hooks"]
+        R8["finalize + destroy process group"]
     end
 
-    subgraph M["Model Stack (`src/models/` + `src/layers.py`)"]
-        M1["deepseek.py\nDeepSeek model + parallel context"]
-        M2["moe.py\nRouter + Local/EP MoE"]
-        M3["transformer.py\nBaseline transformer model"]
-        M4["attention.py + mlp.py\nBlock components"]
-        M5["layers.py\nParallel linear + seq-parallel primitives"]
-        M6["losses.py\nTraining loss modules"]
+    subgraph H["Runtime Helpers (`src/runtime/*`)"]
+        H1["sync.py"]
+        H2["pipeline.py"]
+        H3["optimizer_runtime.py"]
+        H4["checkpoint.py"]
     end
 
-    subgraph X["Observability & Utility"]
-        X1["monitoring.py\nTraining diagnostics"]
-        X2["utils/model_info.py\nModel size/compute reporting"]
+    subgraph V["Verification & Docs"]
+        V1["tests/* runtime + script wiring"]
+        V2["docs/runtime_core_design.md"]
     end
 
-    subgraph V["Verification & Knowledge"]
-        V1["tests/\nUnit + distributed smoke"]
-        V2["docs/\nCommunication + ZeRO guides"]
-    end
+    E1 --> E5
+    E2 --> E5
+    E3 --> E5
+    E4 --> E5
+    E5 --> C0
+    C0 --> R0
 
-    E3 --> E1
-    E3 --> E2
-    E3 --> E4
+    C0 --> C1
+    C0 --> C2
+    C0 --> C3
+    C0 --> C4
+    C0 --> C5
+    C5 --> C6
+    C0 --> C7
 
-    E1 --> D1
-    E1 --> D2
-    E1 --> D3
-    E1 --> O3
-    E1 --> O4
-    E1 --> M1
-    E1 --> M2
-    E1 --> M5
+    C1 --> R1
+    C2 --> R2
+    C3 --> R2
+    C4 --> R3
+    C5 --> R4
+    C7 --> R5
 
-    E2 --> D1
-    E2 --> O3
-    E2 --> O4
-    E2 --> M5
+    R0 --> R1
+    R1 --> R2
+    R2 --> R3
+    R3 --> R4
+    R4 --> R5
+    R5 --> R6
+    R6 --> C6
+    C6 --> R6
+    R6 --> R7
+    R7 --> R8
 
-    E4 --> O1
-    O1 --> O2
-    O1 --> O3
-    O1 --> O4
-    O1 --> O5
-    O1 --> M6
-    O1 --> X1
+    C4 -. uses .-> H1
+    C6 -. uses .-> H2
+    C4 -. uses .-> H3
+    C7 -. uses .-> H4
+    R0 -. uses .-> H2
+    R0 -. uses .-> H4
 
-    D3 --> D2
-
-    M1 --> M2
-    M1 --> M5
-    M3 --> M4
-    M3 --> M5
-    M4 --> M5
-    M2 --> M5
-
-    X2 --> M1
-    X2 --> M3
-
+    V1 -. validates .-> R0
     V1 -. validates .-> E1
     V1 -. validates .-> E2
-    V1 -. validates .-> D3
-    V1 -. validates .-> M1
-    V2 -. documents .-> E1
-    V2 -. documents .-> D2
-    V2 -. documents .-> D3
-    V2 -. documents .-> M2
+    V1 -. validates .-> E3
+    V1 -. validates .-> E4
+    V2 -. documents .-> R0
+    V2 -. documents .-> C0
 ```
 
 ## Learning Guides
@@ -173,7 +193,7 @@ flowchart TB
 |---|---|---|---|
 | 2026-02-09 | `5cfeb63` | Initial repo bootstrap | `README.md`, `src/*`, `examples/*`, `tests/*` |
 | 2026-02-13 | `8044208` | MVP stack refactor + model efficiency reporting | `src/trainer.py`, `src/utils/model_info.py`, `docs/model_info.md` |
-| 2026-02-19 | `9c12e7e` | Monitoring v2 stability/perf metrics | `src/trainer.py`, `src/config.py`, `src/monitoring.py`, `docs/training_monitoring_metrics_reference.md` |
+| 2026-02-19 | `9c12e7e` | Monitoring stability/perf metrics | `src/trainer.py`, `src/config.py`, `src/monitoring.py`, `docs/training_monitoring_metrics_reference.md` |
 | 2026-02-24 | `5206984` | Canonical TP + DP tutorial pipeline | `examples/tp.py`, `src/layers.py`, `docs/tp_dp_communication.md` |
 | 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/train_4p.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
 | 2026-02-25 | `5855268` | Docs IA/readability overhaul | `docs/README.md`, `docs/*.md`, `README.md`, `src/utils/model_info.py` |

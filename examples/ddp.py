@@ -1,85 +1,46 @@
 #!/usr/bin/env python3
-"""
-Simple distributed training script using DDP.
+"""Simple distributed training script using runtime-core orchestration."""
 
-This script demonstrates:
-1. Device-agnostic distributed training (works on CPU and GPU)
-2. Using gloo backend for CPU development
-3. Using nccl backend for GPU production
+from __future__ import annotations
 
-Usage:
-    # CPU development (4 processes)
-    python examples/launch.py --world_size 4 --script examples/ddp.py
-
-    # Or directly with torchrun
-    torchrun --nproc_per_node=4 --backend=gloo examples/ddp.py
-
-    # GPU production (4 GPUs)
-    torchrun --nproc_per_node=4 examples/ddp.py
-"""
-
+import argparse
+from dataclasses import dataclass
 import os
 import sys
-
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torch.utils.data import DistributedSampler
 
-from src.config import Config
-from src.distributed.device import get_device_info, get_device, get_backend
-from src.logging import setup_logging, get_logger
+# Add parent directory to path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.distributed.device import get_backend
+from src.distributed.device import get_device
+from src.distributed.device import get_device_info
+from src.logging import get_logger
+from src.logging import setup_logging
+from src.runtime.checkpoint import NoOpCheckpointManager
+from src.runtime.context import RunConfig
+from src.runtime.context import RuntimeContext
+from src.runtime.contracts import OptimizerState
+from src.runtime.contracts import RuntimeBootstrap
+from src.runtime.contracts import RuntimeComponents
+from src.runtime.contracts import ScheduleStrategy
+from src.runtime.contracts import StepContext
+from src.runtime.contracts import StepOutput
+from src.runtime.contracts import TrainDataBundle
+from src.runtime.engine import RuntimeEngine
+from src.runtime.schedules.non_pipeline import NonPipelineSchedule
+from src.runtime.sync import ParamShardInfo
+
 
 logger = get_logger(__name__)
-
-
-def setup_distributed():
-    """
-    Initialize distributed training environment.
-
-    Reads environment variables set by torchrun or launch_ddp.py:
-    - RANK: Global rank of this process
-    - WORLD_SIZE: Total number of processes
-    - LOCAL_RANK: Local rank within this node
-    - MASTER_ADDR: Address of the master node
-    - MASTER_PORT: Port for communication
-
-    Returns:
-        tuple: (rank, world_size, local_rank, device)
-    """
-    # Get distributed info from environment
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-
-    # Auto-detect backend
-    backend = get_backend()
-
-    logger.info(f"Initializing process group...")
-    logger.info(f"  Rank: {rank}/{world_size}")
-    logger.info(f"  Local Rank: {local_rank}")
-    logger.info(f"  Backend: {backend}")
-
-    # Initialize process group
-    dist.init_process_group(
-        backend=backend,
-        world_size=world_size,
-        rank=rank,
-    )
-
-    # Get device
-    device_info = get_device_info()
-    device = get_device(device_info.device_type, local_rank)
-    if device.type == "cuda":
-        torch.cuda.set_device(local_rank)
-
-    logger.info(f"  Device: {device}")
-
-    return rank, world_size, local_rank, device
 
 
 class SimpleModel(nn.Module):
@@ -95,145 +56,288 @@ class SimpleModel(nn.Module):
             nn.Linear(hidden_size, 1),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run model forward pass."""
         return self.net(x)
 
 
-def create_dummy_dataset(batch_size: int = 32, num_samples: int = 1000):
-    """Create a simple dummy dataset for testing."""
-    class DummyDataset(torch.utils.data.Dataset):
-        def __init__(self, num_samples):
-            # Deterministic construction so all ranks shard the same underlying dataset.
-            generator = torch.Generator().manual_seed(1234)
-            self.data = torch.randn(num_samples, 10, generator=generator)
-            self.targets = torch.randn(num_samples, 1, generator=generator)
+class DummyDataset(Dataset):
+    """Deterministic dummy dataset for DDP tutorial."""
 
-        def __len__(self):
-            return len(self.data)
+    def __init__(self, num_samples: int):
+        generator = torch.Generator().manual_seed(1234)
+        self.data = torch.randn(num_samples, 10, generator=generator)
+        self.targets = torch.randn(num_samples, 1, generator=generator)
 
-        def __getitem__(self, idx):
-            return self.data[idx], self.targets[idx]
+    def __len__(self) -> int:
+        return len(self.data)
 
-    dataset = DummyDataset(num_samples)
-    return dataset
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {"data": self.data[idx], "target": self.targets[idx]}
 
 
-def train_step(model, optimizer, data, target, device):
-    """Single training step."""
-    data, target = data.to(device), target.to(device)
+@dataclass
+class DDPParallelContext:
+    """Resolved DDP runtime topology used by this example."""
 
-    optimizer.zero_grad()
-    output = model(data)
-    loss = nn.functional.mse_loss(output, target)
-    loss.backward()
-    optimizer.step()
+    rank: int
+    world_size: int
+    local_rank: int
+    device: torch.device
 
-    return loss.item()
+    tensor_model_parallel_size: int
+    pipeline_model_parallel_size: int
+    expert_model_parallel_size: int
+    context_parallel_size: int
+    data_parallel_size: int
+    expert_data_parallel_size: int
+
+    tensor_model_parallel_rank: int
+    pipeline_model_parallel_rank: int
+    expert_model_parallel_rank: int
+    context_parallel_rank: int
+    data_parallel_rank: int
+
+    tensor_model_parallel_group: Optional[object]
+    pipeline_model_parallel_group: Optional[object]
+    expert_model_parallel_group: Optional[object]
+    context_parallel_group: Optional[object]
+    data_parallel_group: Optional[object]
+    expert_data_parallel_group: Optional[object]
 
 
-def main():
-    """Main training loop."""
-    # Setup logging
-    setup_logging(log_level="INFO")
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the DDP tutorial."""
+    parser = argparse.ArgumentParser(description="Simple DDP tutorial with runtime core")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_samples", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--max_steps", type=int, default=1_000_000)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--hidden_size", type=int, default=128)
+    parser.add_argument("--log_every", type=int, default=0)
+    return parser.parse_args()
 
-    # Setup distributed training
-    rank, world_size, local_rank, device = setup_distributed()
 
-    # Only log from rank 0 to avoid duplicate output
-    if rank == 0:
+def setup_process_logging(rank: int) -> None:
+    """Configure process-local logging using shared logging utilities."""
+    level = "INFO" if rank == 0 else "WARNING"
+    setup_logging(log_level=level, use_colors=False)
+
+
+@dataclass
+class DDPBootstrap(RuntimeBootstrap):
+    """Build runtime context for DDP tutorial."""
+
+    def build_context(self, args: argparse.Namespace) -> RuntimeContext:
+        """Initialize distributed process state and construct runtime context."""
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+        backend = get_backend()
+        if world_size > 1:
+            dist.init_process_group(backend=backend, world_size=world_size, rank=rank)
+
+        device_info = get_device_info()
+        device = get_device(device_info.device_type, local_rank)
+        if device.type == "cuda":
+            torch.cuda.set_device(local_rank)
+
+        parallel = DDPParallelContext(
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            device=device,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            context_parallel_size=1,
+            data_parallel_size=world_size,
+            expert_data_parallel_size=world_size,
+            tensor_model_parallel_rank=0,
+            pipeline_model_parallel_rank=0,
+            expert_model_parallel_rank=0,
+            context_parallel_rank=0,
+            data_parallel_rank=rank,
+            tensor_model_parallel_group=None,
+            pipeline_model_parallel_group=None,
+            expert_model_parallel_group=None,
+            context_parallel_group=None,
+            data_parallel_group=dist.group.WORLD if dist.is_initialized() else None,
+            expert_data_parallel_group=dist.group.WORLD if dist.is_initialized() else None,
+        )
+
+        if rank == 0:
+            logger.info("Initializing process group...")
+            logger.info("  Rank: %d/%d", rank, world_size)
+            logger.info("  Local Rank: %d", local_rank)
+            logger.info("  Backend: %s", backend)
+            logger.info("  Device: %s", device)
+
+        return RuntimeContext(
+            parallel=parallel,
+            mode="ddp" if world_size > 1 else "single",
+            run_config=RunConfig(args=args, pp_layer_splits=None),
+        )
+
+
+class DDPModelProvider:
+    """Build and wrap DDP model."""
+
+    def build_model(self, ctx: RuntimeContext) -> torch.nn.Module:
+        """Build model and wrap with DDP when world size is greater than one."""
+        args = ctx.run_config.args
+        parallel = ctx.parallel
+
+        model: torch.nn.Module = SimpleModel(hidden_size=args.hidden_size).to(parallel.device)
+        if parallel.world_size > 1:
+            if parallel.device.type == "cuda":
+                model = DDP(model, device_ids=[parallel.local_rank])
+            else:
+                model = DDP(model)
+
+        if parallel.rank == 0:
+            logger.info("Model wrapped with DDP")
+            if hasattr(model, "device_ids"):
+                logger.info("  Device IDs: %s", model.device_ids)
+
+        return model
+
+
+class DDPDataProvider:
+    """Build DDP train data loader and sampler."""
+
+    def build_train_data(self, ctx: RuntimeContext) -> TrainDataBundle:
+        """Build deterministic dataset and distributed sampler-backed loader."""
+        args = ctx.run_config.args
+        parallel = ctx.parallel
+
+        dataset = DummyDataset(num_samples=args.num_samples)
+        sampler: Optional[DistributedSampler] = None
+        if parallel.world_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=parallel.world_size,
+                rank=parallel.rank,
+                shuffle=True,
+                seed=42,
+            )
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            shuffle=sampler is None,
+            num_workers=0,
+        )
+        return TrainDataBundle(loader=dataloader, sampler=sampler)
+
+
+class DDPOptimizerRuntime:
+    """Optimizer policy for DDP tutorial."""
+
+    def initialize(self, model: torch.nn.Module, ctx: RuntimeContext) -> OptimizerState:
+        """Initialize AdamW optimizer state for DDP tutorial training."""
+        args = ctx.run_config.args
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        return OptimizerState(
+            optimizer=optimizer,
+            shard_info=ParamShardInfo(set(), set()),
+        )
+
+    def zero_grad(self, state: OptimizerState) -> None:
+        """Zero optimizer gradients before each training step."""
+        zero_grad = getattr(state.optimizer, "zero_grad")
+        zero_grad(set_to_none=True)
+
+    def step(
+        self,
+        *,
+        model: torch.nn.Module,
+        state: OptimizerState,
+        ctx: RuntimeContext,
+    ) -> None:
+        """Apply one optimizer step; DDP handles gradient synchronization."""
+        del model, ctx
+        step = getattr(state.optimizer, "step")
+        step()
+
+
+@dataclass
+class DDPStepSchedule:
+    """Execute one DDP tutorial train step."""
+
+    optimizer_runtime: DDPOptimizerRuntime
+
+    def run_step(self, step_ctx: StepContext) -> StepOutput:
+        """Execute one MSE train step for the DDP tutorial model."""
+        if step_ctx.batch is None:
+            raise RuntimeError("DDP schedule requires a batch")
+
+        device = step_ctx.runtime_context.parallel.device
+        data = step_ctx.batch["data"].to(device)
+        target = step_ctx.batch["target"].to(device)
+
+        self.optimizer_runtime.zero_grad(step_ctx.optimizer_state)
+        output = step_ctx.model(data)
+        loss = nn.functional.mse_loss(output, target)
+        loss.backward()
+        self.optimizer_runtime.step(
+            model=step_ctx.model,
+            state=step_ctx.optimizer_state,
+            ctx=step_ctx.runtime_context,
+        )
+
+        return StepOutput(
+            task_loss=float(loss.item()),
+            aux_loss=0.0,
+            total_loss=float(loss.item()),
+            drop_fraction=0.0,
+            counters={"objective_count": 1, "drop_count": 1},
+        )
+
+
+@dataclass
+class DDPScheduleSelector:
+    """Always choose non-pipeline schedule for DDP tutorial."""
+
+    schedule: ScheduleStrategy
+
+    def select(self, ctx: RuntimeContext) -> ScheduleStrategy:
+        """Return the single non-pipeline schedule used by this script."""
+        del ctx
+        return self.schedule
+
+
+def build_ddp_components() -> RuntimeComponents:
+    """Build DDP tutorial runtime components."""
+    optimizer_runtime = DDPOptimizerRuntime()
+    schedule = NonPipelineSchedule(step_fn=DDPStepSchedule(optimizer_runtime).run_step)
+    return RuntimeComponents(
+        bootstrap=DDPBootstrap(),
+        model_provider=DDPModelProvider(),
+        data_provider=DDPDataProvider(),
+        optimizer_runtime=optimizer_runtime,
+        schedule_selector=DDPScheduleSelector(schedule=schedule),
+        checkpoint_manager=NoOpCheckpointManager(),
+    )
+
+
+def main() -> None:
+    """Main training loop entrypoint."""
+    args = parse_args()
+
+    rank_pre = int(os.environ.get("RANK", "0"))
+    setup_process_logging(rank_pre)
+
+    if rank_pre == 0:
         logger.info("=" * 60)
         logger.info("Distributed DDP Training Test")
         logger.info("=" * 60)
-        logger.info(f"World Size: {world_size}")
-        logger.info(f"Device: {device}")
-        logger.info(f"Backend: {dist.get_backend()}")
-        logger.info("=" * 60)
-        logger.info("")
 
-    # Create model
-    model = SimpleModel(hidden_size=128).to(device)
-
-    # Wrap model with DDP
-    # Note: device_ids must be specified for DDP
-    if device.type == "cuda":
-        model = DDP(model, device_ids=[local_rank])
-    else:
-        # For CPU, device_ids should be None
-        model = DDP(model)
-
-    if rank == 0:
-        logger.info(f"Model wrapped with DDP")
-        logger.info(f"  Device IDs: {model.device_ids if hasattr(model, 'device_ids') else 'N/A (CPU)'}")
-        logger.info("")
-
-    # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-
-    # Create dataset and dataloader with DistributedSampler
-    dataset = create_dummy_dataset(batch_size=32, num_samples=1000)
-
-    # DistributedSampler ensures each process gets different data
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        seed=42,
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=32,
-        sampler=sampler,
-        num_workers=0,
-    )
-
-    if rank == 0:
-        logger.info("Starting training...")
-        logger.info("")
-
-    # Training loop
-    num_epochs = 3
-    for epoch in range(num_epochs):
-        # Set epoch for sampler to ensure different shuffling each epoch
-        sampler.set_epoch(epoch)
-
-        if rank == 0:
-            logger.info(f"Epoch {epoch + 1}/{num_epochs}")
-
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-
-        for batch_idx, (data, target) in enumerate(dataloader):
-            loss = train_step(model, optimizer, data, target, device)
-            epoch_loss += loss
-            num_batches += 1
-
-        # Only rank 0 logs metrics
-        if rank == 0:
-            # Placeholder; true global average is logged below.
-            avg_loss = epoch_loss / num_batches
-
-        # Aggregate loss stats across all ranks for a global view.
-        loss_stats = torch.tensor(
-            [epoch_loss, float(num_batches)],
-            dtype=torch.float64,
-            device=device,
-        )
-        dist.all_reduce(loss_stats, op=dist.ReduceOp.SUM)
-        global_avg_loss = float(loss_stats[0].item() / max(1.0, loss_stats[1].item()))
-
-        if rank == 0:
-            logger.info(f"  Average Loss: {global_avg_loss:.4f}")
-
-    # Clean up
-    if rank == 0:
-        logger.info("")
-        logger.info("Training completed successfully!")
-        logger.info("")
-
-    dist.destroy_process_group()
+    engine = RuntimeEngine()
+    engine.run(components=build_ddp_components(), args=args)
 
 
 if __name__ == "__main__":
