@@ -9,6 +9,7 @@ implementation.
 
 **Related Docs**:
 - [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
+- [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
 - [TP + DP Backward Flow](tp_dp_communication.md)
 
 This note explains the two load-balancing losses described in DeepSeekMoE
@@ -84,9 +85,10 @@ inside the router, then globally scaled by script-level `aux_loss_coef`:
 That means balancing pressure is expert-level only. This is fine for learning
 and small runs, but large EP runs may benefit from adding device-level loss.
 
-Also, shared EP batch mode (`--attn_tp_axis ep`) assumes deterministic replicated
-non-expert paths; in this tutorial script that assumption is enforced by
-requiring `dropout=0.0`.
+In current canonical mapping, expert sharding is controlled by
+`expert_model_parallel_size` directly. With TP+EP, each TP lane has its own
+expert-parallel domain; expert gradients are synchronized on
+`expert_data_parallel_group` (varying DP and TP for fixed expert shard).
 
 ## 6) Practical reading tip
 

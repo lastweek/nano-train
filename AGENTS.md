@@ -138,6 +138,20 @@ balanced profile: strong defaults with documented exceptions when needed.
 - Log TP/EP/DP rank topology once from rank 0 for traceability.
 - Seed strategy must be explicit and documented for parallel contexts.
 
+### 3.1 Megatron Naming Contract
+- Use Megatron-style names in code, logs, docs, and CLI:
+  - `tensor_model_parallel_*`
+  - `pipeline_model_parallel_*`
+  - `expert_model_parallel_*`
+  - `data_parallel_*`
+  - `expert_data_parallel_*`
+  - `context_parallel_*`
+- Do not overload EP to mean batch-splitting or attention-axis switching.
+- Prefer explicit domains over ad-hoc toggles; removed interfaces must not be
+  reintroduced under new aliases.
+- Backward-compat aliases are allowed for one release only and must emit
+  deprecation warnings.
+
 ### 4. Reproducibility and Checkpointing
 - Record run config and seed in logs for every training entrypoint.
 - Training scripts that touch infra loops must include resumable checkpoint

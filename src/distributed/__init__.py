@@ -40,6 +40,14 @@ from src.distributed.launch import (
     launch_multiprocessing,
     print_launch_instructions,
 )
+from src.distributed.topology import (
+    ModelParallelTopology,
+    ParallelSetup4D,
+    coords_from_rank,
+    initialize_model_parallel,
+    init_parallel_4d,
+    rank_from_coords,
+)
 
 __all__ = [
     # Device info
@@ -55,4 +63,11 @@ __all__ = [
     "get_launch_command",
     "print_launch_instructions",
     "auto_detect_and_print",
+    # 4D topology
+    "ModelParallelTopology",
+    "ParallelSetup4D",
+    "coords_from_rank",
+    "rank_from_coords",
+    "initialize_model_parallel",
+    "init_parallel_4d",
 ]

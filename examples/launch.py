@@ -9,18 +9,21 @@ Execution patterns:
 Usage:
     # TP tutorial on 4 ranks (TP-only)
     python3 examples/launch.py --world-size 4 --backend gloo \
-        --script examples/tp.py --script-args --tp_size 4
+        --script examples/tp.py --script-args --tensor-model-parallel-size 4
 
     # TP tutorial on 4 ranks (TP=2, DP=2)
     python3 examples/launch.py --world-size 4 --backend gloo \
-        --script examples/tp.py --script-args --tp_size 2
+        --script examples/tp.py --script-args --tensor-model-parallel-size 2
 
-    # EP tutorial on 8 ranks (TP=2, EP=2, DP=2)
+    # EP tutorial on 8 ranks (Tensor MP=2, Expert MP=2, Data Parallel=2)
     python3 examples/launch.py --world-size 8 --backend gloo \
-        --script examples/ep.py --script-args --tp_size 2 --ep_size 2
+        --script examples/ep.py --script-args \
+        --tensor-model-parallel-size 2 \
+        --pipeline-model-parallel-size 1 \
+        --expert-model-parallel-size 2
 
     # Multi-GPU NCCL (recommended launch path)
-    torchrun --nproc_per_node=4 examples/tp.py --tp_size 2
+    torchrun --nproc_per_node=4 examples/tp.py --tensor-model-parallel-size 2
 
 Pass target-script flags after `--script-args`.
 """

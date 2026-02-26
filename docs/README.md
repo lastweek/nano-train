@@ -14,8 +14,9 @@ operational task.
 
 1. [TP + DP Communication Guide](tp_dp_communication.md)
 2. [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
-3. [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
-4. [EP Training Monitoring Quickstart](training_monitoring_quickstart.md)
+3. [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
+4. [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
+5. [EP Training Monitoring Quickstart](training_monitoring_quickstart.md)
 
 ## Learning Guides
 
@@ -23,6 +24,7 @@ operational task.
 
 - [TP + DP Communication Guide](tp_dp_communication.md)
 - [TP + EP + DP Communication Guide](ep_tp_dp_communication.md)
+- [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
 - [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
 
 ## Operations

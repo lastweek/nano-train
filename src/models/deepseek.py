@@ -20,8 +20,10 @@ import torch.nn.functional as F
 from src.layers import ColumnParallelLinear
 from src.layers import Dropout
 from src.layers import Embedding
+from src.layers import gather_from_sequence_parallel_region
 from src.layers import Linear
 from src.layers import RowParallelLinear
+from src.layers import scatter_to_sequence_parallel_region
 from src.models.moe import ExpertMLP
 from src.models.moe import ExpertParallelMoE
 from src.models.moe import LocalRoutedMoE
@@ -128,33 +130,175 @@ class DeepSeekModelConfig:
 @dataclass
 class DeepSeekParallelContext:
     """
-    Optional model parallel context for TP and EP integration.
+    Optional model parallel context using Megatron-style parallel naming.
 
     Defaults keep behavior identical to the single-process baseline.
     """
 
-    tp_rank: int = 0
-    tp_size: int = 1
-    tp_group: Optional[object] = None
-    ep_rank: int = 0
-    ep_size: int = 1
-    ep_group: Optional[object] = None
+    tensor_model_parallel_rank: int = 0
+    tensor_model_parallel_size: int = 1
+    tensor_model_parallel_group: Optional[object] = None
+    expert_model_parallel_rank: int = 0
+    expert_model_parallel_size: int = 1
+    expert_model_parallel_group: Optional[object] = None
+    pipeline_model_parallel_rank: int = 0
+    pipeline_model_parallel_size: int = 1
+    pipeline_model_parallel_group: Optional[object] = None
+    context_parallel_rank: int = 0
+    context_parallel_size: int = 1
+    context_parallel_group: Optional[object] = None
+    pp_layer_splits: Optional[tuple[int, ...]] = None
     capacity_factor: float = 1.0
-    expert_tp_size: int = 1
+    expert_tensor_parallel_size: int = 1
+    sequence_parallel: bool = True
 
     def __post_init__(self) -> None:
-        if self.tp_size <= 0:
-            raise ValueError("tp_size must be positive")
-        if self.ep_size <= 0:
-            raise ValueError("ep_size must be positive")
-        if self.tp_rank < 0 or self.tp_rank >= self.tp_size:
-            raise ValueError("tp_rank must be in [0, tp_size)")
-        if self.ep_rank < 0 or self.ep_rank >= self.ep_size:
-            raise ValueError("ep_rank must be in [0, ep_size)")
+        if self.tensor_model_parallel_size <= 0:
+            raise ValueError("tensor_model_parallel_size must be positive")
+        if self.expert_model_parallel_size <= 0:
+            raise ValueError("expert_model_parallel_size must be positive")
+        if self.pipeline_model_parallel_size <= 0:
+            raise ValueError("pipeline_model_parallel_size must be positive")
+        if self.context_parallel_size <= 0:
+            raise ValueError("context_parallel_size must be positive")
+
+        if (
+            self.tensor_model_parallel_rank < 0
+            or self.tensor_model_parallel_rank >= self.tensor_model_parallel_size
+        ):
+            raise ValueError(
+                "tensor_model_parallel_rank must be in [0, tensor_model_parallel_size)"
+            )
+        if (
+            self.expert_model_parallel_rank < 0
+            or self.expert_model_parallel_rank >= self.expert_model_parallel_size
+        ):
+            raise ValueError(
+                "expert_model_parallel_rank must be in [0, expert_model_parallel_size)"
+            )
+        if (
+            self.pipeline_model_parallel_rank < 0
+            or self.pipeline_model_parallel_rank >= self.pipeline_model_parallel_size
+        ):
+            raise ValueError(
+                "pipeline_model_parallel_rank must be in [0, pipeline_model_parallel_size)"
+            )
+        if self.context_parallel_rank < 0 or self.context_parallel_rank >= self.context_parallel_size:
+            raise ValueError("context_parallel_rank must be in [0, context_parallel_size)")
+
+        if self.pp_layer_splits is not None:
+            if len(self.pp_layer_splits) != self.pipeline_model_parallel_size + 1:
+                raise ValueError("pp_layer_splits length must be pipeline_model_parallel_size + 1")
+            if self.pp_layer_splits[0] != 0:
+                raise ValueError("pp_layer_splits must start with 0")
+            for idx in range(1, len(self.pp_layer_splits)):
+                if self.pp_layer_splits[idx] <= self.pp_layer_splits[idx - 1]:
+                    raise ValueError("pp_layer_splits must be strictly increasing")
         if self.capacity_factor <= 0:
             raise ValueError("capacity_factor must be positive")
-        if self.expert_tp_size != 1:
-            raise ValueError("DeepSeek routed experts currently require expert_tp_size=1")
+        if self.expert_tensor_parallel_size != 1:
+            raise ValueError(
+                "DeepSeek routed experts currently require expert_tensor_parallel_size=1"
+            )
+
+    def resolve_attention_tensor_model_parallel(self) -> Tuple[int, int, Optional[object]]:
+        """Resolve attention sharding to tensor model parallel domain."""
+        return (
+            self.tensor_model_parallel_rank,
+            self.tensor_model_parallel_size,
+            self.tensor_model_parallel_group,
+        )
+
+    def resolve_expert_model_parallel(self) -> Tuple[int, int, Optional[object]]:
+        """Resolve routed-expert sharding to expert model parallel domain."""
+        return (
+            self.expert_model_parallel_rank,
+            self.expert_model_parallel_size,
+            self.expert_model_parallel_group,
+        )
+
+    # Backward-compat aliases (one-release transition)
+    def resolve_attn_tp(self) -> Tuple[int, int, Optional[object]]:
+        return self.resolve_attention_tensor_model_parallel()
+
+    def resolve_moe_ep(self) -> Tuple[int, int, Optional[object]]:
+        return self.resolve_expert_model_parallel()
+
+    def resolve_pp_layer_boundaries(self, num_hidden_layers: int) -> tuple[int, ...]:
+        """Resolve global layer boundaries for PP stage partitioning."""
+        if num_hidden_layers <= 0:
+            raise ValueError("num_hidden_layers must be positive")
+
+        if self.pipeline_model_parallel_size == 1:
+            return (0, num_hidden_layers)
+
+        if self.pp_layer_splits is not None:
+            if self.pp_layer_splits[-1] != num_hidden_layers:
+                raise ValueError("pp_layer_splits last value must equal num_hidden_layers")
+            return self.pp_layer_splits
+
+        base = num_hidden_layers // self.pipeline_model_parallel_size
+        remainder = num_hidden_layers % self.pipeline_model_parallel_size
+        boundaries = [0]
+        cursor = 0
+        for stage in range(self.pipeline_model_parallel_size):
+            stage_size = base + (1 if stage < remainder else 0)
+            cursor += stage_size
+            boundaries.append(cursor)
+        return tuple(boundaries)
+
+    def resolve_pp_layer_range(self, num_hidden_layers: int) -> tuple[int, int]:
+        """Return local `[start, end)` layer range for this PP rank."""
+        boundaries = self.resolve_pp_layer_boundaries(num_hidden_layers)
+        rank = self.pipeline_model_parallel_rank
+        return boundaries[rank], boundaries[rank + 1]
+
+    # ------------------------------------------------------------------
+    # Backward-compat aliases (one-release transition)
+    # ------------------------------------------------------------------
+    @property
+    def tp_rank(self) -> int:
+        return self.tensor_model_parallel_rank
+
+    @property
+    def tp_size(self) -> int:
+        return self.tensor_model_parallel_size
+
+    @property
+    def tp_group(self):
+        return self.tensor_model_parallel_group
+
+    @property
+    def ep_rank(self) -> int:
+        return self.expert_model_parallel_rank
+
+    @property
+    def ep_size(self) -> int:
+        return self.expert_model_parallel_size
+
+    @property
+    def ep_group(self):
+        return self.expert_model_parallel_group
+
+    @property
+    def pp_rank(self) -> int:
+        return self.pipeline_model_parallel_rank
+
+    @property
+    def pp_size(self) -> int:
+        return self.pipeline_model_parallel_size
+
+    @property
+    def pp_group(self):
+        return self.pipeline_model_parallel_group
+
+    @property
+    def expert_tp_size(self) -> int:
+        return self.expert_tensor_parallel_size
+
+    @property
+    def enable_moe_sequence_parallel(self) -> bool:
+        return self.sequence_parallel
 
 
 class RMSNorm(nn.Module):
@@ -183,31 +327,31 @@ class GatedMLP(nn.Module):
     ):
         super().__init__()
         self.parallel_context = parallel_context or DeepSeekParallelContext()
-        self.use_tp = self.parallel_context.tp_size > 1
+        self.use_tp = self.parallel_context.tensor_model_parallel_size > 1
 
         if self.use_tp:
             self.gate_proj = ColumnParallelLinear(
                 hidden_size,
                 intermediate_size,
-                tp_rank=self.parallel_context.tp_rank,
-                tp_size=self.parallel_context.tp_size,
-                tp_group=self.parallel_context.tp_group,
+                tp_rank=self.parallel_context.tensor_model_parallel_rank,
+                tp_size=self.parallel_context.tensor_model_parallel_size,
+                tp_group=self.parallel_context.tensor_model_parallel_group,
                 bias=True,
             )
             self.up_proj = ColumnParallelLinear(
                 hidden_size,
                 intermediate_size,
-                tp_rank=self.parallel_context.tp_rank,
-                tp_size=self.parallel_context.tp_size,
-                tp_group=self.parallel_context.tp_group,
+                tp_rank=self.parallel_context.tensor_model_parallel_rank,
+                tp_size=self.parallel_context.tensor_model_parallel_size,
+                tp_group=self.parallel_context.tensor_model_parallel_group,
                 bias=True,
             )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
                 hidden_size,
-                tp_rank=self.parallel_context.tp_rank,
-                tp_size=self.parallel_context.tp_size,
-                tp_group=self.parallel_context.tp_group,
+                tp_rank=self.parallel_context.tensor_model_parallel_rank,
+                tp_size=self.parallel_context.tensor_model_parallel_size,
+                tp_group=self.parallel_context.tensor_model_parallel_group,
                 bias=True,
             )
             self.dropout = Dropout(dropout)
@@ -259,10 +403,25 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 class MultiHeadLatentAttention(nn.Module):
     """MLA-style attention approximation with low-rank Q/KV projections."""
 
-    def __init__(self, config: DeepSeekModelConfig):
+    def __init__(
+        self,
+        config: DeepSeekModelConfig,
+        parallel_context: Optional[DeepSeekParallelContext] = None,
+    ):
         super().__init__()
+        self.parallel_context = parallel_context or DeepSeekParallelContext()
+        (
+            self.attention_tensor_model_parallel_rank,
+            self.attention_tensor_model_parallel_size,
+            self.attention_tensor_model_parallel_group,
+        ) = (
+            self.parallel_context.resolve_attention_tensor_model_parallel()
+        )
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        if self.num_heads % self.attention_tensor_model_parallel_size != 0:
+            raise ValueError("num_attention_heads must be divisible by attention TP size")
+        self.local_num_heads = self.num_heads // self.attention_tensor_model_parallel_size
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
@@ -272,11 +431,21 @@ class MultiHeadLatentAttention(nn.Module):
 
         self.q_a_proj = Linear(self.hidden_size, config.q_lora_rank, bias=False)
         self.q_a_norm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.q_b_proj = Linear(
-            config.q_lora_rank,
-            self.num_heads * self.qk_head_dim,
-            bias=False,
-        )
+        if self.attention_tensor_model_parallel_size > 1:
+            self.q_b_proj = ColumnParallelLinear(
+                config.q_lora_rank,
+                self.num_heads * self.qk_head_dim,
+                tp_rank=self.attention_tensor_model_parallel_rank,
+                tp_size=self.attention_tensor_model_parallel_size,
+                tp_group=self.attention_tensor_model_parallel_group,
+                bias=False,
+            )
+        else:
+            self.q_b_proj = Linear(
+                config.q_lora_rank,
+                self.num_heads * self.qk_head_dim,
+                bias=False,
+            )
 
         self.kv_a_proj = Linear(
             self.hidden_size,
@@ -284,13 +453,30 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
         )
         self.kv_a_norm = RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = Linear(
-            config.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-        )
-
-        self.out_proj = Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
+        if self.attention_tensor_model_parallel_size > 1:
+            self.kv_b_proj = ColumnParallelLinear(
+                config.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                tp_rank=self.attention_tensor_model_parallel_rank,
+                tp_size=self.attention_tensor_model_parallel_size,
+                tp_group=self.attention_tensor_model_parallel_group,
+                bias=False,
+            )
+            self.out_proj = RowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                tp_rank=self.attention_tensor_model_parallel_rank,
+                tp_size=self.attention_tensor_model_parallel_size,
+                tp_group=self.attention_tensor_model_parallel_group,
+                bias=False,
+            )
+        else:
+            self.kv_b_proj = Linear(
+                config.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=False,
+            )
+            self.out_proj = Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
         self.dropout = Dropout(config.attention_dropout)
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -299,7 +485,8 @@ class MultiHeadLatentAttention(nn.Module):
 
         q_latent = self.q_a_proj(x)
         q = self.q_b_proj(self.q_a_norm(q_latent))
-        q = q.view(batch_size, seq_len, self.num_heads, self.qk_head_dim)
+        # Under attention TP, local projection output is only the local head shard.
+        q = q.view(batch_size, seq_len, self.local_num_heads, self.qk_head_dim)
         q = q.permute(0, 2, 1, 3)  # (B, heads, S, qk_head_dim)
         q_nope, q_rope = torch.split(
             q,
@@ -314,11 +501,16 @@ class MultiHeadLatentAttention(nn.Module):
             dim=-1,
         )
         kv = self.kv_b_proj(self.kv_a_norm(kv_latent))
-        kv = kv.view(batch_size, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        kv = kv.view(
+            batch_size,
+            seq_len,
+            self.local_num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
         kv = kv.permute(0, 2, 1, 3)  # (B, heads, S, qk_nope+v)
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        k_rope = k_rope_shared.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        k_rope = k_rope_shared.unsqueeze(1).expand(-1, self.local_num_heads, -1, -1)
         cos, sin = _build_rope_cache(
             seq_len=seq_len,
             dim=self.qk_rope_head_dim,
@@ -339,7 +531,7 @@ class MultiHeadLatentAttention(nn.Module):
 
         out = torch.matmul(probs, v)
         out = out.permute(0, 2, 1, 3).contiguous()
-        out = out.view(batch_size, seq_len, self.num_heads * self.v_head_dim)
+        out = out.view(batch_size, seq_len, self.local_num_heads * self.v_head_dim)
         return self.out_proj(out)
 
 
@@ -353,6 +545,15 @@ class RoutedMoE(nn.Module):
     ):
         super().__init__()
         self.parallel_context = parallel_context or DeepSeekParallelContext()
+        (
+            self.expert_model_parallel_rank,
+            self.expert_model_parallel_size,
+            self.expert_model_parallel_group,
+        ) = self.parallel_context.resolve_expert_model_parallel()
+        self.use_moe_sequence_parallel = (
+            self.parallel_context.sequence_parallel
+            and self.parallel_context.tensor_model_parallel_size > 1
+        )
         shared_kwargs = {
             "hidden_size": config.hidden_size,
             "expert_intermediate_size": config.moe_intermediate_size,
@@ -368,19 +569,37 @@ class RoutedMoE(nn.Module):
             "capacity_factor": self.parallel_context.capacity_factor,
         }
 
-        if self.parallel_context.ep_size > 1:
+        if self.expert_model_parallel_size > 1:
             self.moe = ExpertParallelMoE(
                 **shared_kwargs,
-                ep_rank=self.parallel_context.ep_rank,
-                ep_size=self.parallel_context.ep_size,
-                ep_group=self.parallel_context.ep_group,
-                expert_tp_size=self.parallel_context.expert_tp_size,
+                ep_rank=self.expert_model_parallel_rank,
+                ep_size=self.expert_model_parallel_size,
+                ep_group=self.expert_model_parallel_group,
+                expert_tp_size=self.parallel_context.expert_tensor_parallel_size,
             )
         else:
             self.moe = LocalRoutedMoE(**shared_kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.moe(x)
+        if not self.use_moe_sequence_parallel:
+            return self.moe(x)
+
+        # Avoid duplicate MoE token compute across TP ranks by sharding sequence on TP.
+        local_x = scatter_to_sequence_parallel_region(
+            x,
+            tp_rank=self.parallel_context.tensor_model_parallel_rank,
+            tp_size=self.parallel_context.tensor_model_parallel_size,
+            tp_group=self.parallel_context.tensor_model_parallel_group,
+            seq_dim=1,
+        )
+        local_out = self.moe(local_x)
+        return gather_from_sequence_parallel_region(
+            local_out,
+            tp_rank=self.parallel_context.tensor_model_parallel_rank,
+            tp_size=self.parallel_context.tensor_model_parallel_size,
+            tp_group=self.parallel_context.tensor_model_parallel_group,
+            seq_dim=1,
+        )
 
 
 class DeepSeekDecoderBlock(nn.Module):
@@ -395,7 +614,7 @@ class DeepSeekDecoderBlock(nn.Module):
         super().__init__()
         self.parallel_context = parallel_context or DeepSeekParallelContext()
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn = MultiHeadLatentAttention(config)
+        self.attn = MultiHeadLatentAttention(config, parallel_context=self.parallel_context)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         use_dense = layer_idx < config.first_k_dense_replace
@@ -440,21 +659,53 @@ class DeepSeekModel(nn.Module):
         super().__init__()
         self.config = config
         self.parallel_context = parallel_context or DeepSeekParallelContext()
+        _, attention_tensor_model_parallel_size, _ = (
+            self.parallel_context.resolve_attention_tensor_model_parallel()
+        )
+        _, expert_model_parallel_size, _ = self.parallel_context.resolve_expert_model_parallel()
+        self.pipeline_model_parallel_rank = self.parallel_context.pipeline_model_parallel_rank
+        self.pipeline_model_parallel_size = self.parallel_context.pipeline_model_parallel_size
+        self.pipeline_model_parallel_group = self.parallel_context.pipeline_model_parallel_group
+        self.pipeline_layer_start, self.pipeline_layer_end = self.parallel_context.resolve_pp_layer_range(
+            config.num_hidden_layers
+        )
+        self.pipeline_layer_boundaries = self.parallel_context.resolve_pp_layer_boundaries(
+            config.num_hidden_layers
+        )
 
         if (
-            self.parallel_context.tp_size > 1
-            and config.intermediate_size % self.parallel_context.tp_size != 0
+            self.parallel_context.tensor_model_parallel_size > 1
+            and config.intermediate_size % self.parallel_context.tensor_model_parallel_size != 0
         ):
-            raise ValueError("intermediate_size must be divisible by tp_size for TP dense FFN")
+            raise ValueError(
+                "intermediate_size must be divisible by tensor_model_parallel_size for TP dense FFN"
+            )
         if (
-            self.parallel_context.ep_size > 1
-            and config.n_routed_experts % self.parallel_context.ep_size != 0
+            attention_tensor_model_parallel_size > 1
+            and config.num_attention_heads % attention_tensor_model_parallel_size != 0
         ):
-            raise ValueError("n_routed_experts must be divisible by ep_size for EP MoE")
+            raise ValueError("num_attention_heads must be divisible by attention TP size")
+        if expert_model_parallel_size > 1 and config.n_routed_experts % expert_model_parallel_size != 0:
+            raise ValueError(
+                "n_routed_experts must be divisible by expert_model_parallel_size for EP MoE"
+            )
+        if self.pipeline_layer_end <= self.pipeline_layer_start:
+            raise ValueError("Each PP stage must own at least one decoder layer")
+        if config.tie_word_embeddings and self.pipeline_model_parallel_size > 1:
+            raise ValueError(
+                "tie_word_embeddings is not supported when pipeline_model_parallel_size > 1"
+            )
 
-        self.token_embeddings = Embedding(config.vocab_size, config.hidden_size)
-        self.dropout = Dropout(config.dropout)
+        self.token_embeddings: Optional[Embedding]
+        self.dropout: Optional[Dropout]
+        if self.is_first_pp_stage:
+            self.token_embeddings = Embedding(config.vocab_size, config.hidden_size)
+            self.dropout = Dropout(config.dropout)
+        else:
+            self.token_embeddings = None
+            self.dropout = None
 
+        # Local stage owns only [pipeline_layer_start, pipeline_layer_end) decoder blocks.
         self.blocks = nn.ModuleList(
             [
                 DeepSeekDecoderBlock(
@@ -462,19 +713,26 @@ class DeepSeekModel(nn.Module):
                     i,
                     parallel_context=self.parallel_context,
                 )
-                for i in range(config.num_hidden_layers)
+                for i in range(self.pipeline_layer_start, self.pipeline_layer_end)
             ]
         )
-        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.token_embeddings.weight
+        self.final_norm: Optional[RMSNorm]
+        self.lm_head: Optional[Linear]
+        if self.is_last_pp_stage:
+            self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        else:
+            self.final_norm = None
+            self.lm_head = None
 
         self.apply(self._init_weights)
 
+        if config.tie_word_embeddings and self.token_embeddings is not None and self.lm_head is not None:
+            self.lm_head.weight = self.token_embeddings.weight
+
     def _init_weights(self, module: nn.Module) -> None:
-        if isinstance(module, Linear):
+        if isinstance(module, (Linear, ColumnParallelLinear, RowParallelLinear)):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -493,24 +751,79 @@ class DeepSeekModel(nn.Module):
         mask = torch.triu(mask, diagonal=1)
         return mask.view(1, 1, seq_len, seq_len).expand(batch_size, -1, -1, -1)
 
+    @property
+    def is_first_pp_stage(self) -> bool:
+        """True when this rank owns the first PP stage."""
+        return self.pipeline_model_parallel_rank == 0
+
+    @property
+    def is_last_pp_stage(self) -> bool:
+        """True when this rank owns the last PP stage."""
+        return self.pipeline_model_parallel_rank == self.pipeline_model_parallel_size - 1
+
+    def local_layer_range(self) -> tuple[int, int]:
+        """Return local global-layer range `[start, end)` owned by this PP rank."""
+        return self.pipeline_layer_start, self.pipeline_layer_end
+
+    def forward_stage(
+        self,
+        input_ids: Optional[torch.Tensor],
+        hidden_states: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Run local stage forward for pipeline execution.
+
+        - First stage consumes `input_ids` and returns hidden states (or logits if pipeline size=1).
+        - Middle stages consume hidden states and return hidden states.
+        - Last stage consumes hidden states and returns logits.
+        """
+        x: torch.Tensor
+
+        if self.is_first_pp_stage:
+            if input_ids is None:
+                raise ValueError("input_ids is required on the first PP stage")
+            if self.token_embeddings is None or self.dropout is None:
+                raise RuntimeError("First PP stage is missing embedding modules")
+            batch_size, seq_len = input_ids.shape
+            x = self.token_embeddings(input_ids)
+            x = self.dropout(x)
+        else:
+            if hidden_states is None:
+                raise ValueError("hidden_states is required on non-first PP stages")
+            batch_size, seq_len, _ = hidden_states.shape
+            x = hidden_states
+
+        if attention_mask is None:
+            attention_mask = self._create_causal_mask(batch_size, seq_len, x.device)
+
+        for block in self.blocks:
+            x = block(x, attention_mask)
+
+        if self.is_last_pp_stage:
+            if self.final_norm is None or self.lm_head is None:
+                raise RuntimeError("Last PP stage is missing output modules")
+            x = self.final_norm(x)
+            return self.lm_head(x)
+
+        return x
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # input_ids: (B, S)
-        batch_size, seq_len = input_ids.shape
-        x = self.token_embeddings(input_ids)
-        x = self.dropout(x)
-
-        if attention_mask is None:
-            attention_mask = self._create_causal_mask(batch_size, seq_len, input_ids.device)
-
-        for block in self.blocks:
-            x = block(x, attention_mask)
-
-        x = self.final_norm(x)
-        return self.lm_head(x)
+        # Keep single-stage behavior unchanged.
+        if self.pipeline_model_parallel_size > 1:
+            raise RuntimeError(
+                "forward() is only valid for pipeline_model_parallel_size==1; "
+                "use forward_stage() for PP"
+            )
+        return self.forward_stage(
+            input_ids=input_ids,
+            hidden_states=None,
+            attention_mask=attention_mask,
+        )
 
     @property
     def num_parameters(self) -> int:

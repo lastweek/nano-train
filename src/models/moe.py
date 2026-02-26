@@ -27,6 +27,42 @@ class RouterOutput:
     dropped_fraction: float
 
 
+@dataclass
+class _DispatchPlan:
+    """Per-destination payloads prepared before EP token dispatch."""
+
+    send_tokens: list[torch.Tensor]
+    send_token_idx: list[torch.Tensor]
+    send_slot_idx: list[torch.Tensor]
+    send_local_expert_idx: list[torch.Tensor]
+    send_sort_weight: list[torch.Tensor]
+    send_counts: list[int]
+
+
+@dataclass
+class _DispatchedTokens:
+    """Tokens and metadata received by this rank after dispatch."""
+
+    recv_tokens: torch.Tensor
+    recv_token_idx: torch.Tensor
+    recv_slot_idx: torch.Tensor
+    recv_local_expert_idx: torch.Tensor
+    recv_sort_weight: torch.Tensor
+    recv_src_ranks: torch.Tensor
+
+
+@dataclass
+class _ReturnPayload:
+    """Expert outputs and metadata that will be sent back to source ranks."""
+
+    send_back_features: list[torch.Tensor]
+    send_back_token_idx: list[torch.Tensor]
+    send_back_slot_idx: list[torch.Tensor]
+    dropped: int
+    local_counts: torch.Tensor
+    autograd_fallback: torch.Tensor
+
+
 class ExpertMLP(nn.Module):
     """SwiGLU expert MLP used by routed MoE layers."""
 
@@ -112,7 +148,15 @@ class TopKRouter(nn.Module):
         return torch.where(expert_mask, scores, neg_inf)
 
     def _compute_aux_loss(self, scores: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
-        """Compute a simple load-balancing auxiliary loss."""
+        """
+        Compute expert-level load-balance auxiliary loss (DeepSeekMoE-style proxy).
+
+        This implements L_exp = N * sum_i(f_i * P_i), where:
+        - f_i uses realized top-k assignments (count_i / (K*T))
+        - P_i uses mean router probability for expert i
+
+        Note: device-level balance loss is documented but not added in this tutorial code.
+        """
         if scores.numel() == 0:
             return torch.zeros((), dtype=scores.dtype, device=scores.device)
 
@@ -121,10 +165,14 @@ class TopKRouter(nn.Module):
         else:
             normed_scores = scores
 
+        # One-hot top-k selections: [T, K, N].
         assignments = F.one_hot(topk_indices, num_classes=self.num_experts).float()
+        # Per-token selection mass: selected experts get 1/K, others 0. Shape [T, N].
         assignments = assignments.mean(dim=1)
 
+        # f_i proxy in [0, +): mean selected mass per expert over tokens.
         expert_fraction = assignments.mean(dim=0)
+        # P_i proxy: mean router probability per expert over tokens.
         expert_prob = normed_scores.mean(dim=0)
 
         aux_loss = (expert_fraction * expert_prob).sum() * float(self.num_experts)
@@ -316,6 +364,13 @@ class ExpertParallelMoE(nn.Module):
     Expert-parallel routed MoE with autograd-safe all-to-all dispatch/return.
 
     Experts are explicitly TP=1 (no tensor-parallel sharding inside expert MLPs).
+
+    Tensor notation used by comments in this class:
+    - B: DP-local batch, B_ep: EP-local batch shard, S: sequence length, H: hidden size
+    - T = B_ep * S (local flattened tokens), K = top_k, A = T * K (token-expert assignments)
+    - N_r: assignments sent to destination rank r
+    - N_recv: assignments received on this rank after dispatch all-to-all
+    - N_back: returned expert outputs received by source rank in combine all-to-all
     """
 
     def __init__(
@@ -440,8 +495,9 @@ class ExpertParallelMoE(nn.Module):
         tokens: torch.Tensor,
         topk_indices: torch.Tensor,
         topk_weights: torch.Tensor,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[int]]:
-        """Build per-destination EP send tensors for token dispatch."""
+    ) -> _DispatchPlan:
+        """Build per-destination dispatch payloads from routed token assignments."""
+        # topk_indices/topk_weights: [T, K] -> flatten into A = T*K assignments.
         num_tokens = tokens.size(0)
         token_indices = torch.arange(num_tokens, device=tokens.device, dtype=torch.long)
         token_indices = token_indices.repeat_interleave(self.top_k)
@@ -452,9 +508,11 @@ class ExpertParallelMoE(nn.Module):
         expert_indices = topk_indices.reshape(-1)
         sort_weights = topk_weights.detach().reshape(-1)
 
+        # Map global expert id -> EP destination rank + local expert id on that rank.
         destination_ranks = expert_indices // self.experts_per_rank
         local_expert_indices = expert_indices % self.experts_per_rank
 
+        # Repeat tokens so each (token, selected expert) assignment carries its own payload.
         dispatched_tokens = tokens[token_indices]
 
         send_tokens: list[torch.Tensor] = []
@@ -465,20 +523,22 @@ class ExpertParallelMoE(nn.Module):
 
         for dst_rank in range(self.ep_size):
             mask = destination_ranks == dst_rank
+            # send_*[dst_rank] has shape [N_r, ...].
             send_tokens.append(dispatched_tokens[mask])
             send_token_idx.append(token_indices[mask])
             send_slot_idx.append(slot_indices[mask])
             send_local_expert_idx.append(local_expert_indices[mask])
             send_sort_weight.append(sort_weights[mask])
 
+        # send_counts[dst_rank] == N_r
         send_counts = [int(tensor.size(0)) for tensor in send_tokens]
-        return (
-            send_tokens,
-            send_token_idx,
-            send_slot_idx,
-            send_local_expert_idx,
-            send_sort_weight,
-            send_counts,
+        return _DispatchPlan(
+            send_tokens=send_tokens,
+            send_token_idx=send_token_idx,
+            send_slot_idx=send_slot_idx,
+            send_local_expert_idx=send_local_expert_idx,
+            send_sort_weight=send_sort_weight,
+            send_counts=send_counts,
         )
 
     def _exchange_counts(self, send_counts: list[int], device: torch.device) -> list[int]:
@@ -488,7 +548,12 @@ class ExpertParallelMoE(nn.Module):
         dist.all_to_all_single(recv_counts_tensor, send_counts_tensor, group=self.ep_group)
         return [int(value) for value in recv_counts_tensor.tolist()]
 
-    def _flatten_splits(self, tensors: list[torch.Tensor], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    def _flatten_splits(
+        self,
+        tensors: list[torch.Tensor],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
         """Concatenate list of split tensors, returning an empty tensor when all are empty."""
         if not tensors:
             return torch.empty(0, dtype=dtype, device=device)
@@ -496,6 +561,22 @@ class ExpertParallelMoE(nn.Module):
         if not non_empty:
             return torch.empty(0, dtype=dtype, device=device)
         return torch.cat(non_empty, dim=0)
+
+    def _flatten_splits_for_autograd(
+        self,
+        tensors: list[torch.Tensor],
+        fallback: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Concatenate split tensors while preserving autograd connectivity on empty sends.
+
+        When all splits are empty we return `fallback[:0]` so the send tensor stays attached to
+        the current graph.
+        """
+        non_empty = [tensor for tensor in tensors if tensor.numel() > 0]
+        if non_empty:
+            return torch.cat(non_empty, dim=0)
+        return fallback[:0]
 
     def _all_to_all_metadata(
         self,
@@ -534,6 +615,251 @@ class ExpertParallelMoE(nn.Module):
             group=self.ep_group,
         )
 
+    def _dispatch_tokens(
+        self,
+        tokens: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> _DispatchedTokens:
+        """Dispatch routed token copies and metadata to expert-owner ranks."""
+        plan = self._build_send_partitions(tokens, topk_indices, topk_weights)
+        recv_counts = self._exchange_counts(plan.send_counts, device=tokens.device)
+
+        # A2A #1 (dispatch): token payloads move from source EP rank -> expert-owner EP rank.
+        # recv_tokens shape: [N_recv, H].
+        recv_tokens = self._all_to_all_autograd(
+            send_tensor=self._flatten_splits(plan.send_tokens, tokens.dtype, tokens.device),
+            send_counts=plan.send_counts,
+            recv_counts=recv_counts,
+            output_shape_tail=(self.hidden_size,),
+        )
+
+        # Metadata A2A mirrors payload routing; each tensor below has shape [N_recv].
+        recv_token_idx = self._all_to_all_metadata(
+            send_tensor=self._flatten_splits(plan.send_token_idx, torch.long, tokens.device),
+            send_counts=plan.send_counts,
+            recv_counts=recv_counts,
+        )
+        recv_slot_idx = self._all_to_all_metadata(
+            send_tensor=self._flatten_splits(plan.send_slot_idx, torch.long, tokens.device),
+            send_counts=plan.send_counts,
+            recv_counts=recv_counts,
+        )
+        recv_local_expert_idx = self._all_to_all_metadata(
+            send_tensor=self._flatten_splits(
+                plan.send_local_expert_idx,
+                torch.long,
+                tokens.device,
+            ),
+            send_counts=plan.send_counts,
+            recv_counts=recv_counts,
+        )
+        recv_sort_weight = self._all_to_all_metadata(
+            send_tensor=self._flatten_splits(plan.send_sort_weight, tokens.dtype, tokens.device),
+            send_counts=plan.send_counts,
+            recv_counts=recv_counts,
+        )
+
+        src_rank_ids = torch.arange(self.ep_size, dtype=torch.long, device=tokens.device)
+        recv_counts_tensor = torch.tensor(recv_counts, dtype=torch.long, device=tokens.device)
+        # recv_src_ranks marks which source EP rank each received assignment came from.
+        recv_src_ranks = torch.repeat_interleave(src_rank_ids, recv_counts_tensor)
+
+        return _DispatchedTokens(
+            recv_tokens=recv_tokens,
+            recv_token_idx=recv_token_idx,
+            recv_slot_idx=recv_slot_idx,
+            recv_local_expert_idx=recv_local_expert_idx,
+            recv_sort_weight=recv_sort_weight,
+            recv_src_ranks=recv_src_ranks,
+        )
+
+    def _materialize_rank_splits(
+        self,
+        rank_parts: list[list[torch.Tensor]],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        feature_width: int | None = None,
+    ) -> list[torch.Tensor]:
+        """Materialize per-rank split lists into dense tensors."""
+        result: list[torch.Tensor] = []
+        for parts in rank_parts:
+            if parts:
+                result.append(torch.cat(parts, dim=0))
+                continue
+
+            if feature_width is None:
+                result.append(torch.empty(0, dtype=dtype, device=device))
+            else:
+                result.append(
+                    torch.empty((0, feature_width), dtype=dtype, device=device),
+                )
+        return result
+
+    def _run_local_experts(
+        self,
+        dispatched: _DispatchedTokens,
+        capacity: int,
+        *,
+        token_dtype: torch.dtype,
+        device: torch.device,
+    ) -> _ReturnPayload:
+        """
+        Run local experts and stage outputs for return all-to-all.
+
+        This is the "compute" stage in the dispatch/compute/combine pipeline.
+        """
+        send_back_features_parts: list[list[torch.Tensor]] = [[] for _ in range(self.ep_size)]
+        send_back_token_idx_parts: list[list[torch.Tensor]] = [[] for _ in range(self.ep_size)]
+        send_back_slot_idx_parts: list[list[torch.Tensor]] = [[] for _ in range(self.ep_size)]
+
+        dropped = 0
+        local_counts = torch.zeros(self.experts_per_rank, dtype=torch.long, device=device)
+
+        for local_expert_idx, expert in enumerate(self.experts):
+            # selected: indices into [N_recv] assignments routed to this local expert.
+            selected = (dispatched.recv_local_expert_idx == local_expert_idx).nonzero(
+                as_tuple=False
+            )
+            if selected.numel() == 0:
+                continue
+
+            selected = selected.squeeze(-1)
+            sort_weights = dispatched.recv_sort_weight[selected]
+
+            if capacity > 0 and selected.numel() > capacity:
+                # Capacity keeps highest routing weights for this expert on this rank.
+                keep_rel = torch.topk(sort_weights, k=capacity, sorted=True).indices
+                dropped += int(selected.numel() - keep_rel.numel())
+                selected = selected[keep_rel]
+
+            # Expert compute: [N_keep, H] -> [N_keep, H].
+            expert_output = expert(dispatched.recv_tokens[selected])
+            src_ranks = dispatched.recv_src_ranks[selected]
+            src_token_idx = dispatched.recv_token_idx[selected]
+            src_slot_idx = dispatched.recv_slot_idx[selected]
+
+            for src_rank in range(self.ep_size):
+                src_mask = src_ranks == src_rank
+                if not bool(src_mask.any()):
+                    continue
+                # Stage outputs/metadata by source rank for return A2A.
+                send_back_features_parts[src_rank].append(expert_output[src_mask])
+                send_back_token_idx_parts[src_rank].append(src_token_idx[src_mask])
+                send_back_slot_idx_parts[src_rank].append(src_slot_idx[src_mask])
+
+            local_counts[local_expert_idx] = selected.numel()
+
+        return _ReturnPayload(
+            send_back_features=self._materialize_rank_splits(
+                send_back_features_parts,
+                dtype=token_dtype,
+                device=device,
+                feature_width=self.hidden_size,
+            ),
+            send_back_token_idx=self._materialize_rank_splits(
+                send_back_token_idx_parts,
+                dtype=torch.long,
+                device=device,
+            ),
+            send_back_slot_idx=self._materialize_rank_splits(
+                send_back_slot_idx_parts,
+                dtype=torch.long,
+                device=device,
+            ),
+            dropped=dropped,
+            local_counts=local_counts,
+            autograd_fallback=dispatched.recv_tokens,
+        )
+
+    def _combine_remote_outputs(
+        self,
+        tokens: torch.Tensor,
+        topk_weights: torch.Tensor,
+        payload: _ReturnPayload,
+    ) -> tuple[torch.Tensor, int, int]:
+        """
+        Return expert outputs to source ranks and combine into final token outputs.
+
+        This is the "combine" stage in the dispatch/compute/combine pipeline.
+        """
+        send_back_counts = [int(tensor.size(0)) for tensor in payload.send_back_features]
+        recv_back_counts = self._exchange_counts(send_back_counts, device=tokens.device)
+
+        # A2A #2 (return): send expert outputs back to original source ranks.
+        # recv_back_features shape: [N_back, H].
+        recv_back_features = self._all_to_all_autograd(
+            send_tensor=self._flatten_splits_for_autograd(
+                payload.send_back_features,
+                fallback=payload.autograd_fallback,
+            ),
+            send_counts=send_back_counts,
+            recv_counts=recv_back_counts,
+            output_shape_tail=(self.hidden_size,),
+        )
+
+        send_back_token_idx_flat = self._flatten_splits(
+            payload.send_back_token_idx,
+            torch.long,
+            tokens.device,
+        )
+        send_back_slot_idx_flat = self._flatten_splits(
+            payload.send_back_slot_idx,
+            torch.long,
+            tokens.device,
+        )
+
+        recv_back_token_idx = self._all_to_all_metadata(
+            send_tensor=send_back_token_idx_flat,
+            send_counts=send_back_counts,
+            recv_counts=recv_back_counts,
+        )
+        recv_back_slot_idx = self._all_to_all_metadata(
+            send_tensor=send_back_slot_idx_flat,
+            send_counts=send_back_counts,
+            recv_counts=recv_back_counts,
+        )
+
+        # Combine: map each returned expert output to (token_idx, topk slot) and sum into [T, H].
+        output_tokens = torch.zeros_like(tokens)
+        if recv_back_features.numel() > 0:
+            recv_weights = topk_weights[recv_back_token_idx, recv_back_slot_idx]
+            recv_weighted = recv_back_features * recv_weights.unsqueeze(-1)
+            output_tokens.index_add_(0, recv_back_token_idx, recv_weighted)
+
+        local_total_assignments = float(topk_weights.numel())
+        stats = torch.tensor(
+            [float(payload.dropped), local_total_assignments],
+            device=tokens.device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=self.ep_group)
+        dropped = int(stats[0].item())
+        total_assignments = int(stats[1].item())
+        return output_tokens, dropped, total_assignments
+
+    def _forward_multi_rank(
+        self,
+        tokens: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        capacity: int,
+    ) -> tuple[torch.Tensor, int, int, torch.Tensor]:
+        """Run EP multi-rank forward via dispatch -> local compute -> combine stages."""
+        dispatched = self._dispatch_tokens(tokens, topk_indices, topk_weights)
+        payload = self._run_local_experts(
+            dispatched,
+            capacity,
+            token_dtype=tokens.dtype,
+            device=tokens.device,
+        )
+        output_tokens, dropped, total_assignments = self._combine_remote_outputs(
+            tokens,
+            topk_weights,
+            payload,
+        )
+        return output_tokens, dropped, total_assignments, payload.local_counts
+
     def _forward_single_rank(
         self,
         tokens: torch.Tensor,
@@ -542,6 +868,7 @@ class ExpertParallelMoE(nn.Module):
         capacity: int,
     ) -> tuple[torch.Tensor, int, int, torch.Tensor]:
         """Fallback local execution path when ep_size == 1."""
+        # Single-rank equivalent of dispatch -> compute -> combine without collectives.
         output_tokens = torch.zeros_like(tokens)
         dropped = 0
         local_counts = torch.zeros(self.experts_per_rank, dtype=torch.long, device=tokens.device)
@@ -571,7 +898,7 @@ class ExpertParallelMoE(nn.Module):
         return output_tokens, dropped, total_assignments, local_counts
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply expert-parallel routed MoE to input tensors shaped [B, S, H]."""
+        """Apply expert-parallel routed MoE to input tensors shaped `[batch, seq, hidden]`."""
         if x.dim() != 3:
             raise ValueError("x must have shape [batch, seq, hidden]")
 
@@ -582,11 +909,14 @@ class ExpertParallelMoE(nn.Module):
         if self.ep_size > 1:
             self._require_distributed()
 
+        # x: [B_ep, S, H] -> tokens: [T, H], where T = B_ep * S.
         tokens = x.reshape(-1, hidden_size)
         router_output = self.router(tokens)
+        # Router outputs are per-token top-k assignments: [T, K].
         topk_indices = router_output.topk_indices
         topk_weights = router_output.topk_weights
 
+        # capacity is per expert for this step, computed from global EP token count.
         capacity = self._compute_capacity(tokens.size(0), device=tokens.device)
 
         if self.ep_size == 1:
@@ -597,150 +927,12 @@ class ExpertParallelMoE(nn.Module):
                 capacity=capacity,
             )
         else:
-            (
-                send_tokens,
-                send_token_idx,
-                send_slot_idx,
-                send_local_expert_idx,
-                send_sort_weight,
-                send_counts,
-            ) = self._build_send_partitions(tokens, topk_indices, topk_weights)
-
-            recv_counts = self._exchange_counts(send_counts, device=tokens.device)
-            send_token_flat = self._flatten_splits(send_tokens, tokens.dtype, tokens.device)
-            recv_tokens = self._all_to_all_autograd(
-                send_tensor=send_token_flat,
-                send_counts=send_counts,
-                recv_counts=recv_counts,
-                output_shape_tail=(hidden_size,),
+            output_tokens, dropped, total_assignments, local_counts = self._forward_multi_rank(
+                tokens=tokens,
+                topk_indices=topk_indices,
+                topk_weights=topk_weights,
+                capacity=capacity,
             )
-
-            send_token_idx_flat = self._flatten_splits(send_token_idx, torch.long, tokens.device)
-            send_slot_idx_flat = self._flatten_splits(send_slot_idx, torch.long, tokens.device)
-            send_local_expert_flat = self._flatten_splits(send_local_expert_idx, torch.long, tokens.device)
-            send_sort_weight_flat = self._flatten_splits(send_sort_weight, tokens.dtype, tokens.device)
-
-            recv_token_idx_flat = self._all_to_all_metadata(
-                send_tensor=send_token_idx_flat,
-                send_counts=send_counts,
-                recv_counts=recv_counts,
-            )
-            recv_slot_idx_flat = self._all_to_all_metadata(
-                send_tensor=send_slot_idx_flat,
-                send_counts=send_counts,
-                recv_counts=recv_counts,
-            )
-            recv_local_expert_flat = self._all_to_all_metadata(
-                send_tensor=send_local_expert_flat,
-                send_counts=send_counts,
-                recv_counts=recv_counts,
-            )
-            recv_sort_weight_flat = self._all_to_all_metadata(
-                send_tensor=send_sort_weight_flat,
-                send_counts=send_counts,
-                recv_counts=recv_counts,
-            )
-
-            src_rank_ids = torch.arange(self.ep_size, dtype=torch.long, device=tokens.device)
-            recv_counts_tensor = torch.tensor(recv_counts, dtype=torch.long, device=tokens.device)
-            recv_src_ranks = torch.repeat_interleave(src_rank_ids, recv_counts_tensor)
-
-            send_back_features_parts: list[list[torch.Tensor]] = [[] for _ in range(self.ep_size)]
-            send_back_token_idx_parts: list[list[torch.Tensor]] = [[] for _ in range(self.ep_size)]
-            send_back_slot_idx_parts: list[list[torch.Tensor]] = [[] for _ in range(self.ep_size)]
-
-            dropped = 0
-            local_counts = torch.zeros(self.experts_per_rank, dtype=torch.long, device=tokens.device)
-
-            for local_expert_idx, expert in enumerate(self.experts):
-                selected = (recv_local_expert_flat == local_expert_idx).nonzero(as_tuple=False)
-                if selected.numel() == 0:
-                    continue
-
-                selected = selected.squeeze(-1)
-                sort_weights = recv_sort_weight_flat[selected]
-
-                if capacity > 0 and selected.numel() > capacity:
-                    keep_rel = torch.topk(sort_weights, k=capacity, sorted=True).indices
-                    selected = selected[keep_rel]
-                    dropped += sort_weights.numel() - capacity
-
-                expert_input = recv_tokens[selected]
-                expert_output = expert(expert_input)
-
-                src_ranks = recv_src_ranks[selected]
-                src_token_idx = recv_token_idx_flat[selected]
-                src_slot_idx = recv_slot_idx_flat[selected]
-
-                for src_rank in range(self.ep_size):
-                    src_mask = src_ranks == src_rank
-                    if not bool(src_mask.any()):
-                        continue
-                    send_back_features_parts[src_rank].append(expert_output[src_mask])
-                    send_back_token_idx_parts[src_rank].append(src_token_idx[src_mask])
-                    send_back_slot_idx_parts[src_rank].append(src_slot_idx[src_mask])
-
-                local_counts[local_expert_idx] = selected.numel()
-
-            send_back_features = [
-                torch.cat(parts, dim=0)
-                if parts
-                else torch.empty((0, hidden_size), dtype=tokens.dtype, device=tokens.device)
-                for parts in send_back_features_parts
-            ]
-            send_back_token_idx = [
-                torch.cat(parts, dim=0)
-                if parts
-                else torch.empty(0, dtype=torch.long, device=tokens.device)
-                for parts in send_back_token_idx_parts
-            ]
-            send_back_slot_idx = [
-                torch.cat(parts, dim=0)
-                if parts
-                else torch.empty(0, dtype=torch.long, device=tokens.device)
-                for parts in send_back_slot_idx_parts
-            ]
-
-            send_back_counts = [int(tensor.size(0)) for tensor in send_back_features]
-            recv_back_counts = self._exchange_counts(send_back_counts, device=tokens.device)
-            non_empty_back = [tensor for tensor in send_back_features if tensor.numel() > 0]
-            if non_empty_back:
-                send_back_feature_flat = torch.cat(non_empty_back, dim=0)
-            else:
-                # Keep autograd graph connectivity even for zero-token ranks.
-                send_back_feature_flat = recv_tokens[:0]
-            recv_back_features = self._all_to_all_autograd(
-                send_tensor=send_back_feature_flat,
-                send_counts=send_back_counts,
-                recv_counts=recv_back_counts,
-                output_shape_tail=(hidden_size,),
-            )
-
-            send_back_token_idx_flat = self._flatten_splits(send_back_token_idx, torch.long, tokens.device)
-            send_back_slot_idx_flat = self._flatten_splits(send_back_slot_idx, torch.long, tokens.device)
-
-            recv_back_token_idx_flat = self._all_to_all_metadata(
-                send_tensor=send_back_token_idx_flat,
-                send_counts=send_back_counts,
-                recv_counts=recv_back_counts,
-            )
-            recv_back_slot_idx_flat = self._all_to_all_metadata(
-                send_tensor=send_back_slot_idx_flat,
-                send_counts=send_back_counts,
-                recv_counts=recv_back_counts,
-            )
-
-            output_tokens = torch.zeros_like(tokens)
-            if recv_back_features.numel() > 0:
-                recv_weights = topk_weights[recv_back_token_idx_flat, recv_back_slot_idx_flat]
-                recv_weighted = recv_back_features * recv_weights.unsqueeze(-1)
-                output_tokens.index_add_(0, recv_back_token_idx_flat, recv_weighted)
-
-            local_total_assignments = float(topk_indices.numel())
-            stats = torch.tensor([float(dropped), local_total_assignments], device=tokens.device)
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=self.ep_group)
-            dropped = int(stats[0].item())
-            total_assignments = int(stats[1].item())
 
         if self.shared_experts:
             shared_output = torch.zeros_like(tokens)

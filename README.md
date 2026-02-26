@@ -122,6 +122,32 @@ python examples/train_mvp.py
 - [ ] Phase 10 (Weeks 31-34): Advanced optimization (fused ops, CPU offload)
 - [ ] Phase 11 (Weeks 35-36): Production hardening (testing, docs)
 
+## 📌 Progress Tracker
+
+This section tracks major repo improvements in chronological order.
+Use this as the source of truth for "what changed when".
+
+### Completed Milestones
+
+| Date | Commit | Milestone | Major Files Changed |
+|---|---|---|---|
+| 2026-02-09 | `5cfeb63` | Initial repo bootstrap | `README.md`, `src/*`, `examples/*`, `tests/*` |
+| 2026-02-13 | `8044208` | MVP stack refactor + model efficiency reporting | `src/trainer.py`, `src/utils/model_info.py`, `docs/model_info.md` |
+| 2026-02-19 | `9c12e7e` | Monitoring v2 stability/perf metrics | `src/trainer.py`, `src/config.py`, `src/monitoring.py`, `docs/training_monitoring_metrics_reference.md` |
+| 2026-02-24 | `5206984` | Canonical TP + DP tutorial pipeline | `examples/tp.py`, `src/layers.py`, `docs/tp_dp_communication.md` |
+| 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/ep.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
+| 2026-02-25 | `5855268` | Docs IA/readability overhaul | `docs/README.md`, `docs/*.md`, `README.md`, `src/utils/model_info.py` |
+
+### Planned Next Milestones
+
+| Status | Milestone | Expected Focus Files |
+|---|---|---|
+| In Progress | 4D TP+PP+EP+DP tutorial path | `examples/ep.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/pp_tp_ep_dp_communication.md` |
+| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/ep.py`, `src/models/moe.py`, `tests/test_ep_script_logic.py` |
+| Planned | DeepSeek parallel context cleanup and simplification | `src/models/deepseek.py`, `tests/test_deepseek_model.py` |
+| Planned | TP/EP learning script consistency pass | `examples/tp.py`, `examples/ep.py`, `docs/ep_tp_dp_communication.md` |
+| Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/ep.py`, `docs/deepseek_moe_aux_losses.md` |
+
 ## 🗺️ Roadmap
 
 1. **Milestone 1:** Train 1B parameter model (current target: 125M ✅)
@@ -171,6 +197,8 @@ The [sync_and_run.sh](scripts/sync_and_run.sh) script automates:
   and gradient flow in 2D parallel training.
 - [TP + EP + DP Communication](docs/ep_tp_dp_communication.md) - expert dispatch/return
   all-to-all flow, gradient synchronization domains, and expert TP=1 rationale.
+- [TP + PP + EP + DP Communication](docs/pp_tp_ep_dp_communication.md) - 4D topology,
+  non-interleaved 1F1B pipeline schedule, stage-to-stage communication, and label transfer.
 - [DeepSeekMoE Aux Losses](docs/deepseek_moe_aux_losses.md) - expert/device load-balance
   objectives from DeepSeekMoE, plus mapping to this repo's current implementation.
 

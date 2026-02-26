@@ -853,3 +853,104 @@ class RowParallelLinear(nn.Module):
             partial_output = partial_output + self.bias
 
         return partial_output
+
+
+class _ScatterToSequenceParallelRegion(torch.autograd.Function):
+    """Autograd-safe sequence scatter across TP ranks."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_: torch.Tensor,
+        tp_rank: int,
+        tp_size: int,
+        tp_group,
+        seq_dim: int,
+    ) -> torch.Tensor:
+        ctx.tp_rank = tp_rank
+        ctx.tp_size = tp_size
+        ctx.tp_group = tp_group
+        ctx.seq_dim = seq_dim
+
+        if tp_size == 1:
+            return input_
+
+        seq_len = input_.size(seq_dim)
+        if seq_len % tp_size != 0:
+            raise ValueError("sequence length must be divisible by tp_size for sequence scatter")
+
+        chunk = seq_len // tp_size
+        start = tp_rank * chunk
+        return input_.narrow(seq_dim, start, chunk).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.tp_size == 1:
+            return grad_output, None, None, None, None
+
+        gather_list = [torch.empty_like(grad_output) for _ in range(ctx.tp_size)]
+        dist.all_gather(gather_list, grad_output.contiguous(), group=ctx.tp_group)
+        grad_input = torch.cat(gather_list, dim=ctx.seq_dim).contiguous()
+        return grad_input, None, None, None, None
+
+
+class _GatherFromSequenceParallelRegion(torch.autograd.Function):
+    """Autograd-safe sequence gather across TP ranks."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_: torch.Tensor,
+        tp_rank: int,
+        tp_size: int,
+        tp_group,
+        seq_dim: int,
+    ) -> torch.Tensor:
+        ctx.tp_rank = tp_rank
+        ctx.tp_size = tp_size
+        ctx.seq_dim = seq_dim
+
+        if tp_size == 1:
+            return input_
+
+        gather_list = [torch.empty_like(input_) for _ in range(tp_size)]
+        dist.all_gather(gather_list, input_.contiguous(), group=tp_group)
+        return torch.cat(gather_list, dim=seq_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.tp_size == 1:
+            return grad_output, None, None, None, None
+
+        seq_len = grad_output.size(ctx.seq_dim)
+        if seq_len % ctx.tp_size != 0:
+            raise ValueError("sequence length must be divisible by tp_size for sequence gather")
+
+        chunk = seq_len // ctx.tp_size
+        start = ctx.tp_rank * chunk
+        grad_input = grad_output.narrow(ctx.seq_dim, start, chunk).contiguous()
+        return grad_input, None, None, None, None
+
+
+def scatter_to_sequence_parallel_region(
+    input_: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    tp_group=None,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Scatter sequence dimension across TP ranks and keep autograd correctness."""
+    group = tp_group if tp_group is not None else dist.group.WORLD
+    return _ScatterToSequenceParallelRegion.apply(input_, tp_rank, tp_size, group, seq_dim)
+
+
+def gather_from_sequence_parallel_region(
+    input_: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    tp_group=None,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Gather sequence shards from TP ranks and keep autograd correctness."""
+    group = tp_group if tp_group is not None else dist.group.WORLD
+    return _GatherFromSequenceParallelRegion.apply(input_, tp_rank, tp_size, group, seq_dim)

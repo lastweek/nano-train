@@ -12,15 +12,17 @@ Note:
 
 Run examples:
     # single rank
-    python3 examples/tp.py --tp_size 1 --max_steps 2 --epochs 1
+    python3 examples/tp.py --tensor-model-parallel-size 1 --max_steps 2 --epochs 1
 
     # TP-only (world=4, tp=4, dp=1)
     python3 examples/launch.py --world-size 4 --backend gloo \
-        --script examples/tp.py --script-args --tp_size 4 --max_steps 2 --epochs 1
+        --script examples/tp.py --script-args \
+        --tensor-model-parallel-size 4 --max_steps 2 --epochs 1
 
     # TP+DP (world=4, tp=2, dp=2)
     python3 examples/launch.py --world-size 4 --backend gloo \
-        --script examples/tp.py --script-args --tp_size 2 --max_steps 2 --epochs 1
+        --script examples/tp.py --script-args \
+        --tensor-model-parallel-size 2 --max_steps 2 --epochs 1
 
 Core learning reference:
     docs/tp_dp_communication.md
@@ -29,6 +31,7 @@ Core learning reference:
 import argparse
 import os
 import sys
+import warnings
 from typing import Optional, Set
 
 import torch
@@ -147,7 +150,13 @@ class DummyDataset(Dataset):
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Canonical TP/DP tutorial script")
-    parser.add_argument("--tp_size", type=int, default=None, help="TP size. Default: world_size")
+    parser.add_argument(
+        "--tensor-model-parallel-size",
+        type=int,
+        default=None,
+        help="Tensor model parallel size. Default: world_size",
+    )
+    parser.add_argument("--tp_size", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_samples", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=3)
@@ -159,7 +168,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate_size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.tensor_model_parallel_size is None and args.tp_size is not None:
+        warnings.warn(
+            "--tp_size is deprecated; use --tensor-model-parallel-size",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        args.tensor_model_parallel_size = args.tp_size
+    elif args.tensor_model_parallel_size is not None and args.tp_size is not None:
+        warnings.warn(
+            "Both --tp_size and --tensor-model-parallel-size were provided. "
+            "Using canonical --tensor-model-parallel-size.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    return args
 
 
 def setup_process_logging(rank: int) -> None:
@@ -358,7 +384,11 @@ def main() -> None:
     setup_process_logging(rank_pre)
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    tp_size = args.tp_size if args.tp_size is not None else world_size
+    tp_size = (
+        args.tensor_model_parallel_size
+        if args.tensor_model_parallel_size is not None
+        else world_size
+    )
 
     (
         rank,

@@ -1,132 +1,91 @@
-# TP + EP + DP Communication Guide
+# TP + EP + DP Communication Guide (Megatron Naming)
 
-**Purpose**: Explain communication domains and gradient synchronization rules in the
-`examples/ep.py` tutorial for combined TP+EP+DP training.
+**Purpose**: Explain communication domains and gradient synchronization rules in
+`examples/ep.py` when `pipeline_model_parallel_size == 1`.
 
-**Audience**: Readers learning how EP changes communication relative to TP+DP.
+**Audience**: Readers learning where expert parallelism adds communication.
 
-**Prerequisites**: Understanding of TP/DP basics and MoE top-k routing.
+**Prerequisites**:
+- [TP + DP Backward Flow](tp_dp_communication.md)
+- Basic MoE top-k routing intuition
 
 **Related Docs**:
-- [TP + DP Backward Flow](tp_dp_communication.md)
+- [TP + PP + EP + DP Communication Guide](pp_tp_ep_dp_communication.md)
 - [DeepSeekMoE Auxiliary Losses](deepseek_moe_aux_losses.md)
 
 ## Table of Contents
 
 - [1) 3D process grid](#1-3d-process-grid)
-- [2) What TP does in this setup](#2-what-tp-does-in-this-setup)
-- [3) What EP adds](#3-what-ep-adds)
-- [4) EP batch semantics: split vs shared](#4-ep-batch-semantics-split-vs-shared)
-- [5) Capacity and dropping](#5-capacity-and-dropping)
-- [6) Where gradients are synchronized](#6-where-gradients-are-synchronized)
-- [7) Why no WORLD loss all-reduce is required](#7-why-no-world-loss-all-reduce-is-required)
-- [8) Practical interpretation](#8-practical-interpretation)
-- [9) Router auxiliary losses](#9-router-auxiliary-losses)
-
-This note summarizes the canonical communication domains for combined Tensor Parallelism
-(TP), Expert Parallelism (EP), and Data Parallelism (DP), as implemented by `examples/ep.py`.
-
+- [2) Communication domains](#2-communication-domains)
+- [3) MoE dispatch, expert compute, combine](#3-moe-dispatch-expert-compute-combine)
+- [4) Sequence-parallel behavior around MoE](#4-sequence-parallel-behavior-around-moe)
+- [5) Gradient synchronization domains](#5-gradient-synchronization-domains)
+- [6) Why no WORLD loss all-reduce is required](#6-why-no-world-loss-all-reduce-is-required)
+- [7) Practical checklist](#7-practical-checklist)
 
 ## 1) 3D process grid
 
-Each rank has coordinates `(dp_rank, tp_rank, ep_rank)`.
+Each rank has coordinates:
+`(data_parallel_rank, tensor_model_parallel_rank, expert_model_parallel_rank)`.
 
-- TP dimension: shard dense linear tensors inside a replica.
-- EP dimension: shard routed experts across expert ranks.
-- DP dimension: replicate the full TP+EP shard layout over data shards.
+- Tensor model parallel: shard dense/attention linear layers.
+- Expert model parallel: shard routed experts.
+- Data parallel: replicate the same TP+EP layout across data shards.
 
-Rule of thumb:
+## 2) Communication domains
 
-- Dense TP collectives: fixed `(dp_rank, ep_rank)`, varying `tp_rank`.
-- Attention TP collectives:
-  - `--attn_tp_axis tp`: fixed `(dp_rank, ep_rank)`, varying `tp_rank`
-  - `--attn_tp_axis ep`: fixed `(dp_rank, tp_rank)`, varying `ep_rank`
-- EP collectives: fixed `(dp_rank, tp_rank)`, varying `ep_rank`.
-- DP collectives: fixed `(tp_rank, ep_rank)`, varying `dp_rank`.
+`examples/ep.py` uses these groups:
 
-## 2) What TP does in this setup
+- `tensor_model_parallel_group`: fixed `(dp, ep)`, varying `tp`
+- `expert_model_parallel_group`: fixed `(dp, tp)`, varying `ep`
+- `data_parallel_group`: fixed `(tp, ep)`, varying `dp`
+- `expert_data_parallel_group`: fixed `ep`, varying `(dp, tp)`
 
-Dense TP layers follow the same rules as TP-only training:
+The key distinction is:
 
-- Row-parallel linear: forward all-reduce(sum) on partial output `Y` in TP group.
-- Column-parallel linear: backward all-reduce(sum) on `dX` in TP group.
+- EP collectives inside MoE run on `expert_model_parallel_group`.
+- Expert parameter gradients synchronize on `expert_data_parallel_group`.
 
-These TP collectives stay inside TP layer implementations.
+## 3) MoE dispatch, expert compute, combine
 
-## 3) What EP adds
+Inside each routed MoE layer:
 
-EP adds routed-expert communication around the MoE layer.
+1. Route tokens to top-k expert ids.
+2. Dispatch token assignments with all-to-all on `expert_model_parallel_group`.
+3. Run local expert MLPs (`expert_tensor_parallel_size = 1`).
+4. Return expert outputs with all-to-all on the same group.
+5. Combine returned outputs with router weights.
 
-Within each `(dp_rank, tp_rank)` EP group:
+## 4) Sequence-parallel behavior around MoE
 
-1. Each EP rank routes its local token shard to global expert ids.
-2. **Dispatch all-to-all**: send token activations to owner ranks of selected experts.
-3. Local experts run on received tokens (`expert_tp=1`, no TP inside experts).
-4. **Return all-to-all**: send expert outputs back to source ranks.
-5. Source ranks merge expert contributions with top-k weights.
+When `tensor_model_parallel_size > 1` and sequence parallel is enabled, the model:
 
-These two all-to-all collectives are the main new communication introduced by EP.
+1. Scatters sequence/tokens across TP ranks before MoE.
+2. Runs MoE on local sequence shard.
+3. Gathers sequence back across TP ranks after MoE.
 
-## 4) EP batch semantics: split vs shared
+This avoids duplicate routed-expert token compute across TP ranks.
 
-`examples/ep.py` supports two EP batch behaviors, inferred from `--attn_tp_axis`:
+## 5) Gradient synchronization domains
 
-- `--attn_tp_axis tp` -> `split` mode:
-  each EP rank gets a disjoint DP-local batch shard (`B -> B_ep`).
-- `--attn_tp_axis ep` -> `shared` mode:
-  each EP rank sees the full DP-local batch (`B` on every EP rank).
-  This is required when attention heads are TP-sharded across the EP axis.
+After `loss.backward()`:
 
-Interpretation:
+- Non-expert parameters: all-reduce(avg) on `data_parallel_group`.
+- Expert parameters: all-reduce(avg) on `expert_data_parallel_group`.
 
-- In `split` mode, EP ranks are independent for attention input ownership.
-- In `shared` mode, EP ranks cooperate on attention TP, so attention input must be shared.
+No script-level TP all-reduce is added here; TP collectives stay inside TP layers.
 
-## 5) Capacity and dropping
+## 6) Why no WORLD loss all-reduce is required
 
-Per-expert capacity is:
+Loss all-reduce is optional for logging only. Training correctness comes from
+parameter-gradient synchronization in the correct domains above.
 
-`capacity = ceil(capacity_factor * total_tokens * top_k / num_experts)`
+## 7) Practical checklist
 
-Assignments above capacity are dropped deterministically by routing weight
-(highest kept first), and dropped fraction is logged.
-
-## 6) Where gradients are synchronized
-
-After backward in TP+EP+DP:
-
-- `split` mode:
-  - EP all-reduce(avg): non-EP-axis and non-expert parameters
-    (EP ranks processed different data shards).
-  - DP all-reduce(avg): all parameters across DP replicas.
-  - Expert params: additional `1/ep_size` scaling after DP reduce, because each rank
-    used mean loss over its local shard.
-- `shared` mode:
-  - No EP gradient all-reduce for non-expert params (EP ranks saw the same batch).
-  - DP all-reduce(avg): all parameters across DP replicas.
-  - Expert params: additional `1/ep_size` scaling, because EP dispatch/return duplicates
-    source-token contributions across EP ranks in this tutorial setup.
-
-`expert_tp=1` means expert MLP weights are local to one EP rank and never TP-sharded.
-
-## 7) Why no WORLD loss all-reduce is required
-
-Loss all-reduce is optional for logging.
-Training correctness comes from correct gradient synchronization domains above.
-
-## 8) Practical interpretation
-
-Compared with TP+DP, EP introduces:
-
-- Additional forward communication: dispatch + return all-to-all around MoE.
-- Additional backward pressure through those all-to-all paths.
-- Additional non-expert EP gradient synchronization due token sharding by EP rank.
-
-That is the core communication cost/benefit tradeoff of EP.
-
-## 9) Router auxiliary losses
-
-For DeepSeekMoE-style load-balance losses (expert-level vs device-level) and how
-they map to this repo's current code, see:
-
-- [DeepSeekMoE Aux Losses](deepseek_moe_aux_losses.md)
+1. `world_size % (tensor_model_parallel_size * pipeline_model_parallel_size * expert_model_parallel_size * context_parallel_size) == 0`
+2. Current tutorial guard: do not combine `tensor_model_parallel_size > 1` with `expert_model_parallel_size > 1`
+3. `num_experts % expert_model_parallel_size == 0`
+4. `num_heads % tensor_model_parallel_size == 0`
+5. `seq_len % tensor_model_parallel_size == 0` when MoE sequence parallel is enabled
+6. `expert_tensor_parallel_size == 1` in this tutorial implementation
+7. `dropout == 0.0` whenever tensor or expert model parallel is greater than 1
