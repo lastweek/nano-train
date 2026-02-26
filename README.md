@@ -1,131 +1,171 @@
-# Nano-Train: A Distributed LLM Training Framework
+# Nano-Train
 
-A production-grade distributed LLM training framework from scratch, targeting
-models like DeepSeek-R1 (671B MoE parameters). The framework will implement
-state-of-the-art parallelism strategies (tensor, pipeline, data, sequence, and
-expert parallelism), memory optimizations, and training infrastructure similar
-to Megatron-LM but with a cleaner, more modular architecture.
+Learning-first distributed training repo focused on Megatron-style parallelism:
+Tensor (TP), Pipeline (PP), Expert (EP), Data (DP), and ZeRO-1/2.
 
-## 🎯 Goal
+## Current Status
 
-Train SOTA LLMs (7B to 671B parameters) with support for:
-- Mixture-of-Experts (MoE) architectures like DeepSeek-R1
-- 3D parallelism: Tensor, Pipeline, Data, Sequence, Expert
-- Scale to 1000+ GPUs
-- Efficient memory usage for training large models
+- Main tutorial entrypoint: `examples/train_4p.py` (TP/PP/EP/DP + ZeRO-1/2).
+- Focused TP/DP learning path: `examples/tp.py`.
+- ZeRO implementation: `src/distributed/zero.py` (`optim`, `optim_grads`).
+- DeepSeek-style model stack:
+  - `src/models/deepseek.py`
+  - `src/models/moe.py`
+- Current tutorial constraints in `examples/train_4p.py`:
+  - `tensor-model-parallel-size > 1` with `expert-model-parallel-size > 1` is disallowed.
+  - `expert-tensor-parallel-size == 1`.
+  - `context-parallel-size == 1`.
+  - ZeRO-3 (`optim_grads_params`) is out of scope.
 
-## 🚀 Quick Start (Google Colab)
+## Quick Start
 
-**New:** Train with GPU in Google Colab!
-
-1. Open [notebooks/train_in_colab.ipynb](notebooks/train_in_colab.ipynb) in Google Colab
-2. Enable GPU runtime (Runtime → Change runtime type → T4 GPU)
-3. Run all cells to automatically train
-
-**Local Development:**
-- Run [check_gpu.py](check_gpu.py) to verify your local GPU setup
-- Use [scripts/sync_and_run.sh](scripts/sync_and_run.sh) to automate workflow
-
-## 📁 Project Structure
-
-```
-nano_train/
-├── core/                    # Core infrastructure
-│   ├── config.py           # Configuration system
-│   ├── distributed.py      # Distributed initialization
-│   └── logging.py          # Logging utilities
-├── models/                 # Model architectures
-│   ├── transformer.py      # Transformer blocks
-│   ├── attention.py        # Attention mechanisms (MHA, GQA, MQA)
-│   ├── mlp.py              # MLP/MoE layers
-│   └── embedding.py        # Embeddings & RoPE
-├── parallelism/            # Parallelism strategies
-│   ├── tensor_parallel.py  # Tensor parallelism
-│   ├── pipeline_parallel.py # Pipeline parallelism
-│   ├── data_parallel.py    # DDP/FSDP wrappers
-│   ├── sequence_parallel.py # Sequence parallelism
-│   └── expert_parallel.py  # Expert parallelism (MoE)
-├── memory/                 # Memory optimization
-│   ├── checkpointing.py    # Gradient/activation checkpointing
-│   ├── offload.py          # CPU offloading
-│   └── metrics.py          # Memory tracking
-├── communication/          # Communication primitives
-│   ├── collectives.py      # All-reduce, all-gather wrappers
-│   └── overlap.py          # Computation-communication overlap
-├── training/               # Training infrastructure
-│   ├── optimizer.py        # Optimizers (AdamW, etc.)
-│   ├── scheduler.py        # LR schedulers
-│   ├── checkpoint.py       # Checkpoint saving/loading
-│   └── trainer.py          # Main training loop
-├── data/                   # Data loading
-│   ├── dataset.py          # Dataset classes
-│   ├── loader.py           # DataLoader wrappers
-│   └── preprocessing.py    # Tokenization & preprocessing
-├── kernels/                # Custom CUDA kernels
-│   ├── flash_attention.py  # Flash Attention interface
-│   ├── rotary.py           # RoPE kernels
-│   └── moe_routing.py      # MoE routing kernels
-└── utils/                  # Utilities
-    ├── metrics.py          # Training metrics
-    └── timers.py           # Performance timing
-examples/                   # Example training scripts
-configs/                    # Configuration files
-tests/                      # Test suite
-notebooks/                   # Google Colab notebooks
-scripts/                    # Automation scripts
-```
-
-## 🏃️ Installation
+### Install
 
 ```bash
 git clone https://github.com/lastweek/nano-train.git
 cd nano-train
-
-# For local development with GPU:
-python check_gpu.py  # Verify GPU setup
-
-# For training:
 pip install -r requirements.txt
-python examples/train_mvp.py
-
-# View logs (TensorBoard):
-./scripts/start_tensorboard.sh
 ```
 
-## 📊 Current Status
+### Single-Rank Smoke
 
-### ✅ Phase 0 Complete (Weeks 1-3)
-**MVP Training Cycle Working**
-- [x] Configuration system (dataclass-based)
-- [x] Basic transformer block (MHA, MLP)
-- [x] Training loop with optimizer & scheduler
-- [x] Simple data loader
-- [x] Character-level vocab for MVP
+```bash
+python3 examples/train_4p.py \
+  --tensor-model-parallel-size 1 \
+  --pipeline-model-parallel-size 1 \
+  --expert-model-parallel-size 1 \
+  --max_steps 2
+```
 
-**Training Results (125M model):**
-- Steps completed: 1000/1000
-- Training time: 33 minutes 24 seconds
-- Final loss: 0.0000 (decreased from ~3.5)
-- Loss decrease: ✅ Model is learning
-- Checkpointing: ✅ Working
+### 4P + ZeRO-2 Smoke
 
-### 🔄 In Progress
-- [ ] Phase 1 (Weeks 4-6): Production-ready foundation (OmegaConf + Hydra, distributed training)
-- [ ] Phase 2 (Weeks 7-10): Flash Attention, gradient checkpointing, BF16
-- [ ] Phase 3 (Weeks 11-14): Tensor Parallelism
-- [ ] Phase 4 (Weeks 15-16): Data Parallelism
-- [ ] Phase 5 (Weeks 17-18): Attention enhancements (RoPE, GQA)
-- [ ] Phase 6 (Weeks 19-20): Pipeline Parallelism
-- [ ] Phase 7 (Weeks 21-24): Mixture-of-Experts (MoE)
-- [ ] Phase 8 (Weeks 25-26): Sequence Parallelism
-- [ ] Phase 9 (Weeks 27-30): Production features (checkpointing, monitoring)
-- [ ] Phase 10 (Weeks 31-34): Advanced optimization (fused ops, CPU offload)
-- [ ] Phase 11 (Weeks 35-36): Production hardening (testing, docs)
+```bash
+python3 examples/launch.py --world-size 4 --backend gloo \
+  --script examples/train_4p.py --script-args \
+  --tensor-model-parallel-size 1 \
+  --pipeline-model-parallel-size 2 \
+  --expert-model-parallel-size 2 \
+  --num_microbatches 2 \
+  --use-distributed-optimizer \
+  --data-parallel-sharding-strategy optim_grads \
+  --max_steps 1
+```
 
-## 📌 Progress Tracker
+## Key Entrypoints
 
-This section tracks major repo improvements in chronological order.
-Use this as the source of truth for "what changed when".
+| Path | Purpose |
+|---|---|
+| `examples/train_4p.py` | Canonical TP/PP/EP/DP tutorial script with optional ZeRO-1/2 |
+| `examples/tp.py` | TP-only and TP+DP tutorial path |
+| `examples/launch.py` | Multi-process launcher for local distributed runs |
+| `src/distributed/topology.py` | Parallel group/rank topology setup |
+| `src/distributed/zero.py` | Megatron-style ZeRO-1/2 optimizer implementation |
+| `src/trainer.py` | Shared trainer loop and checkpoint integration hooks |
+
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+    subgraph E["Entry Points (`examples/`)"]
+        E1["train_4p.py\nCanonical TP/PP/EP/DP + ZeRO tutorial"]
+        E2["tp.py\nTP-only and TP+DP tutorial"]
+        E3["launch.py\nMulti-process launcher"]
+        E4["mvp.py / deepseek.py / ddp.py\nFocused demos"]
+    end
+
+    subgraph O["Orchestration (`src/`)"]
+        O1["trainer.py\nTraining loop + checkpoint hooks"]
+        O2["config.py\nTyped runtime config"]
+        O3["dataset.py\nDataset + dataloader helpers"]
+        O4["logging.py\nStructured logging"]
+        O5["optimizer.py + scheduler.py\nOptimization policies"]
+    end
+
+    subgraph D["Distributed Runtime (`src/distributed/`)"]
+        D1["device.py\nDevice/backend selection"]
+        D2["topology.py\nTP/PP/EP/DP process groups"]
+        D3["zero.py\nMegatron-style ZeRO-1/2"]
+    end
+
+    subgraph M["Model Stack (`src/models/` + `src/layers.py`)"]
+        M1["deepseek.py\nDeepSeek model + parallel context"]
+        M2["moe.py\nRouter + Local/EP MoE"]
+        M3["transformer.py\nBaseline transformer model"]
+        M4["attention.py + mlp.py\nBlock components"]
+        M5["layers.py\nParallel linear + seq-parallel primitives"]
+        M6["losses.py\nTraining loss modules"]
+    end
+
+    subgraph X["Observability & Utility"]
+        X1["monitoring.py\nTraining diagnostics"]
+        X2["utils/model_info.py\nModel size/compute reporting"]
+    end
+
+    subgraph V["Verification & Knowledge"]
+        V1["tests/\nUnit + distributed smoke"]
+        V2["docs/\nCommunication + ZeRO guides"]
+    end
+
+    E3 --> E1
+    E3 --> E2
+    E3 --> E4
+
+    E1 --> D1
+    E1 --> D2
+    E1 --> D3
+    E1 --> O3
+    E1 --> O4
+    E1 --> M1
+    E1 --> M2
+    E1 --> M5
+
+    E2 --> D1
+    E2 --> O3
+    E2 --> O4
+    E2 --> M5
+
+    E4 --> O1
+    O1 --> O2
+    O1 --> O3
+    O1 --> O4
+    O1 --> O5
+    O1 --> M6
+    O1 --> X1
+
+    D3 --> D2
+
+    M1 --> M2
+    M1 --> M5
+    M3 --> M4
+    M3 --> M5
+    M4 --> M5
+    M2 --> M5
+
+    X2 --> M1
+    X2 --> M3
+
+    V1 -. validates .-> E1
+    V1 -. validates .-> E2
+    V1 -. validates .-> D3
+    V1 -. validates .-> M1
+    V2 -. documents .-> E1
+    V2 -. documents .-> D2
+    V2 -. documents .-> D3
+    V2 -. documents .-> M2
+```
+
+## Learning Guides
+
+- [Docs Index](docs/README.md)
+- [TP + DP Communication](docs/tp_dp_communication.md)
+- [TP + EP + DP Communication](docs/ep_tp_dp_communication.md)
+- [TP + PP + EP + DP Communication](docs/pp_tp_ep_dp_communication.md)
+- [DeepSeekMoE Auxiliary Losses](docs/deepseek_moe_aux_losses.md)
+- [Megatron ZeRO-1/2 Design](docs/megatron_zero1_zero2_design.md)
+- [ZeRO-1/2 Intuitive Summary](docs/zero1_zero2_intuitive_summary.md)
+- [ZeRO-1/2 Quickstart](docs/zero1_zero2_quickstart.md)
+
+## Progress Tracker
 
 ### Completed Milestones
 
@@ -137,7 +177,7 @@ Use this as the source of truth for "what changed when".
 | 2026-02-24 | `5206984` | Canonical TP + DP tutorial pipeline | `examples/tp.py`, `src/layers.py`, `docs/tp_dp_communication.md` |
 | 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/train_4p.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
 | 2026-02-25 | `5855268` | Docs IA/readability overhaul | `docs/README.md`, `docs/*.md`, `README.md`, `src/utils/model_info.py` |
-| 2026-02-26 | `TBD (this commit)` | 4P training entrypoint + ZeRO-1/2 integration and debug visibility | `examples/train_4p.py`, `src/distributed/zero.py`, `src/trainer.py`, `src/config.py`, `docs/zero1_zero2_*.md`, `tests/test_zero_*.py` |
+| 2026-02-26 | `69188d8` | 4P entrypoint rename + ZeRO-1/2 integration and debug visibility | `examples/train_4p.py`, `src/distributed/zero.py`, `src/trainer.py`, `docs/zero1_zero2_*.md`, `tests/test_zero_*.py` |
 
 ### Planned Next Milestones
 
@@ -146,85 +186,28 @@ Use this as the source of truth for "what changed when".
 | In Progress | Canonical TP+EP mapping (remove TP+EP guard, avoid expert replication) | `examples/train_4p.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md`, `docs/pp_tp_ep_dp_communication.md` |
 | Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/train_4p.py`, `src/models/moe.py`, `tests/test_train_4p_script_logic.py` |
 | Planned | DeepSeek parallel context cleanup and simplification | `src/models/deepseek.py`, `tests/test_deepseek_model.py` |
-| Planned | TP/EP learning script consistency pass | `examples/tp.py`, `examples/train_4p.py`, `docs/ep_tp_dp_communication.md` |
 | Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/train_4p.py`, `docs/deepseek_moe_aux_losses.md` |
 | Planned | Checkpoint resume path for ZeRO sharded optimizer in trainer | `src/trainer.py`, `src/distributed/zero.py`, `docs/zero1_zero2_quickstart.md` |
 
-## 🗺️ Roadmap
+## Repository Layout
 
-1. **Milestone 1:** Train 1B parameter model (current target: 125M ✅)
-2. **Milestone 2:** Add Flash Attention for 10x speedup
-3. **Milestone 3:** Implement tensor parallelism (TP=8)
-4. **Milestone 4:** Train 7B dense model
-5. **Milestone 5:** Implement MoE for DeepSeek-R1 style models
-6. **Final Goal:** Train 671B MoE model at scale
-
-## 🔧 Development Workflow
-
-### Local Development
-```bash
-# 1. Make changes locally
-# 2. Push to GitHub
-./scripts/sync_and_run.sh
+```text
+docs/         learning and implementation guides
+examples/     runnable training/tutorial scripts
+src/          core training/model/distributed modules
+tests/        unit and distributed smoke tests
+scripts/      local helper scripts
 ```
 
-### Google Colab Training
+## Development Checks
+
 ```bash
-# 1. Open notebooks/train_in_colab.ipynb in Colab
-# 2. Enable GPU runtime
-# 3. Run all cells
+pytest -q
+ruff check .
+ruff format --check .
+mypy src/
 ```
 
-The [sync_and_run.sh](scripts/sync_and_run.sh) script automates:
-1. Detects local git changes
-2. Commits and pushes to GitHub
-3. Generates a Colab notebook script
-4. The Colab script pulls latest code and starts training
+## License
 
-## 📈 Architecture Decisions
-
-| Component | Technology | Rationale |
-|-----------|-----------|-----------|
-| Framework | PyTorch | Industry standard, best distributed support |
-| Attention | Flash Attention | Proven performance, widely adopted |
-| Parallelism | Support all types (TP, PP, DP, SP, EP) | Maximum flexibility |
-| Precision | BF16 primary | Better numerical stability than FP16 |
-| Configuration | OmegaConf + Hydra | Flexible, hierarchical configs |
-| Checkpointing | Sharded for training, full for inference | Balance storage and compatibility |
-
-## 📘 Learning Guides
-
-- [Docs Index](docs/README.md) - organized navigation across guides, operations, and reference docs.
-- [TP + DP Backward Flow](docs/tp_dp_communication.md) - communication domains, collectives,
-  and gradient flow in 2D parallel training.
-- [TP + EP + DP Communication](docs/ep_tp_dp_communication.md) - expert dispatch/return
-  all-to-all flow, gradient synchronization domains, and expert TP=1 rationale.
-- [TP + PP + EP + DP Communication](docs/pp_tp_ep_dp_communication.md) - 4D topology,
-  non-interleaved 1F1B pipeline schedule, stage-to-stage communication, and label transfer.
-- [DeepSeekMoE Aux Losses](docs/deepseek_moe_aux_losses.md) - expert/device load-balance
-  objectives from DeepSeekMoE, plus mapping to this repo's current implementation.
-- [Megatron ZeRO-1/2 Design](docs/megatron_zero1_zero2_design.md) - implementation-level
-  design of Megatron distributed optimizer + DDP interactions, and how to map them into this repo.
-- [ZeRO-1/2 Intuitive Summary](docs/zero1_zero2_intuitive_summary.md) - small-tensor mental model
-  for `all-reduce`, `reduce-scatter`, `all-gather`, and what ZeRO-1 vs ZeRO-2 partition.
-- [ZeRO-1/2 Quickstart](docs/zero1_zero2_quickstart.md) - runnable commands for baseline,
-  ZeRO-1 (`optim`), and ZeRO-2 (`optim_grads`) with `examples/train_4p.py`.
-
-## 📚 References
-
-- [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM) - 3D parallelism reference
-- [PyTorch FSDP Documentation](https://pytorch.org/docs/stable/fsdp.html)
-- [Flash Attention](https://github.com/Dao-AILab/flash-attention)
-- [DeepSeek-R1 GitHub](https://github.com/deepseek-ai/DeepSeek-R1) - MoE architecture reference
-
-## 📄 License
-
-MIT License - See LICENSE file for details
-
-## 🙏 Acknowledgments
-
-Built with inspiration from:
-- NVIDIA Megatron-LM team
-- DeepSeek-AI team
-- PyTorch team
-- And the broader open-source ML community
+MIT License.
