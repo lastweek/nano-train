@@ -41,6 +41,9 @@ def resolve_dataset_path(dataset_path: str) -> str:
 
 def build_deepseek_config(
     model_preset: str,
+    *,
+    param_dtype: torch.dtype,
+    param_device: Optional[torch.device],
     vocab_size: Optional[int] = None,
 ) -> DeepSeekModelConfig:
     """
@@ -51,12 +54,17 @@ def build_deepseek_config(
     - tiny: Small runnable config for local training experiments.
     """
     if model_preset == "deepseek_v3":
-        return DeepSeekModelConfig()
+        return DeepSeekModelConfig(
+            param_dtype=param_dtype,
+            param_device=param_device,
+        )
 
     if model_preset == "tiny":
         if vocab_size is None:
             raise ValueError("vocab_size is required for tiny preset")
         return DeepSeekModelConfig(
+            param_dtype=param_dtype,
+            param_device=param_device,
             vocab_size=vocab_size,
             hidden_size=384,
             num_hidden_layers=8,
@@ -166,6 +174,8 @@ def main() -> None:
 
     model_cfg = build_deepseek_config(
         model_preset=args.model_preset,
+        param_dtype=torch.float32,
+        param_device=None if args.meta_init else device,
         vocab_size=dataset.vocab_size if dataset is not None else None,
     )
     if args.meta_init:

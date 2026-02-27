@@ -2,7 +2,7 @@
 
 **Purpose**: Run ZeRO-1/2 in nano-train using Megatron-style interface flags.
 
-**Audience**: Engineers validating distributed optimizer behavior in `examples/train_4p.py`.
+**Audience**: Engineers validating distributed optimizer behavior in `examples/train_4d.py`.
 
 **Prerequisites**:
 - Python environment with repo dependencies installed.
@@ -19,7 +19,7 @@
 
 ```bash
 python3 examples/launch.py --world-size 2 --backend gloo \
-  --script examples/train_4p.py --script-args \
+  --script examples/train_4d.py --script-args \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 1 \
   --expert-model-parallel-size 1 \
@@ -31,7 +31,7 @@ python3 examples/launch.py --world-size 2 --backend gloo \
 
 ```bash
 python3 examples/launch.py --world-size 2 --backend gloo \
-  --script examples/train_4p.py --script-args \
+  --script examples/train_4d.py --script-args \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 1 \
   --expert-model-parallel-size 1 \
@@ -44,7 +44,7 @@ python3 examples/launch.py --world-size 2 --backend gloo \
 
 ```bash
 python3 examples/launch.py --world-size 2 --backend gloo \
-  --script examples/train_4p.py --script-args \
+  --script examples/train_4d.py --script-args \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 1 \
   --expert-model-parallel-size 1 \
@@ -57,7 +57,7 @@ python3 examples/launch.py --world-size 2 --backend gloo \
 
 ```bash
 python3 examples/launch.py --world-size 4 --backend gloo \
-  --script examples/train_4p.py --script-args \
+  --script examples/train_4d.py --script-args \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 2 \
   --expert-model-parallel-size 2 \
@@ -71,7 +71,7 @@ python3 examples/launch.py --world-size 4 --backend gloo \
 
 ```bash
 python3 examples/launch.py --world-size 4 --backend gloo \
-  --script examples/train_4p.py --script-args \
+  --script examples/train_4d.py --script-args \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 2 \
   --expert-model-parallel-size 2 \
@@ -81,6 +81,47 @@ python3 examples/launch.py --world-size 4 --backend gloo \
   --zero-debug \
   --zero-debug-max-steps 1 \
   --zero-debug-max-params 12 \
+  --max_steps 1
+```
+
+### 6) Mixed Precision + ZeRO (Megatron-Style Precision Flags)
+
+FP16 with dynamic loss scaling:
+
+```bash
+python3 examples/launch.py --world-size 2 --backend gloo \
+  --script examples/train_4d.py --script-args \
+  --tensor-model-parallel-size 1 \
+  --pipeline-model-parallel-size 1 \
+  --expert-model-parallel-size 1 \
+  --use-distributed-optimizer \
+  --data-parallel-sharding-strategy optim_grads \
+  --fp16 \
+  --params-dtype fp16 \
+  --main-params-dtype fp32 \
+  --main-grads-dtype fp32 \
+  --exp-avg-dtype fp32 \
+  --exp-avg-sq-dtype fp32 \
+  --max_steps 2
+```
+
+FP8 emulated path (for functional validation):
+
+```bash
+python3 examples/launch.py --world-size 2 --backend gloo \
+  --script examples/train_4d.py --script-args \
+  --tensor-model-parallel-size 1 \
+  --pipeline-model-parallel-size 1 \
+  --expert-model-parallel-size 1 \
+  --use-distributed-optimizer \
+  --data-parallel-sharding-strategy optim \
+  --fp8 \
+  --fp8-backend emulated \
+  --params-dtype bf16 \
+  --main-params-dtype fp32 \
+  --main-grads-dtype fp32 \
+  --exp-avg-dtype fp32 \
+  --exp-avg-sq-dtype fp32 \
   --max_steps 1
 ```
 

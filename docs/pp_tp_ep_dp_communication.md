@@ -1,7 +1,7 @@
 # TP + PP + EP + DP Communication Guide (Megatron Naming)
 
 **Purpose**: Explain what pipeline parallelism adds on top of TP+EP+DP in
-`examples/train_4p.py`.
+`examples/train_4d.py`.
 
 **Audience**: Readers who already understand TP/EP/DP and want a practical 4D model.
 
@@ -36,7 +36,7 @@ Rank mapping in this repo:
 
 ## 2) Communication domains
 
-`examples/train_4p.py` uses:
+`examples/train_4d.py` uses:
 
 - `tensor_model_parallel_group`: fixed `(dp, pp, ep)`, varying `tp`
 - `pipeline_model_parallel_group`: fixed `(dp, tp, ep)`, varying `pp`

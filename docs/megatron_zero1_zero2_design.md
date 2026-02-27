@@ -280,7 +280,7 @@ Common failure modes:
 The repository now includes a synchronous Megatron-style ZeRO-1/2 baseline:
 
 - Core optimizer: `src/distributed/zero.py` (`MegatronZeroOptimizer`)
-- Tutorial integration: `examples/train_4p.py` (`--use-distributed-optimizer`,
+- Tutorial integration: `examples/train_4d.py` (`--use-distributed-optimizer`,
   `--data-parallel-sharding-strategy`)
 - Trainer hook: `src/trainer.py` calls `step_with_ready_grads()` when available
 - Checkpoint format: `optimizer_nonparam.pt` + `optimizer_manifest.json` +
@@ -302,7 +302,7 @@ Current v1 limitations:
 - Optimizer integration:
   - [src/optimizer.py](../src/optimizer.py) should gain distributed-optimizer entrypoints
 - Training loop integration:
-  - [examples/train_4p.py](../examples/train_4p.py) and shared training paths should call explicit
+  - [examples/train_4d.py](../examples/train_4d.py) and shared training paths should call explicit
     `start_grad_sync/finish_grad_sync/step_with_ready_grads` style APIs
 
 ### What to implement first (ordered)

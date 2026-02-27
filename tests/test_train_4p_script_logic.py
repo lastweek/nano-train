@@ -1,4 +1,4 @@
-"""Logic tests for examples/train_4p.py argument handling and gradient sync rules."""
+"""Logic tests for examples/train_4d.py argument handling and gradient sync rules."""
 
 from __future__ import annotations
 
@@ -15,11 +15,11 @@ import torch.nn as nn
 
 def _load_train_4p_module() -> ModuleType:
     repo_root = Path(__file__).parent.parent
-    module_path = repo_root / "examples" / "train_4p.py"
+    module_path = repo_root / "examples" / "train_4d.py"
     module_name = "train_4p_example_test_module"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("Failed to load examples/train_4p.py for tests")
+        raise RuntimeError("Failed to load examples/train_4d.py for tests")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -76,7 +76,7 @@ def _build_args_for_validate(
 
 
 def test_parse_args_requires_canonical_parallel_flags(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["train_4p.py"])
+    monkeypatch.setattr(sys, "argv", ["train_4d.py"])
     with pytest.raises(SystemExit):
         EP_MODULE.parse_args()
 
@@ -86,7 +86,7 @@ def test_parse_args_accepts_canonical_parallel_flags(monkeypatch) -> None:
         sys,
         "argv",
         [
-            "train_4p.py",
+            "train_4d.py",
             "--tensor-model-parallel-size",
             "1",
             "--pipeline-model-parallel-size",

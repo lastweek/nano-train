@@ -69,6 +69,8 @@ class MultiHeadAttention(nn.Module):
                 tp_size=self.tp_size,
                 tp_group=self.tp_group,
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
 
             # RowParallelLinear expects the GLOBAL input size and consumes a local shard.
@@ -79,11 +81,25 @@ class MultiHeadAttention(nn.Module):
                 tp_size=self.tp_size,
                 tp_group=self.tp_group,
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
         else:
             # Standard Linear layers
-            self.qkv_proj = Linear(config.hidden_size, 3 * config.hidden_size, bias=False)
-            self.out_proj = Linear(config.hidden_size, config.hidden_size, bias=False)
+            self.qkv_proj = Linear(
+                config.hidden_size,
+                3 * config.hidden_size,
+                bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
+            self.out_proj = Linear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
 
         self.dropout = Dropout(config.dropout)
         self.scale = 1.0 / math.sqrt(self.head_dim)

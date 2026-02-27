@@ -13,8 +13,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.layers import Linear, LayerNorm, Embedding, Dropout, GELU, clip_grad_norm
-from conftest import assert_tensor_close, assert_grad_close
+from src.layers import Dropout
+from src.layers import Embedding as _Embedding
+from src.layers import GELU
+from src.layers import LayerNorm as _LayerNorm
+from src.layers import Linear as _Linear
+from src.layers import clip_grad_norm
+from conftest import assert_grad_close
+from conftest import assert_tensor_close
+
+
+def Linear(*args, **kwargs):  # noqa: N802
+    return _Linear(*args, param_dtype=torch.float32, param_device=None, **kwargs)
+
+
+def LayerNorm(*args, **kwargs):  # noqa: N802
+    return _LayerNorm(*args, param_dtype=torch.float32, param_device=None, **kwargs)
+
+
+def Embedding(*args, **kwargs):  # noqa: N802
+    return _Embedding(*args, param_dtype=torch.float32, param_device=None, **kwargs)
 
 
 # =============================================================================

@@ -13,7 +13,13 @@ from src.models.attention import MultiHeadAttention
 
 
 def test_attention_monitoring_stats_exist_and_are_bounded() -> None:
-    config = ModelConfig(hidden_size=16, num_attention_heads=4, dropout=0.0)
+    config = ModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
+        hidden_size=16,
+        num_attention_heads=4,
+        dropout=0.0,
+    )
     attn = MultiHeadAttention(config)
     attn.eval()
 

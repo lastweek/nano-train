@@ -39,10 +39,18 @@ class TransformerBlock(nn.Module):
         self.layer_idx = layer_idx
 
         self.attention = MultiHeadAttention(config, tp_config)
-        self.attn_norm = LayerNorm(config.hidden_size)
+        self.attn_norm = LayerNorm(
+            config.hidden_size,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
 
         self.mlp = MLP(config, tp_config)
-        self.mlp_norm = LayerNorm(config.hidden_size)
+        self.mlp_norm = LayerNorm(
+            config.hidden_size,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
 
     def forward(
         self,
@@ -100,9 +108,17 @@ class TransformerModel(nn.Module):
         self.tp_group = tp_config.group
 
         # Embeddings are always replicated (not sharded)
-        self.token_embeddings = Embedding(config.vocab_size, config.hidden_size)
+        self.token_embeddings = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
         self.position_embeddings = Embedding(
-            config.max_position_embeddings, config.hidden_size
+            config.max_position_embeddings,
+            config.hidden_size,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
         )
         self.dropout = Dropout(config.dropout)
 
@@ -113,7 +129,11 @@ class TransformerModel(nn.Module):
         ])
 
         # Final layer norm
-        self.ln_f = LayerNorm(config.hidden_size)
+        self.ln_f = LayerNorm(
+            config.hidden_size,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
 
         # LM head
         if self.tp_enabled:
@@ -132,10 +152,18 @@ class TransformerModel(nn.Module):
                 tp_size=self.tp_size,
                 tp_group=self.tp_group,
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
         else:
             # Standard Linear
-            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = Linear(
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
             # Weight tying: share embeddings and lm_head weights
             # Note: Not done in TP mode due to shape mismatch
             self.lm_head.weight = self.token_embeddings.weight

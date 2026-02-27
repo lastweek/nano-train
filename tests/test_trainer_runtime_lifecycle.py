@@ -17,10 +17,10 @@ from src.runtime.sync import ParamShardInfo
 
 def _load_mvp_module():
     repo_root = Path(__file__).parent.parent
-    module_path = repo_root / "examples" / "mvp.py"
+    module_path = repo_root / "examples" / "train_mvp.py"
     spec = importlib.util.spec_from_file_location("mvp_runtime_lifecycle_test", module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("Failed to load examples/mvp.py")
+        raise RuntimeError("Failed to load examples/train_mvp.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules["mvp_runtime_lifecycle_test"] = module
     spec.loader.exec_module(module)

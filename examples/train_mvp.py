@@ -34,6 +34,13 @@ from src.runtime.contracts import StepContext
 from src.runtime.contracts import StepOutput
 from src.runtime.contracts import TrainDataBundle
 from src.runtime.engine import RuntimeEngine
+from src.runtime.mixed_precision import apply_model_precision_plan
+from src.runtime.mixed_precision import build_model_precision_plan
+from src.runtime.mixed_precision import dtype_alias_to_torch
+from src.runtime.mixed_precision import ensure_lowbit_compute_assignments
+from src.runtime.mixed_precision import MixedPrecisionController
+from src.runtime.mixed_precision import refresh_persistent_lowbit_params
+from src.runtime.mixed_precision import resolve_precision_config
 from src.runtime.schedules.non_pipeline import NonPipelineSchedule
 from src.runtime.sync import ParamShardInfo
 from src.trainer import Trainer
@@ -122,6 +129,184 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MVP training with runtime core")
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--bf16", action="store_true", help="Enable BF16 mixed precision")
+    parser.add_argument("--fp16", action="store_true", help="Enable FP16 mixed precision")
+    parser.add_argument("--fp8", action="store_true", help="Enable FP8 mixed precision")
+    parser.add_argument("--fp4", action="store_true", help="Enable FP4 mixed precision (emulated)")
+    parser.add_argument(
+        "--fp8-backend",
+        type=str,
+        default="transformer_engine",
+        choices=["transformer_engine", "emulated"],
+        help="FP8 backend implementation",
+    )
+    parser.add_argument(
+        "--fp8-format",
+        type=str,
+        default="e4m3",
+        choices=["e4m3", "hybrid"],
+        help="FP8 format recipe",
+    )
+    parser.add_argument(
+        "--fp8-amax-history-len",
+        type=int,
+        default=16,
+        help="FP8 amax history length",
+    )
+    parser.add_argument(
+        "--fp8-amax-compute-algo",
+        type=str,
+        default="most_recent",
+        choices=["most_recent", "max"],
+        help="FP8 amax compute algorithm",
+    )
+    parser.add_argument(
+        "--fp4-backend",
+        type=str,
+        default="emulated",
+        choices=["emulated"],
+        help="FP4 backend implementation",
+    )
+    parser.add_argument(
+        "--params-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Model parameter storage dtype",
+    )
+    parser.add_argument(
+        "--main-params-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Main optimizer parameter dtype",
+    )
+    parser.add_argument(
+        "--main-grads-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Main optimizer gradient dtype",
+    )
+    parser.add_argument(
+        "--exp-avg-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Adam exp_avg state dtype",
+    )
+    parser.add_argument(
+        "--exp-avg-sq-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Adam exp_avg_sq state dtype",
+    )
+    parser.add_argument(
+        "--loss-scale-init",
+        type=float,
+        default=65536.0,
+        help="Initial dynamic loss scale value",
+    )
+    parser.add_argument(
+        "--loss-scale-growth-factor",
+        type=float,
+        default=2.0,
+        help="Loss scale growth factor",
+    )
+    parser.add_argument(
+        "--loss-scale-backoff-factor",
+        type=float,
+        default=0.5,
+        help="Loss scale backoff factor on overflow",
+    )
+    parser.add_argument(
+        "--loss-scale-growth-interval",
+        type=int,
+        default=2000,
+        help="Successful step interval before loss scale growth",
+    )
+    parser.add_argument(
+        "--loss-scale-min",
+        type=float,
+        default=1.0,
+        help="Minimum loss scale",
+    )
+    parser.add_argument(
+        "--loss-scale-max",
+        type=float,
+        default=16777216.0,
+        help="Maximum loss scale",
+    )
+    parser.add_argument(
+        "--fp8-param",
+        action="store_true",
+        help="Enable persistent FP8 parameter storage for selected modules",
+    )
+    parser.add_argument(
+        "--fp4-param",
+        action="store_true",
+        help="Enable persistent FP4 parameter storage for selected modules",
+    )
+    parser.add_argument(
+        "--fp4-param-format",
+        type=str,
+        default="nf4",
+        choices=["nf4"],
+        help="Persistent FP4 quantization format",
+    )
+    parser.add_argument(
+        "--persistent-scale-granularity",
+        type=str,
+        default="per_channel",
+        choices=["per_tensor", "per_channel"],
+        help="Scale granularity for persistent low-bit quantization",
+    )
+    parser.add_argument(
+        "--module-pattern-type",
+        type=str,
+        default="regex",
+        choices=["regex", "glob"],
+        help="Pattern matcher type for module precision policies",
+    )
+    parser.add_argument(
+        "--compute-lowbit-mode",
+        type=str,
+        default=None,
+        choices=["fp8", "fp4"],
+        help="Per-module low-bit compute mode override",
+    )
+    parser.add_argument(
+        "--compute-lowbit-include",
+        action="append",
+        default=None,
+        help="Repeatable include patterns for low-bit compute module selection",
+    )
+    parser.add_argument(
+        "--compute-lowbit-exclude",
+        action="append",
+        default=None,
+        help="Repeatable exclude patterns for low-bit compute module selection",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-mode",
+        type=str,
+        default="off",
+        choices=["off", "fp8", "fp4"],
+        help="Per-module persistent low-bit storage mode",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-include",
+        action="append",
+        default=None,
+        help="Repeatable include patterns for persistent low-bit module selection",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-exclude",
+        action="append",
+        default=None,
+        help="Repeatable exclude patterns for persistent low-bit module selection",
+    )
     return parser.parse_args()
 
 
@@ -141,6 +326,10 @@ class MVPBootstrap(RuntimeBootstrap):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info("Training device: %s", device)
+        precision_config = resolve_precision_config(args, device)
+        config.training.bf16 = precision_config.mode in ("bf16", "fp8", "fp4")
+        config.model.param_dtype = dtype_alias_to_torch(precision_config.params_dtype)
+        config.model.param_device = device
 
         logger.info("Loading dataset...")
         dataset = TextDataset(
@@ -217,7 +406,11 @@ class MVPBootstrap(RuntimeBootstrap):
         return RuntimeContext(
             parallel=parallel,
             mode="single",
-            run_config=RunConfig(args=args, pp_layer_splits=None),
+            run_config=RunConfig(
+                args=args,
+                pp_layer_splits=None,
+                precision_config=precision_config,
+            ),
         )
 
 
@@ -227,8 +420,26 @@ class MVPModelProvider:
     def build_model(self, ctx: RuntimeContext) -> torch.nn.Module:
         """Build model and emit model-report diagnostics."""
         config = ctx.run_config.args._mvp_config
+        precision_config = ctx.run_config.precision_config
+        if precision_config is None:
+            raise RuntimeError("precision_config must be resolved in MVPBootstrap")
         logger.info("Creating model...")
         model = TransformerModel(config.model)
+        policy = precision_config.module_precision_policy
+        if policy is not None:
+            precision_plan = build_model_precision_plan(model, policy)
+            apply_model_precision_plan(model, precision_plan)
+            ensure_lowbit_compute_assignments(
+                precision_config,
+                precision_plan,
+                script_name="train_mvp.py",
+            )
+            logger.info(
+                "MVP per-module low-bit policy: compute_modules=%d persistent_modules=%d",
+                precision_plan.compute_lowbit_module_count,
+                precision_plan.persistent_lowbit_module_count,
+            )
+        refresh_persistent_lowbit_params(model)
         logger.info("Model vocab size: %d", config.model.vocab_size)
         logger.info("Total parameters: %s", f"{model.num_parameters:,}")
         dump_model_info(model, logger=logger, plot_distributions=False)
@@ -260,6 +471,13 @@ class MVPOptimizerRuntime:
         device = args._mvp_device
 
         trainer = Trainer(model, config, train_loader, device, val_loader=val_loader)
+        precision_config = ctx.run_config.precision_config
+        if precision_config is None:
+            raise RuntimeError("precision_config must be resolved in MVPBootstrap")
+        precision_controller = MixedPrecisionController(
+            precision_config,
+            device=ctx.parallel.device,
+        )
 
         logger.info("=" * 50)
         logger.info("Starting training...")
@@ -278,6 +496,7 @@ class MVPOptimizerRuntime:
             "prev_step_end_time": time.time(),
             "last_loss": None,
             "progress": _NoProgress(),
+            "precision_controller": precision_controller,
         }
 
         return OptimizerState(
@@ -317,6 +536,11 @@ class MVPStepSchedule:
         totals: _TrainTotals = extra_state["totals"]  # type: ignore[assignment]
         window: _TrainWindow = extra_state["window"]  # type: ignore[assignment]
         progress: _NoProgress = extra_state["progress"]  # type: ignore[assignment]
+        precision_controller = extra_state.get("precision_controller")
+        if precision_controller is not None and not isinstance(
+            precision_controller, MixedPrecisionController
+        ):
+            raise TypeError("precision_controller must be MixedPrecisionController when provided")
         prev_step_end_time = float(extra_state["prev_step_end_time"])
 
         step = int(step_ctx.train_state.global_step)
@@ -331,14 +555,23 @@ class MVPStepSchedule:
         step_start = time.time()
         lr_used = float(trainer.optimizer.param_groups[0]["lr"])
 
-        loss, grad_norm, tokens, effective_tokens, samples = trainer.training_step(
-            step_ctx.batch,
-            step=step,
-            log_this_step=log_this_step,
-        )
+        if precision_controller is None:
+            loss, grad_norm, tokens, effective_tokens, samples = trainer.training_step(
+                step_ctx.batch,
+                step=step,
+                log_this_step=log_this_step,
+            )
+        else:
+            with precision_controller.autocast_context():
+                loss, grad_norm, tokens, effective_tokens, samples = trainer.training_step(
+                    step_ctx.batch,
+                    step=step,
+                    log_this_step=log_this_step,
+                )
 
         trainer._maybe_sync_cuda_timing()
         step_seconds = time.time() - step_start
+        refresh_persistent_lowbit_params(step_ctx.model)
 
         loss_value = float(loss.detach().cpu().item())
         totals.update(

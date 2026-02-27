@@ -25,6 +25,7 @@ runtime-backed scripts.
 - [7) Current Script Mapping](#7-current-script-mapping)
 - [8) Known Guardrails](#8-known-guardrails)
 - [9) Troubleshooting](#9-troubleshooting)
+- [10) Mixed Precision Integration](#10-mixed-precision-integration)
 
 ## 1) Runtime Mental Model
 
@@ -45,7 +46,8 @@ The runtime system follows one core pattern:
 Why this exists:
 - Keep orchestration logic reusable.
 - Keep domain-specific logic near each entry script.
-- Allow different scripts (`train_4p`, `tp`, `ddp`, `mvp`) to share one loop skeleton.
+- Allow different scripts (`train_4d`, `train_tp`, `train_ddp`, `train_mvp`) to share one loop
+  skeleton.
 
 What it does not try to solve:
 - It is not a model framework.
@@ -73,6 +75,8 @@ flowchart TD
 
     G -. may use .-> P[src/runtime/pipeline.py]
     C4 -. may use .-> O[src/runtime/optimizer_runtime.py]
+    C4 -. may use .-> MP[src/runtime/mixed_precision.py]
+    C4 -. low-bit backend .-> TE[src/runtime/te_backend.py]
     C4 -. may use .-> S[src/runtime/sync.py]
     C6 -. may use .-> K[src/runtime/checkpoint.py]
 ```
@@ -140,6 +144,7 @@ class RuntimeComponents:
 class RunConfig:
     args: argparse.Namespace
     pp_layer_splits: Optional[tuple[int, ...]]
+    precision_config: Optional[PrecisionConfig] = None
 
 @dataclass
 class RuntimeContext:
@@ -202,6 +207,15 @@ class ResumeState:
 - `StepOutput.counters`:
   - engine expects `objective_count` and `drop_count` (defaults to `1` if absent)
 
+Precision note:
+- Scripts can resolve and store `RunConfig.precision_config` during bootstrap.
+- Optimizer/schedule implementations can use this for autocast policy, low-bit backend routing,
+  and loss-scaling behavior.
+- Low-bit compute is strict per-module: layers only dispatch low-bit when a
+  `ModulePrecisionAssignment` is applied via
+  `build_model_precision_plan(...)` + `apply_model_precision_plan(...)`.
+  Active low-bit runtime context does not act as a global fallback selector.
+
 ## 6) How to Use the Runtime Pattern
 
 Minimal recipe for a new script:
@@ -247,10 +261,10 @@ RuntimeEngine().run(components=components, args=parse_args())
 
 | Script | Bootstrap | Model/Data | Optimizer | Schedule Selection | Checkpoint |
 |---|---|---|---|---|---|
-| `examples/train_4p.py` | `Train4PBootstrap` | `Train4PModelProvider`, `Train4PDataProvider` | `Train4POptimizerRuntime` | `Train4PScheduleSelector` | `Train4PCheckpointManager` |
-| `examples/tp.py` | `TPBootstrap` | `TPModelProvider`, `TPDataProvider` | `TPOptimizerRuntime` | `TPScheduleSelector` | `NoOpCheckpointManager` |
-| `examples/ddp.py` | `DDPBootstrap` | `DDPModelProvider`, `DDPDataProvider` | `DDPOptimizerRuntime` | `DDPScheduleSelector` | `NoOpCheckpointManager` |
-| `examples/mvp.py` | `MVPBootstrap` | `MVPModelProvider`, `MVPDataProvider` | `MVPOptimizerRuntime` | `MVPScheduleSelector` | `MVPCheckpointManager` |
+| `examples/train_4d.py` | `Train4PBootstrap` | `Train4PModelProvider`, `Train4PDataProvider` | `Train4POptimizerRuntime` | `Train4PScheduleSelector` | `Train4PCheckpointManager` |
+| `examples/train_tp.py` | `TPBootstrap` | `TPModelProvider`, `TPDataProvider` | `TPOptimizerRuntime` | `TPScheduleSelector` | `NoOpCheckpointManager` |
+| `examples/train_ddp.py` | `DDPBootstrap` | `DDPModelProvider`, `DDPDataProvider` | `DDPOptimizerRuntime` | `DDPScheduleSelector` | `NoOpCheckpointManager` |
+| `examples/train_mvp.py` | `MVPBootstrap` | `MVPModelProvider`, `MVPDataProvider` | `MVPOptimizerRuntime` | `MVPScheduleSelector` | `MVPCheckpointManager` |
 
 Why components live in `examples/`:
 - These classes encode script-specific behavior and tutorial goals.
@@ -261,13 +275,13 @@ Why components live in `examples/`:
 
 High-level guardrails currently enforced by scripts or runtime helpers:
 
-- `train_4p` validation currently enforces tutorial constraints such as:
+- `train_4d` validation currently enforces tutorial constraints such as:
   - `context_parallel_size == 1`
   - `expert_tensor_parallel_size == 1`
   - TP+EP guardrails in current tutorial mode
   - ZeRO-3 path is out of scope in current tutorial
-- `tp.py` and `ddp.py` use non-pipeline schedules.
-- `mvp.py` bootstrap is single-process oriented.
+- `train_tp.py` and `train_ddp.py` use non-pipeline schedules.
+- `train_mvp.py` bootstrap is single-process oriented.
 
 ## 9) Troubleshooting
 
@@ -295,3 +309,16 @@ Test references for runtime behavior:
 - `tests/test_runtime_checkpoint_lifecycle.py`
 - `tests/test_runtime_bootstrap_contract.py`
 - `tests/test_example_runtime_wiring.py`
+
+## 10) Mixed Precision Integration
+
+`train_4d` integrates mixed precision while keeping `RuntimeEngine` APIs unchanged:
+
+1. Bootstrap resolves `PrecisionConfig` from Megatron-style precision flags.
+2. `Train4POptimizerRuntime` creates a mixed-precision controller and stores it in
+   `OptimizerState.extra_state`.
+3. Schedules wrap forward/loss in precision context and run scaled backward where needed.
+4. Before optimizer step, controller logic unscales grads, checks global finiteness, and can skip
+   unsafe steps consistently across ranks.
+5. Low-bit (`fp8`/`fp4`) linear execution routes through runtime backend dispatch used by
+   `src/layers.py`.

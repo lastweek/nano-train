@@ -37,11 +37,11 @@ def main():
         print("  Or directly with torchrun (using gloo backend):")
         print(f"  torchrun --nproc_per_node={info.world_size} \\")
         print(f"    --backend=gloo \\")
-        print(f"    examples/ddp.py")
+        print(f"    examples/train_ddp.py")
     else:
         print("GPU Production Mode:")
         print(f"  Launch on {info.world_size} GPUs:")
-        print(f"  torchrun --nproc_per_node={info.world_size} examples/ddp.py")
+        print(f"  torchrun --nproc_per_node={info.world_size} examples/train_ddp.py")
 
     print()
     print("Environment Variables:")

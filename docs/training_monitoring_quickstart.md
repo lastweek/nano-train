@@ -16,7 +16,7 @@ high-signal health indicators.
 ### 1) Run a training script
 
 ```bash
-python examples/mvp.py
+python examples/train_mvp.py
 ```
 
 ### 2) Start TensorBoard

@@ -62,7 +62,7 @@ Code path:
 - Router loss computation:
   [src/models/moe.py](../src/models/moe.py) in `TopKRouter._compute_aux_loss`
 - Training objective composition:
-  [examples/train_4p.py](../examples/train_4p.py) in `train_step`
+  [examples/train_4d.py](../examples/train_4d.py) in `train_step`
 
 Implemented form:
 
@@ -92,7 +92,7 @@ expert-parallel domain; expert gradients are synchronized on
 
 ## 6) Practical reading tip
 
-When reading logs in `examples/train_4p.py`:
+When reading logs in `examples/train_4d.py`:
 
 - `task` is language-model loss (`L_task`)
 - `aux` is summed MoE expert-balance proxy

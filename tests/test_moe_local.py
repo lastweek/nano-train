@@ -20,6 +20,8 @@ def test_local_moe_forward_backward_and_stats() -> None:
         expert_intermediate_size=32,
         num_experts=4,
         top_k=2,
+        param_dtype=torch.float32,
+        param_device=None,
         dropout=0.0,
         n_shared_experts=1,
         scoring_func="sigmoid",

@@ -33,6 +33,8 @@ def _free_port() -> int:
 
 def _tiny_config() -> DeepSeekModelConfig:
     return DeepSeekModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
         vocab_size=64,
         hidden_size=64,
         num_hidden_layers=4,

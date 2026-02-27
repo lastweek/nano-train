@@ -869,6 +869,8 @@ def test_sensitivity_deepseek_does_not_scan_named_modules():
     print("Testing DeepSeek sensitivity avoids named_modules scans...")
 
     cfg = DeepSeekModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
         vocab_size=128,
         hidden_size=32,
         num_hidden_layers=4,
@@ -944,6 +946,8 @@ def test_ep_inference_defaults_to_four_experts_per_gpu():
     print("Testing EP inference defaults to ~4 experts per GPU...")
 
     cfg = DeepSeekModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
         vocab_size=128,
         hidden_size=32,
         num_hidden_layers=4,

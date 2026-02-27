@@ -9,12 +9,15 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import Literal
 from typing import Optional
+import torch
 import torch.distributed as dist
 
 
 @dataclass
 class ModelConfig:
     """Model architecture configuration (125M params for MVP)."""
+    param_dtype: torch.dtype
+    param_device: Optional[torch.device]
     hidden_size: int = 768
     num_layers: int = 12
     num_attention_heads: int = 12
@@ -226,7 +229,12 @@ class DistributedConfig:
 @dataclass
 class Config:
     """Main configuration class."""
-    model: ModelConfig = field(default_factory=ModelConfig)
+    model: ModelConfig = field(
+        default_factory=lambda: ModelConfig(
+            param_dtype=torch.float32,
+            param_device=None,
+        )
+    )
     training: TrainingConfig = field(default_factory=TrainingConfig)
     data: DataConfig = field(default_factory=DataConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)

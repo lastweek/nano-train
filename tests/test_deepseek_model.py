@@ -20,6 +20,8 @@ from src.models.moe import ExpertParallelMoE
 
 def _tiny_cfg(num_hidden_layers: int = 2) -> DeepSeekModelConfig:
     return DeepSeekModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
         vocab_size=64,
         hidden_size=96,
         num_hidden_layers=num_hidden_layers,
@@ -119,6 +121,8 @@ def test_moe_uses_expert_model_parallel_domain() -> None:
 def test_moe_expert_ranges_replicate_across_tensor_parallel() -> None:
     """With expert_model_parallel_size=2, each EP shard repeats across TP ranks."""
     cfg = DeepSeekModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
         vocab_size=64,
         hidden_size=96,
         num_hidden_layers=3,

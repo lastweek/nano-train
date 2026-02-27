@@ -57,6 +57,8 @@ class MLP(nn.Module):
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 tp_group=self.tp_group,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
 
             # RowParallelLinear expects GLOBAL in_features and consumes local shard.
@@ -66,11 +68,23 @@ class MLP(nn.Module):
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 tp_group=self.tp_group,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
         else:
             # Standard Linear layers
-            self.fc1 = Linear(config.hidden_size, config.intermediate_size)
-            self.fc2 = Linear(config.intermediate_size, config.hidden_size)
+            self.fc1 = Linear(
+                config.hidden_size,
+                config.intermediate_size,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
+            self.fc2 = Linear(
+                config.intermediate_size,
+                config.hidden_size,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
 
         self.dropout = Dropout(config.dropout)
         self.act = GELU()

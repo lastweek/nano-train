@@ -37,7 +37,12 @@ try:
     from src.layers import Linear, LayerNorm, Embedding, Dropout, GELU, clip_grad_norm
 
     # Linear
-    linear = Linear(10, 20).to(device)
+    linear = Linear(
+        10,
+        20,
+        param_dtype=torch.float32,
+        param_device=None,
+    ).to(device)
     ref = torch.nn.Linear(10, 20).to(device)
     with torch.no_grad():
         linear.weight.copy_(ref.weight)
@@ -51,7 +56,11 @@ try:
     print("  ✓ Linear")
 
     # LayerNorm
-    ln = LayerNorm(20).to(device)
+    ln = LayerNorm(
+        20,
+        param_dtype=torch.float32,
+        param_device=None,
+    ).to(device)
     ref = torch.nn.LayerNorm(20).to(device)
     with torch.no_grad():
         ln.weight.copy_(ref.weight)
@@ -65,7 +74,12 @@ try:
     print("  ✓ LayerNorm")
 
     # Embedding
-    emb = Embedding(100, 20).to(device)
+    emb = Embedding(
+        100,
+        20,
+        param_dtype=torch.float32,
+        param_device=None,
+    ).to(device)
     ref = torch.nn.Embedding(100, 20).to(device)
     with torch.no_grad():
         emb.weight.copy_(ref.weight)

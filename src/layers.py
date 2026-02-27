@@ -23,13 +23,368 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+from typing import TYPE_CHECKING
+
+from src.runtime.te_backend import ActiveLowBitContext
+from src.runtime.te_backend import get_active_lowbit_context
+
+if TYPE_CHECKING:
+    from src.runtime.contracts import LowBitComputeMode
+    from src.runtime.contracts import ModulePrecisionAssignment
+    from src.runtime.contracts import PersistentScaleGranularity
+else:
+    LowBitComputeMode = str
+    ModulePrecisionAssignment = object
+    PersistentScaleGranularity = str
+
+
+def _nf4_codebook(device: torch.device) -> torch.Tensor:
+    """Return NF4 codebook values used for FP4 persistent quantization."""
+    return torch.tensor(
+        [
+            -1.0,
+            -0.6961928,
+            -0.52507305,
+            -0.3949175,
+            -0.28444138,
+            -0.18477343,
+            -0.09105004,
+            0.0,
+            0.0795803,
+            0.1609302,
+            0.2461123,
+            0.33791524,
+            0.44070983,
+            0.562617,
+            0.72295684,
+            1.0,
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _safe_scale(
+    tensor: torch.Tensor,
+    *,
+    granularity: "PersistentScaleGranularity",
+) -> torch.Tensor:
+    """Compute safe positive scales for per-tensor or per-channel quantization."""
+    tensor_f = tensor.float()
+    if granularity == "per_channel" and tensor.dim() > 1:
+        reduce_dims = tuple(range(1, tensor.dim()))
+        scale = tensor_f.abs().amax(dim=reduce_dims, keepdim=True)
+    else:
+        scale = tensor_f.abs().amax()
+
+    one = torch.ones_like(scale, dtype=torch.float32)
+    scale = torch.where(torch.isfinite(scale) & (scale > 0), scale, one)
+    return scale
+
+
+def _quantize_fp8_persistent(
+    tensor: torch.Tensor,
+    *,
+    granularity: "PersistentScaleGranularity",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor into FP8 persistent representation with scales."""
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        raise RuntimeError("Persistent FP8 requires torch.float8_e4m3fn support")
+
+    scale = _safe_scale(tensor, granularity=granularity)
+    normalized = (tensor.float() / scale).clamp(min=-448.0, max=448.0)
+    fp8_values = normalized.to(dtype=fp8_dtype)
+    return fp8_values, scale
+
+
+def _dequantize_fp8_persistent(
+    fp8_values: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize FP8 persistent representation into target dtype."""
+    return (fp8_values.float() * scale).to(dtype=target_dtype)
+
+
+def _pack_nibbles(indices: torch.Tensor) -> torch.Tensor:
+    """Pack uint8 [0, 15] values into packed uint8 nibbles."""
+    flat = indices.reshape(-1).to(dtype=torch.uint8)
+    if flat.numel() % 2 == 1:
+        pad = torch.zeros(1, dtype=torch.uint8, device=flat.device)
+        flat = torch.cat((flat, pad), dim=0)
+
+    low = flat[0::2]
+    high = flat[1::2] << 4
+    return (low | high).contiguous()
+
+
+def _unpack_nibbles(
+    packed: torch.Tensor,
+    *,
+    num_values: int,
+) -> torch.Tensor:
+    """Unpack packed uint8 nibbles into long indices [0, 15]."""
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    unpacked = torch.empty(packed.numel() * 2, dtype=torch.long, device=packed.device)
+    unpacked[0::2] = low.long()
+    unpacked[1::2] = high.long()
+    return unpacked[:num_values]
+
+
+def _quantize_nf4_persistent(
+    tensor: torch.Tensor,
+    *,
+    granularity: "PersistentScaleGranularity",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor into NF4 packed codes plus scale metadata."""
+    scale = _safe_scale(tensor, granularity=granularity)
+    normalized = tensor.float() / scale
+    codebook = _nf4_codebook(tensor.device)
+    clipped = normalized.clamp(min=float(codebook[0]), max=float(codebook[-1]))
+    distances = (clipped.reshape(-1, 1) - codebook.reshape(1, -1)).abs()
+    indices = distances.argmin(dim=1).to(dtype=torch.uint8)
+    packed = _pack_nibbles(indices)
+    return packed, scale
+
+
+def _dequantize_nf4_persistent(
+    packed_codes: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    num_values: int,
+    target_shape: torch.Size,
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize NF4 packed code representation into target dtype tensor."""
+    codebook = _nf4_codebook(packed_codes.device)
+    unpacked = _unpack_nibbles(packed_codes, num_values=num_values)
+    dequant = codebook[unpacked].reshape(target_shape) * scale
+    return dequant.to(dtype=target_dtype)
+
+
+class _LowBitPrecisionLinearMixin:
+    """Reusable per-module low-bit compute and persistent parameter hooks."""
+
+    def _init_lowbit_precision_state(self) -> None:
+        self._precision_assignment: Optional["ModulePrecisionAssignment"] = None
+        self.register_buffer("_persistent_fp8_weight", torch.empty(0), persistent=True)
+        self.register_buffer(
+            "_persistent_fp4_codes",
+            torch.empty(0, dtype=torch.uint8),
+            persistent=True,
+        )
+        self.register_buffer("_persistent_scale", torch.empty(0), persistent=True)
+        self.register_buffer(
+            "_persistent_numel",
+            torch.zeros((), dtype=torch.int64),
+            persistent=True,
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Load parameters while tolerating legacy checkpoints without low-bit buffers."""
+        super()._load_from_state_dict(  # type: ignore[misc]
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        optional_suffixes = (
+            "_persistent_fp8_weight",
+            "_persistent_fp4_codes",
+            "_persistent_scale",
+            "_persistent_numel",
+        )
+        optional_keys = {f"{prefix}{suffix}" for suffix in optional_suffixes}
+        missing_keys[:] = [key for key in missing_keys if key not in optional_keys]
+
+    def set_precision_assignment(self, assignment: "ModulePrecisionAssignment") -> None:
+        """Set per-module precision assignment resolved by runtime policy."""
+        self._precision_assignment = assignment
+        self.refresh_persistent_lowbit_params()
+
+    def _persistent_mode(self) -> str:
+        assignment = self._precision_assignment
+        if assignment is None:
+            return "off"
+        return str(getattr(assignment, "persistent_lowbit_mode", "off"))
+
+    def _persistent_granularity(self) -> str:
+        assignment = self._precision_assignment
+        if assignment is None:
+            return "per_channel"
+        return str(getattr(assignment, "persistent_scale_granularity", "per_channel"))
+
+    def _compute_lowbit_mode(
+        self,
+    ) -> Optional["LowBitComputeMode"]:
+        assignment = self._precision_assignment
+        if assignment is None:
+            return None
+
+        assignment_mode = getattr(assignment, "compute_lowbit_mode", None)
+        if assignment_mode is None:
+            return None
+        mode_text = str(assignment_mode)
+        if mode_text not in ("fp8", "fp4"):
+            return None
+        return mode_text  # type: ignore[return-value]
+
+    def _clear_persistent_lowbit_buffers(self) -> None:
+        self._persistent_fp8_weight = torch.empty(0, device=self.weight.device)
+        self._persistent_fp4_codes = torch.empty(0, dtype=torch.uint8, device=self.weight.device)
+        self._persistent_scale = torch.empty(0, device=self.weight.device)
+        self._persistent_numel = torch.zeros((), dtype=torch.int64, device=self.weight.device)
+
+    @torch.no_grad()
+    def refresh_persistent_lowbit_params(self) -> None:
+        """Refresh persistent low-bit buffers from current master weight."""
+        mode = self._persistent_mode()
+        if mode == "off":
+            self._clear_persistent_lowbit_buffers()
+            return
+
+        granularity = self._persistent_granularity()
+        if granularity not in ("per_tensor", "per_channel"):
+            raise ValueError(
+                f"Unsupported persistent_scale_granularity={granularity!r} "
+                "for low-bit persistent params"
+            )
+
+        if mode == "fp8":
+            fp8_weight, scale = _quantize_fp8_persistent(
+                self.weight.detach(),
+                granularity=granularity,  # type: ignore[arg-type]
+            )
+            self._persistent_fp8_weight = fp8_weight
+            self._persistent_fp4_codes = torch.empty(
+                0,
+                dtype=torch.uint8,
+                device=self.weight.device,
+            )
+            self._persistent_scale = scale
+            self._persistent_numel = torch.tensor(
+                int(self.weight.numel()),
+                dtype=torch.int64,
+                device=self.weight.device,
+            )
+            return
+
+        if mode == "fp4":
+            fp4_format = str(getattr(self._precision_assignment, "fp4_persistent_format", "nf4"))
+            if fp4_format != "nf4":
+                raise ValueError("Only nf4 is supported for FP4 persistent params")
+
+            packed, scale = _quantize_nf4_persistent(
+                self.weight.detach(),
+                granularity=granularity,  # type: ignore[arg-type]
+            )
+            self._persistent_fp4_codes = packed
+            self._persistent_fp8_weight = torch.empty(0, device=self.weight.device)
+            self._persistent_scale = scale
+            self._persistent_numel = torch.tensor(
+                int(self.weight.numel()),
+                dtype=torch.int64,
+                device=self.weight.device,
+            )
+            return
+
+        raise ValueError(f"Unsupported persistent low-bit mode: {mode}")
+
+    def _persistent_weight_ste(self) -> torch.Tensor:
+        """Return weight used in forward with STE bridge to master parameter."""
+        mode = self._persistent_mode()
+        if mode == "off":
+            return self.weight
+
+        if mode == "fp8":
+            if self._persistent_fp8_weight.numel() != self.weight.numel():
+                self.refresh_persistent_lowbit_params()
+            dequant = _dequantize_fp8_persistent(
+                self._persistent_fp8_weight,
+                self._persistent_scale,
+                target_dtype=self.weight.dtype,
+            )
+        elif mode == "fp4":
+            if int(self._persistent_numel.item()) != int(self.weight.numel()):
+                self.refresh_persistent_lowbit_params()
+            dequant = _dequantize_nf4_persistent(
+                self._persistent_fp4_codes,
+                self._persistent_scale,
+                num_values=int(self.weight.numel()),
+                target_shape=self.weight.shape,
+                target_dtype=self.weight.dtype,
+            )
+        else:
+            raise ValueError(f"Unsupported persistent low-bit mode: {mode}")
+
+        return self.weight + (dequant - self.weight).detach()
+
+    def _dispatch_lowbit_linear(
+        self,
+        *,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        lowbit_context: Optional[ActiveLowBitContext],
+    ) -> Optional[torch.Tensor]:
+        """Run low-bit backend if module policy selects one; otherwise return None."""
+        compute_mode = self._compute_lowbit_mode()
+        if compute_mode is None:
+            if (
+                self._precision_assignment is None
+                and lowbit_context is not None
+                and lowbit_context.backend_by_mode
+            ):
+                module_name = getattr(self._precision_assignment, "module_name", None)
+                module_label = module_name if module_name else "<unassigned>"
+                raise RuntimeError(
+                    "Low-bit context is active, but module "
+                    f"{self.__class__.__name__} ({module_label}) has no precision assignment. "
+                    "Apply per-module assignments via "
+                    "build_model_precision_plan(...) and apply_model_precision_plan(...)."
+                )
+            return None
+        if lowbit_context is None:
+            raise RuntimeError(
+                f"Module {self.__class__.__name__} requested compute mode {compute_mode} "
+                "without active low-bit runtime context"
+            )
+
+        backend = lowbit_context.backend_by_mode.get(str(compute_mode))
+        if backend is None:
+            raise RuntimeError(
+                f"No active low-bit backend for compute mode {compute_mode}. "
+                "Check --compute-lowbit-mode and backend flags."
+            )
+        return backend.linear(
+            x,
+            weight,
+            bias,
+            mode=compute_mode,
+            config=lowbit_context.config,
+        )
 
 
 # =============================================================================
 # LINEAR LAYER (Fully Connected / Dense)
 # =============================================================================
 
-class Linear(nn.Module):
+class Linear(_LowBitPrecisionLinearMixin, nn.Module):
     """
     Linear transformation: y = xA^T + b
 
@@ -94,7 +449,15 @@ class Linear(nn.Module):
     - Output: Input (hidden_size) → Vocab (vocab_size)
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        *,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
+    ):
         """
         Args:
             in_features: Number of input features (last dim of input)
@@ -107,12 +470,25 @@ class Linear(nn.Module):
 
         # Weight matrix: (out_features, in_features)
         # Each row is weights for one output neuron
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight = nn.Parameter(
+            torch.empty(
+                out_features,
+                in_features,
+                dtype=param_dtype,
+                device=param_device,
+            )
+        )
 
         # Bias vector: (out_features,)
         # One bias value per output neuron
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
+            self.bias = nn.Parameter(
+                torch.empty(
+                    out_features,
+                    dtype=param_dtype,
+                    device=param_device,
+                )
+            )
         else:
             self.register_parameter('bias', None)
 
@@ -121,6 +497,7 @@ class Linear(nn.Module):
         nn.init.normal_(self.weight, std=0.02)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
+        self._init_lowbit_precision_state()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -138,11 +515,22 @@ class Linear(nn.Module):
         Returns:
             Tensor of shape (*, out_features)
         """
+        lowbit = get_active_lowbit_context()
+        weight = self._persistent_weight_ste()
+        lowbit_output = self._dispatch_lowbit_linear(
+            x=x,
+            weight=weight,
+            bias=self.bias,
+            lowbit_context=lowbit,
+        )
+        if lowbit_output is not None:
+            return lowbit_output
+
         # F.linear is equivalent to x @ weight.T + bias
         # But more numerically stable and optimized
         if self.bias is not None:
-            return F.linear(x, self.weight, self.bias)
-        return F.linear(x, self.weight)
+            return F.linear(x, weight, self.bias)
+        return F.linear(x, weight)
 
 
 # =============================================================================
@@ -214,7 +602,14 @@ class LayerNorm(nn.Module):
     - Training speed: Allows higher learning rates
     """
 
-    def __init__(self, normalized_shape: int, eps: float = 1e-5):
+    def __init__(
+        self,
+        normalized_shape: int,
+        eps: float = 1e-5,
+        *,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
+    ):
         """
         Args:
             normalized_shape: Number of features to normalize (usually hidden_size)
@@ -225,10 +620,22 @@ class LayerNorm(nn.Module):
         self.eps = eps
 
         # Learnable scale (gamma): Initialize to 1.0 (identity)
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.weight = nn.Parameter(
+            torch.ones(
+                normalized_shape,
+                dtype=param_dtype,
+                device=param_device,
+            )
+        )
 
         # Learnable shift (beta): Initialize to 0.0 (identity)
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.bias = nn.Parameter(
+            torch.zeros(
+                normalized_shape,
+                dtype=param_dtype,
+                device=param_device,
+            )
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -322,7 +729,14 @@ class Embedding(nn.Module):
     - Enable gradient-based learning (can't backprop through discrete IDs)
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
+    ):
         """
         Args:
             num_embeddings: Size of the dictionary (vocab_size)
@@ -334,7 +748,14 @@ class Embedding(nn.Module):
 
         # Embedding matrix: (num_embeddings, embedding_dim)
         # Each row is the vector for one token ID
-        self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim))
+        self.weight = nn.Parameter(
+            torch.empty(
+                num_embeddings,
+                embedding_dim,
+                dtype=param_dtype,
+                device=param_device,
+            )
+        )
 
         # Initialize with normal distribution (std=0.02)
         # This is common for transformers (similar to GPT-2)
@@ -689,7 +1110,7 @@ class _CopyToTensorParallelRegion(torch.autograd.Function):
         return grad_input, None
 
 
-class ColumnParallelLinear(nn.Module):
+class ColumnParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
     """
     Column-parallel linear (shard output features).
 
@@ -714,6 +1135,9 @@ class ColumnParallelLinear(nn.Module):
         tp_size: int,
         bias: bool = True,
         tp_group=None,
+        *,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
     ):
         """
         Args:
@@ -740,15 +1164,29 @@ class ColumnParallelLinear(nn.Module):
 
         # Weight shard: (shard_size, in_features)
         # F.linear expects (out_features, in_features), so this is correct
-        self.weight = nn.Parameter(torch.empty(self.shard_size, in_features))
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.shard_size,
+                in_features,
+                dtype=param_dtype,
+                device=param_device,
+            )
+        )
         if bias:
-            self.bias = nn.Parameter(torch.empty(self.shard_size))
+            self.bias = nn.Parameter(
+                torch.empty(
+                    self.shard_size,
+                    dtype=param_dtype,
+                    device=param_device,
+                )
+            )
         else:
             self.register_parameter('bias', None)
 
         nn.init.normal_(self.weight, std=0.02)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
+        self._init_lowbit_precision_state()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -763,12 +1201,23 @@ class ColumnParallelLinear(nn.Module):
         if self.tp_size > 1:
             x = _CopyToTensorParallelRegion.apply(x, self.tp_group)
 
+        lowbit = get_active_lowbit_context()
+        weight = self._persistent_weight_ste()
+        lowbit_output = self._dispatch_lowbit_linear(
+            x=x,
+            weight=weight,
+            bias=self.bias,
+            lowbit_context=lowbit,
+        )
+        if lowbit_output is not None:
+            return lowbit_output
+
         if self.bias is not None:
-            return F.linear(x, self.weight, self.bias)
-        return F.linear(x, self.weight)
+            return F.linear(x, weight, self.bias)
+        return F.linear(x, weight)
 
 
-class RowParallelLinear(nn.Module):
+class RowParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
     """
     Row-parallel linear (shard input features).
 
@@ -795,6 +1244,9 @@ class RowParallelLinear(nn.Module):
         tp_size: int,
         bias: bool = True,
         tp_group=None,
+        *,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
     ):
         """
         Args:
@@ -821,15 +1273,29 @@ class RowParallelLinear(nn.Module):
 
         # Weight shard: (out_features, shard_size)
         # F.linear expects (out_features, in_features), so this is correct
-        self.weight = nn.Parameter(torch.empty(out_features, self.shard_size))
+        self.weight = nn.Parameter(
+            torch.empty(
+                out_features,
+                self.shard_size,
+                dtype=param_dtype,
+                device=param_device,
+            )
+        )
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
+            self.bias = nn.Parameter(
+                torch.empty(
+                    out_features,
+                    dtype=param_dtype,
+                    device=param_device,
+                )
+            )
         else:
             self.register_parameter('bias', None)
 
         nn.init.normal_(self.weight, std=0.02)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
+        self._init_lowbit_precision_state()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -841,8 +1307,19 @@ class RowParallelLinear(nn.Module):
         Returns:
             Tensor of shape (*, out_features) - full output on all GPUs
         """
-        # Compute partial output from local input/weight shards.
-        partial_output = F.linear(x, self.weight, None)
+        lowbit = get_active_lowbit_context()
+        weight = self._persistent_weight_ste()
+        lowbit_output = self._dispatch_lowbit_linear(
+            x=x,
+            weight=weight,
+            bias=None,
+            lowbit_context=lowbit,
+        )
+        if lowbit_output is None:
+            # Compute partial output from local input/weight shards.
+            partial_output = F.linear(x, weight, None)
+        else:
+            partial_output = lowbit_output
 
         # Sum partial outputs across TP ranks.
         if self.tp_size > 1:

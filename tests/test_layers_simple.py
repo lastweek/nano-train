@@ -31,7 +31,12 @@ def test_linear():
 
     from src.layers import Linear
 
-    native = Linear(10, 20).to(device)
+    native = Linear(
+        10,
+        20,
+        param_dtype=torch.float32,
+        param_device=None,
+    ).to(device)
     ref = nn.Linear(10, 20).to(device)
 
     with torch.no_grad():
@@ -53,7 +58,11 @@ def test_layer_norm():
 
     from src.layers import LayerNorm
 
-    native = LayerNorm(20).to(device)
+    native = LayerNorm(
+        20,
+        param_dtype=torch.float32,
+        param_device=None,
+    ).to(device)
     ref = nn.LayerNorm(20).to(device)
 
     with torch.no_grad():
@@ -75,7 +84,12 @@ def test_embedding():
 
     from src.layers import Embedding
 
-    native = Embedding(100, 20).to(device)
+    native = Embedding(
+        100,
+        20,
+        param_dtype=torch.float32,
+        param_device=None,
+    ).to(device)
     ref = nn.Embedding(100, 20).to(device)
 
     with torch.no_grad():
@@ -147,10 +161,20 @@ def test_integration():
 
     # Native MLP
     native = torch.nn.Sequential(
-        Linear(10, 20),
+        Linear(
+            10,
+            20,
+            param_dtype=torch.float32,
+            param_device=None,
+        ),
         GELU(),
         Dropout(0.0),
-        Linear(20, 15)
+        Linear(
+            20,
+            15,
+            param_dtype=torch.float32,
+            param_device=None,
+        )
     ).to(device)
 
     # Reference MLP

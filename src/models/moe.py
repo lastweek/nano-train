@@ -66,11 +66,37 @@ class _ReturnPayload:
 class ExpertMLP(nn.Module):
     """SwiGLU expert MLP used by routed MoE layers."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int, dropout: float) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        dropout: float,
+        *,
+        param_dtype: torch.dtype,
+        param_device: torch.device | None,
+    ) -> None:
         super().__init__()
-        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = Linear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            param_dtype=param_dtype,
+            param_device=param_device,
+        )
+        self.up_proj = Linear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            param_dtype=param_dtype,
+            param_device=param_device,
+        )
+        self.down_proj = Linear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            param_dtype=param_dtype,
+            param_device=param_device,
+        )
         self.dropout = Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -87,6 +113,9 @@ class TopKRouter(nn.Module):
         hidden_size: int,
         num_experts: int,
         top_k: int,
+        *,
+        param_dtype: torch.dtype,
+        param_device: torch.device | None,
         scoring_func: str = "sigmoid",
         n_group: int = 1,
         topk_group: int = 1,
@@ -117,13 +146,22 @@ class TopKRouter(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
 
-        self.router = Linear(hidden_size, num_experts, bias=False)
+        self.router = Linear(
+            hidden_size,
+            num_experts,
+            bias=False,
+            param_dtype=param_dtype,
+            param_device=param_device,
+        )
 
     def _score_experts(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute routing scores from raw logits."""
         if self.scoring_func == "sigmoid":
             return torch.sigmoid(logits)
-        return torch.softmax(logits, dim=-1)
+        logits_softmax = logits
+        if logits_softmax.dtype not in (torch.float32, torch.float64):
+            logits_softmax = logits_softmax.float()
+        return torch.softmax(logits_softmax, dim=-1).to(dtype=logits.dtype)
 
     def _apply_group_routing(self, scores: torch.Tensor) -> torch.Tensor:
         """Apply DeepSeek-style group routing mask before top-k selection."""
@@ -204,7 +242,10 @@ class TopKRouter(nn.Module):
             denom = torch.clamp(topk_weights.sum(dim=-1, keepdim=True), min=1e-9)
             topk_weights = topk_weights / denom
         elif self.scoring_func == "softmax":
-            topk_weights = torch.softmax(topk_weights, dim=-1)
+            topk_weights_softmax = topk_weights
+            if topk_weights_softmax.dtype not in (torch.float32, torch.float64):
+                topk_weights_softmax = topk_weights_softmax.float()
+            topk_weights = torch.softmax(topk_weights_softmax, dim=-1).to(dtype=topk_weights.dtype)
 
         topk_weights = topk_weights * self.routed_scaling_factor
         aux_loss = self._compute_aux_loss(scores, topk_indices)
@@ -226,6 +267,9 @@ class LocalRoutedMoE(nn.Module):
         expert_intermediate_size: int,
         num_experts: int,
         top_k: int,
+        *,
+        param_dtype: torch.dtype,
+        param_device: torch.device | None,
         dropout: float = 0.0,
         n_shared_experts: int = 0,
         scoring_func: str = "sigmoid",
@@ -248,6 +292,8 @@ class LocalRoutedMoE(nn.Module):
             hidden_size=hidden_size,
             num_experts=num_experts,
             top_k=top_k,
+            param_dtype=param_dtype,
+            param_device=param_device,
             scoring_func=scoring_func,
             n_group=n_group,
             topk_group=topk_group,
@@ -260,6 +306,8 @@ class LocalRoutedMoE(nn.Module):
                     hidden_size=hidden_size,
                     intermediate_size=expert_intermediate_size,
                     dropout=dropout,
+                    param_dtype=param_dtype,
+                    param_device=param_device,
                 )
                 for _ in range(num_experts)
             ]
@@ -270,6 +318,8 @@ class LocalRoutedMoE(nn.Module):
                     hidden_size=hidden_size,
                     intermediate_size=expert_intermediate_size,
                     dropout=dropout,
+                    param_dtype=param_dtype,
+                    param_device=param_device,
                 )
                 for _ in range(n_shared_experts)
             ]
@@ -382,6 +432,9 @@ class ExpertParallelMoE(nn.Module):
         ep_rank: int,
         ep_size: int,
         ep_group,
+        *,
+        param_dtype: torch.dtype,
+        param_device: torch.device | None,
         dropout: float = 0.0,
         n_shared_experts: int = 0,
         scoring_func: str = "sigmoid",
@@ -419,6 +472,8 @@ class ExpertParallelMoE(nn.Module):
             hidden_size=hidden_size,
             num_experts=num_experts,
             top_k=top_k,
+            param_dtype=param_dtype,
+            param_device=param_device,
             scoring_func=scoring_func,
             n_group=n_group,
             topk_group=topk_group,
@@ -432,6 +487,8 @@ class ExpertParallelMoE(nn.Module):
                     hidden_size=hidden_size,
                     intermediate_size=expert_intermediate_size,
                     dropout=dropout,
+                    param_dtype=param_dtype,
+                    param_device=param_device,
                 )
                 for _ in range(self.experts_per_rank)
             ]
@@ -443,6 +500,8 @@ class ExpertParallelMoE(nn.Module):
                     hidden_size=hidden_size,
                     intermediate_size=expert_intermediate_size,
                     dropout=dropout,
+                    param_dtype=param_dtype,
+                    param_device=param_device,
                 )
                 for _ in range(n_shared_experts)
             ]

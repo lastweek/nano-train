@@ -5,13 +5,13 @@ Tensor (TP), Pipeline (PP), Expert (EP), Data (DP), and ZeRO-1/2.
 
 ## Current Status
 
-- Main tutorial entrypoint: `examples/train_4p.py` (TP/PP/EP/DP + ZeRO-1/2).
-- Focused TP/DP learning path: `examples/tp.py`.
+- Main tutorial entrypoint: `examples/train_4d.py` (TP/PP/EP/DP + ZeRO-1/2).
+- Focused TP/DP learning path: `examples/train_tp.py`.
 - ZeRO implementation: `src/distributed/zero.py` (`optim`, `optim_grads`).
 - DeepSeek-style model stack:
   - `src/models/deepseek.py`
   - `src/models/moe.py`
-- Current tutorial constraints in `examples/train_4p.py`:
+- Current tutorial constraints in `examples/train_4d.py`:
   - `tensor-model-parallel-size > 1` with `expert-model-parallel-size > 1` is disallowed.
   - `expert-tensor-parallel-size == 1`.
   - `context-parallel-size == 1`.
@@ -30,7 +30,7 @@ pip install -r requirements.txt
 ### Single-Rank Smoke
 
 ```bash
-python3 examples/train_4p.py \
+python3 examples/train_4d.py \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 1 \
   --expert-model-parallel-size 1 \
@@ -41,7 +41,7 @@ python3 examples/train_4p.py \
 
 ```bash
 python3 examples/launch.py --world-size 4 --backend gloo \
-  --script examples/train_4p.py --script-args \
+  --script examples/train_4d.py --script-args \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 2 \
   --expert-model-parallel-size 2 \
@@ -51,12 +51,29 @@ python3 examples/launch.py --world-size 4 --backend gloo \
   --max_steps 1
 ```
 
+### Mixed Precision Smoke (FP8 Emulated)
+
+```bash
+python3 examples/train_4d.py \
+  --tensor-model-parallel-size 1 \
+  --pipeline-model-parallel-size 1 \
+  --expert-model-parallel-size 1 \
+  --fp8 \
+  --fp8-backend emulated \
+  --params-dtype bf16 \
+  --main-params-dtype fp32 \
+  --main-grads-dtype fp32 \
+  --exp-avg-dtype fp32 \
+  --exp-avg-sq-dtype fp32 \
+  --max_steps 1
+```
+
 ## Key Entrypoints
 
 | Path | Purpose |
 |---|---|
-| `examples/train_4p.py` | Canonical TP/PP/EP/DP tutorial script with optional ZeRO-1/2 |
-| `examples/tp.py` | TP-only and TP+DP tutorial path |
+| `examples/train_4d.py` | Canonical TP/PP/EP/DP tutorial script with optional ZeRO-1/2 |
+| `examples/train_tp.py` | TP-only and TP+DP tutorial path |
 | `examples/launch.py` | Multi-process launcher for local distributed runs |
 | `src/distributed/topology.py` | Parallel group/rank topology setup |
 | `src/distributed/zero.py` | Megatron-style ZeRO-1/2 optimizer implementation |
@@ -66,7 +83,7 @@ python3 examples/launch.py --world-size 4 --backend gloo \
 
 ## Runtime Core
 
-`examples/train_4p.py`, `examples/tp.py`, `examples/ddp.py`, and `examples/mvp.py`
+`examples/train_4d.py`, `examples/train_tp.py`, `examples/train_ddp.py`, and `examples/train_mvp.py`
 now use a thin-script pattern:
 
 - Script owns CLI and component wiring.
@@ -83,10 +100,10 @@ See `docs/runtime_core_design.md` for full API and extension details.
 ```mermaid
 flowchart TD
     subgraph E["Entry Scripts (`examples/`)"]
-        E1["train_4p.py"]
-        E2["tp.py"]
-        E3["ddp.py"]
-        E4["mvp.py"]
+        E1["train_4d.py"]
+        E2["train_tp.py"]
+        E3["train_ddp.py"]
+        E4["train_mvp.py"]
         E5["Parse args + assemble RuntimeComponents"]
     end
 
@@ -194,19 +211,19 @@ flowchart TD
 | 2026-02-09 | `5cfeb63` | Initial repo bootstrap | `README.md`, `src/*`, `examples/*`, `tests/*` |
 | 2026-02-13 | `8044208` | MVP stack refactor + model efficiency reporting | `src/trainer.py`, `src/utils/model_info.py`, `docs/model_info.md` |
 | 2026-02-19 | `9c12e7e` | Monitoring stability/perf metrics | `src/trainer.py`, `src/config.py`, `src/monitoring.py`, `docs/training_monitoring_metrics_reference.md` |
-| 2026-02-24 | `5206984` | Canonical TP + DP tutorial pipeline | `examples/tp.py`, `src/layers.py`, `docs/tp_dp_communication.md` |
-| 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/train_4p.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
+| 2026-02-24 | `5206984` | Canonical TP + DP tutorial pipeline | `examples/train_tp.py`, `src/layers.py`, `docs/tp_dp_communication.md` |
+| 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/train_4d.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
 | 2026-02-25 | `5855268` | Docs IA/readability overhaul | `docs/README.md`, `docs/*.md`, `README.md`, `src/utils/model_info.py` |
-| 2026-02-26 | `69188d8` | 4P entrypoint rename + ZeRO-1/2 integration and debug visibility | `examples/train_4p.py`, `src/distributed/zero.py`, `src/trainer.py`, `docs/zero1_zero2_*.md`, `tests/test_zero_*.py` |
+| 2026-02-26 | `69188d8` | 4P entrypoint rename + ZeRO-1/2 integration and debug visibility | `examples/train_4d.py`, `src/distributed/zero.py`, `src/trainer.py`, `docs/zero1_zero2_*.md`, `tests/test_zero_*.py` |
 
 ### Planned Next Milestones
 
 | Status | Milestone | Expected Focus Files |
 |---|---|---|
-| In Progress | Canonical TP+EP mapping (remove TP+EP guard, avoid expert replication) | `examples/train_4p.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md`, `docs/pp_tp_ep_dp_communication.md` |
-| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/train_4p.py`, `src/models/moe.py`, `tests/test_train_4p_script_logic.py` |
+| In Progress | Canonical TP+EP mapping (remove TP+EP guard, avoid expert replication) | `examples/train_4d.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md`, `docs/pp_tp_ep_dp_communication.md` |
+| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/train_4d.py`, `src/models/moe.py`, `tests/test_train_4p_script_logic.py` |
 | Planned | DeepSeek parallel context cleanup and simplification | `src/models/deepseek.py`, `tests/test_deepseek_model.py` |
-| Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/train_4p.py`, `docs/deepseek_moe_aux_losses.md` |
+| Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/train_4d.py`, `docs/deepseek_moe_aux_losses.md` |
 | Planned | Checkpoint resume path for ZeRO sharded optimizer in trainer | `src/trainer.py`, `src/distributed/zero.py`, `docs/zero1_zero2_quickstart.md` |
 
 ## Repository Layout

@@ -32,6 +32,8 @@ from src.models.moe import LocalRoutedMoE
 @dataclass
 class DeepSeekModelConfig:
     """Configuration shaped after DeepSeek-V3 key parameters."""
+    param_dtype: torch.dtype
+    param_device: Optional[torch.device]
 
     # Core architecture
     vocab_size: int = 129280
@@ -304,10 +306,23 @@ class DeepSeekParallelContext:
 class RMSNorm(nn.Module):
     """RMSNorm used by DeepSeek-style decoder blocks."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        *,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
+    ):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(
+            torch.ones(
+                hidden_size,
+                dtype=param_dtype,
+                device=param_device,
+            )
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         var = x.pow(2).mean(dim=-1, keepdim=True)
@@ -323,6 +338,8 @@ class GatedMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         dropout: float,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
         parallel_context: Optional[DeepSeekParallelContext] = None,
     ):
         super().__init__()
@@ -337,6 +354,8 @@ class GatedMLP(nn.Module):
                 tp_size=self.parallel_context.tensor_model_parallel_size,
                 tp_group=self.parallel_context.tensor_model_parallel_group,
                 bias=True,
+                param_dtype=param_dtype,
+                param_device=param_device,
             )
             self.up_proj = ColumnParallelLinear(
                 hidden_size,
@@ -345,6 +364,8 @@ class GatedMLP(nn.Module):
                 tp_size=self.parallel_context.tensor_model_parallel_size,
                 tp_group=self.parallel_context.tensor_model_parallel_group,
                 bias=True,
+                param_dtype=param_dtype,
+                param_device=param_device,
             )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
@@ -353,6 +374,8 @@ class GatedMLP(nn.Module):
                 tp_size=self.parallel_context.tensor_model_parallel_size,
                 tp_group=self.parallel_context.tensor_model_parallel_group,
                 bias=True,
+                param_dtype=param_dtype,
+                param_device=param_device,
             )
             self.dropout = Dropout(dropout)
         else:
@@ -360,6 +383,8 @@ class GatedMLP(nn.Module):
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 dropout=dropout,
+                param_dtype=param_dtype,
+                param_device=param_device,
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -429,8 +454,19 @@ class MultiHeadLatentAttention(nn.Module):
         self.scale = self.qk_head_dim ** -0.5
         self.rope_theta = config.rope_theta
 
-        self.q_a_proj = Linear(self.hidden_size, config.q_lora_rank, bias=False)
-        self.q_a_norm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.q_a_proj = Linear(
+            self.hidden_size,
+            config.q_lora_rank,
+            bias=False,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
+        self.q_a_norm = RMSNorm(
+            config.q_lora_rank,
+            eps=config.rms_norm_eps,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
         if self.attention_tensor_model_parallel_size > 1:
             self.q_b_proj = ColumnParallelLinear(
                 config.q_lora_rank,
@@ -439,20 +475,31 @@ class MultiHeadLatentAttention(nn.Module):
                 tp_size=self.attention_tensor_model_parallel_size,
                 tp_group=self.attention_tensor_model_parallel_group,
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
         else:
             self.q_b_proj = Linear(
                 config.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
 
         self.kv_a_proj = Linear(
             self.hidden_size,
             config.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
         )
-        self.kv_a_norm = RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_norm = RMSNorm(
+            config.kv_lora_rank,
+            eps=config.rms_norm_eps,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
         if self.attention_tensor_model_parallel_size > 1:
             self.kv_b_proj = ColumnParallelLinear(
                 config.kv_lora_rank,
@@ -461,6 +508,8 @@ class MultiHeadLatentAttention(nn.Module):
                 tp_size=self.attention_tensor_model_parallel_size,
                 tp_group=self.attention_tensor_model_parallel_group,
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
             self.out_proj = RowParallelLinear(
                 self.num_heads * self.v_head_dim,
@@ -469,14 +518,24 @@ class MultiHeadLatentAttention(nn.Module):
                 tp_size=self.attention_tensor_model_parallel_size,
                 tp_group=self.attention_tensor_model_parallel_group,
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
         else:
             self.kv_b_proj = Linear(
                 config.kv_lora_rank,
                 self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
                 bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
             )
-            self.out_proj = Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
+            self.out_proj = Linear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
         self.dropout = Dropout(config.attention_dropout)
 
     def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
@@ -526,7 +585,10 @@ class MultiHeadLatentAttention(nn.Module):
         scores = torch.matmul(q_final, k_final.transpose(-2, -1)) * self.scale
         if attention_mask is not None:
             scores = scores + attention_mask
-        probs = torch.softmax(scores, dim=-1)
+        scores_softmax = scores
+        if scores_softmax.dtype not in (torch.float32, torch.float64):
+            scores_softmax = scores_softmax.float()
+        probs = torch.softmax(scores_softmax, dim=-1).to(dtype=scores.dtype)
         probs = self.dropout(probs)
 
         out = torch.matmul(probs, v)
@@ -559,6 +621,8 @@ class RoutedMoE(nn.Module):
             "expert_intermediate_size": config.moe_intermediate_size,
             "num_experts": config.n_routed_experts,
             "top_k": config.num_experts_per_tok,
+            "param_dtype": config.param_dtype,
+            "param_device": config.param_device,
             "dropout": config.dropout,
             "n_shared_experts": config.n_shared_experts,
             "scoring_func": config.scoring_func,
@@ -613,9 +677,19 @@ class DeepSeekDecoderBlock(nn.Module):
     ):
         super().__init__()
         self.parallel_context = parallel_context or DeepSeekParallelContext()
-        self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
         self.attn = MultiHeadLatentAttention(config, parallel_context=self.parallel_context)
-        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            param_dtype=config.param_dtype,
+            param_device=config.param_device,
+        )
 
         use_dense = layer_idx < config.first_k_dense_replace
         use_moe = (
@@ -631,6 +705,8 @@ class DeepSeekDecoderBlock(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 dropout=config.dropout,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
                 parallel_context=self.parallel_context,
             )
             self.ffn_type = "dense"
@@ -699,7 +775,12 @@ class DeepSeekModel(nn.Module):
         self.token_embeddings: Optional[Embedding]
         self.dropout: Optional[Dropout]
         if self.is_first_pp_stage:
-            self.token_embeddings = Embedding(config.vocab_size, config.hidden_size)
+            self.token_embeddings = Embedding(
+                config.vocab_size,
+                config.hidden_size,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
             self.dropout = Dropout(config.dropout)
         else:
             self.token_embeddings = None
@@ -720,8 +801,19 @@ class DeepSeekModel(nn.Module):
         self.final_norm: Optional[RMSNorm]
         self.lm_head: Optional[Linear]
         if self.is_last_pp_stage:
-            self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.final_norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
+            self.lm_head = Linear(
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+                param_dtype=config.param_dtype,
+                param_device=config.param_device,
+            )
         else:
             self.final_norm = None
             self.lm_head = None

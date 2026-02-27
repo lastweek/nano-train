@@ -40,6 +40,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         ep_rank=rank,
         ep_size=world_size,
         ep_group=dist.group.WORLD,
+        param_dtype=torch.float32,
+        param_device=None,
         dropout=0.0,
         n_shared_experts=1,
         scoring_func="sigmoid",

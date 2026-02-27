@@ -33,6 +33,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 DataParallelShardingStrategy = Literal["no_shard", "optim", "optim_grads"]
+OptimizerStateDType = Literal["fp32", "bf16", "fp16"]
 
 
 @dataclass
@@ -47,6 +48,10 @@ class DistributedOptimizerConfig:
     betas: tuple[float, float] = (0.9, 0.999)
     eps: float = 1e-8
     use_reduce_scatter: bool = True
+    main_params_dtype: OptimizerStateDType = "fp32"
+    main_grads_dtype: OptimizerStateDType = "fp32"
+    exp_avg_dtype: OptimizerStateDType = "fp32"
+    exp_avg_sq_dtype: OptimizerStateDType = "fp32"
     debug: bool = False
     debug_max_steps: int = 1
     debug_max_params: int = 8
@@ -94,6 +99,16 @@ def _ceil_div(n: int, d: int) -> int:
     return (n + d - 1) // d
 
 
+def _resolve_dtype_alias(dtype_alias: OptimizerStateDType) -> torch.dtype:
+    if dtype_alias == "fp32":
+        return torch.float32
+    if dtype_alias == "bf16":
+        return torch.bfloat16
+    if dtype_alias == "fp16":
+        return torch.float16
+    raise ValueError(f"Unsupported optimizer dtype alias: {dtype_alias}")
+
+
 def _compute_shard(numel: int, rank: int, size: int) -> tuple[int, int, int]:
     # Split flattened tensor into ceil-div chunks so every rank has deterministic
     # ownership bounds even when `numel` is not divisible by group size.
@@ -137,6 +152,13 @@ class MegatronZeroOptimizer:
             raise ValueError("debug_max_steps must be >= 1")
         if config.debug_max_params < 1:
             raise ValueError("debug_max_params must be >= 1")
+        for dtype_name in (
+            config.main_params_dtype,
+            config.main_grads_dtype,
+            config.exp_avg_dtype,
+            config.exp_avg_sq_dtype,
+        ):
+            _resolve_dtype_alias(dtype_name)
 
         self.model = model
         self.config = config
@@ -144,6 +166,10 @@ class MegatronZeroOptimizer:
         self.expert_data_parallel_group = expert_data_parallel_group
         self.expert_param_ids = set(expert_param_ids)
         self._reduce_scatter_fallback = False
+        self._main_params_dtype = _resolve_dtype_alias(config.main_params_dtype)
+        self._main_grads_dtype = _resolve_dtype_alias(config.main_grads_dtype)
+        self._exp_avg_dtype = _resolve_dtype_alias(config.exp_avg_dtype)
+        self._exp_avg_sq_dtype = _resolve_dtype_alias(config.exp_avg_sq_dtype)
 
         self._named_params: list[tuple[str, nn.Parameter]] = [
             (name, param) for name, param in model.named_parameters() if param.requires_grad
@@ -237,15 +263,15 @@ class MegatronZeroOptimizer:
             shard_start, shard_end, chunk_size = _compute_shard(numel, group_rank, group_size)
             shard_numel = max(0, shard_end - shard_start)
 
-            full_flat = param.detach().float().view(-1)
+            full_flat = param.detach().to(dtype=self._main_params_dtype).view(-1)
             # ZeRO keeps full model params for compute but only local optimizer
             # shards (`master_param`, `exp_avg`, `exp_avg_sq`) for updates.
             if shard_numel > 0:
                 master_param = full_flat[shard_start:shard_end].clone()
             else:
                 master_param = full_flat.new_empty((0,))
-            exp_avg = torch.zeros_like(master_param)
-            exp_avg_sq = torch.zeros_like(master_param)
+            exp_avg = torch.zeros_like(master_param, dtype=self._exp_avg_dtype)
+            exp_avg_sq = torch.zeros_like(master_param, dtype=self._exp_avg_sq_dtype)
 
             meta = _ShardMeta(
                 name=name,
@@ -396,7 +422,7 @@ class MegatronZeroOptimizer:
             if grad is None:
                 continue
 
-            grad_flat = grad.detach().float().contiguous().view(-1)
+            grad_flat = grad.detach().to(dtype=self._main_grads_dtype).contiguous().view(-1)
             if strategy == "optim":
                 # ZeRO-1: all-reduce averaged full grads, then keep local shard.
                 if meta.group_size > 1:
@@ -418,14 +444,27 @@ class MegatronZeroOptimizer:
             # Stage 3: local AdamW update on owned FP32 shard state only.
             if master_param.numel() > 0:
                 params_with_local_updates += 1
-                exp_avg.mul_(beta1).add_(grad_shard, alpha=1.0 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad_shard, grad_shard, value=1.0 - beta2)
+                grad_shard_f = grad_shard.float()
+                exp_avg_f = exp_avg.float()
+                exp_avg_sq_f = exp_avg_sq.float()
+                master_param_f = master_param.float()
+
+                exp_avg_f.mul_(beta1).add_(grad_shard_f, alpha=1.0 - beta1)
+                exp_avg_sq_f.mul_(beta2).addcmul_(
+                    grad_shard_f,
+                    grad_shard_f,
+                    value=1.0 - beta2,
+                )
                 bias_correction1 = 1.0 - beta1**step
                 bias_correction2 = 1.0 - beta2**step
-                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+                denom = exp_avg_sq_f.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
                 step_size = lr / bias_correction1
-                master_param.mul_(1.0 - lr * weight_decay)
-                master_param.addcdiv_(exp_avg, denom, value=-step_size)
+                master_param_f.mul_(1.0 - lr * weight_decay)
+                master_param_f.addcdiv_(exp_avg_f, denom, value=-step_size)
+
+                master_param.copy_(master_param_f.to(dtype=self._main_params_dtype))
+                exp_avg.copy_(exp_avg_f.to(dtype=self._exp_avg_dtype))
+                exp_avg_sq.copy_(exp_avg_sq_f.to(dtype=self._exp_avg_sq_dtype))
 
             # Stage 4: all-gather updated shards so model parameters are
             # replicated for the next forward pass.
@@ -519,6 +558,12 @@ class MegatronZeroOptimizer:
             "global_step": self._global_step,
             "strategy": self._strategy(),
             "parameter_signature_hash": self.parameter_signature_hash(),
+            "optimizer_state_dtypes": {
+                "main_params_dtype": self.config.main_params_dtype,
+                "main_grads_dtype": self.config.main_grads_dtype,
+                "exp_avg_dtype": self.config.exp_avg_dtype,
+                "exp_avg_sq_dtype": self.config.exp_avg_sq_dtype,
+            },
             "parameters": {},
         }
         parameters = payload["parameters"]
@@ -575,13 +620,15 @@ class MegatronZeroOptimizer:
                 tensor = record.get(key)
                 if not torch.is_tensor(tensor):
                     raise ValueError(f"Missing tensor '{key}' for parameter '{name}'")
-                tensor = tensor.to(device=state["master_param"].device, dtype=torch.float32)
+                target = state[key]
+                assert torch.is_tensor(target)
+                tensor = tensor.to(device=target.device, dtype=target.dtype)
                 if tensor.numel() != shard_numel:
                     raise ValueError(
                         f"Shard shape mismatch for {name}:{key} "
                         f"(expected {shard_numel}, got {tensor.numel()})"
                     )
-                state[key].copy_(tensor.view_as(state[key]))
+                target.copy_(tensor.view_as(target))
             state["step"] = int(record.get("step", state["step"]))
 
         if strict and missing:
@@ -626,6 +673,12 @@ class MegatronZeroOptimizer:
             "strategy": self._strategy(),
             "num_distributed_optimizer_instances": self.config.num_distributed_optimizer_instances,
             "parameter_signature_hash": self.parameter_signature_hash(),
+            "optimizer_state_dtypes": {
+                "main_params_dtype": self.config.main_params_dtype,
+                "main_grads_dtype": self.config.main_grads_dtype,
+                "exp_avg_dtype": self.config.exp_avg_dtype,
+                "exp_avg_sq_dtype": self.config.exp_avg_sq_dtype,
+            },
             "files": {
                 "nonparam": "optimizer_nonparam.pt",
                 "shard": f"optimizer_shard_rank{rank}.pt",

@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from typing import Optional
+from typing import TYPE_CHECKING
 
 from src.distributed.topology import ModelParallelTopology
+
+if TYPE_CHECKING:
+    from src.runtime.contracts import PrecisionConfig
 
 
 @dataclass
@@ -15,6 +19,7 @@ class RunConfig:
 
     args: argparse.Namespace
     pp_layer_splits: Optional[tuple[int, ...]]
+    precision_config: Optional["PrecisionConfig"] = None
 
 
 @dataclass

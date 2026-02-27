@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.distributed.device import get_backend
 from src.distributed.device import get_device
 from src.distributed.device import get_device_info
+from src.layers import Linear
 from src.logging import get_logger
 from src.logging import setup_logging
 from src.runtime.checkpoint import NoOpCheckpointManager
@@ -36,6 +37,14 @@ from src.runtime.contracts import StepContext
 from src.runtime.contracts import StepOutput
 from src.runtime.contracts import TrainDataBundle
 from src.runtime.engine import RuntimeEngine
+from src.runtime.mixed_precision import apply_model_precision_plan
+from src.runtime.mixed_precision import build_model_precision_plan
+from src.runtime.mixed_precision import dtype_alias_to_torch
+from src.runtime.mixed_precision import ensure_lowbit_compute_assignments
+from src.runtime.mixed_precision import MixedPrecisionController
+from src.runtime.mixed_precision import refresh_persistent_lowbit_params
+from src.runtime.mixed_precision import resolve_precision_config
+from src.runtime.optimizer_runtime import PrecisionAdamW
 from src.runtime.schedules.non_pipeline import NonPipelineSchedule
 from src.runtime.sync import ParamShardInfo
 
@@ -46,14 +55,35 @@ logger = get_logger(__name__)
 class SimpleModel(nn.Module):
     """Simple model for testing distributed training."""
 
-    def __init__(self, hidden_size: int = 128):
+    def __init__(
+        self,
+        hidden_size: int = 128,
+        *,
+        param_dtype: torch.dtype,
+        param_device: Optional[torch.device],
+    ):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(10, hidden_size),
+            Linear(
+                10,
+                hidden_size,
+                param_dtype=param_dtype,
+                param_device=param_device,
+            ),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
+            Linear(
+                hidden_size,
+                hidden_size,
+                param_dtype=param_dtype,
+                param_device=param_device,
+            ),
             nn.ReLU(),
-            nn.Linear(hidden_size, 1),
+            Linear(
+                hidden_size,
+                1,
+                param_dtype=param_dtype,
+                param_device=param_device,
+            ),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -116,6 +146,184 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden_size", type=int, default=128)
     parser.add_argument("--log_every", type=int, default=0)
+    parser.add_argument("--bf16", action="store_true", help="Enable BF16 mixed precision")
+    parser.add_argument("--fp16", action="store_true", help="Enable FP16 mixed precision")
+    parser.add_argument("--fp8", action="store_true", help="Enable FP8 mixed precision")
+    parser.add_argument("--fp4", action="store_true", help="Enable FP4 mixed precision (emulated)")
+    parser.add_argument(
+        "--fp8-backend",
+        type=str,
+        default="transformer_engine",
+        choices=["transformer_engine", "emulated"],
+        help="FP8 backend implementation",
+    )
+    parser.add_argument(
+        "--fp8-format",
+        type=str,
+        default="e4m3",
+        choices=["e4m3", "hybrid"],
+        help="FP8 format recipe",
+    )
+    parser.add_argument(
+        "--fp8-amax-history-len",
+        type=int,
+        default=16,
+        help="FP8 amax history length",
+    )
+    parser.add_argument(
+        "--fp8-amax-compute-algo",
+        type=str,
+        default="most_recent",
+        choices=["most_recent", "max"],
+        help="FP8 amax compute algorithm",
+    )
+    parser.add_argument(
+        "--fp4-backend",
+        type=str,
+        default="emulated",
+        choices=["emulated"],
+        help="FP4 backend implementation",
+    )
+    parser.add_argument(
+        "--params-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Model parameter storage dtype",
+    )
+    parser.add_argument(
+        "--main-params-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Main optimizer parameter dtype",
+    )
+    parser.add_argument(
+        "--main-grads-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Main optimizer gradient dtype",
+    )
+    parser.add_argument(
+        "--exp-avg-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Adam exp_avg state dtype",
+    )
+    parser.add_argument(
+        "--exp-avg-sq-dtype",
+        type=str,
+        default=None,
+        choices=["fp32", "bf16", "fp16"],
+        help="Adam exp_avg_sq state dtype",
+    )
+    parser.add_argument(
+        "--loss-scale-init",
+        type=float,
+        default=65536.0,
+        help="Initial dynamic loss scale value",
+    )
+    parser.add_argument(
+        "--loss-scale-growth-factor",
+        type=float,
+        default=2.0,
+        help="Loss scale growth factor",
+    )
+    parser.add_argument(
+        "--loss-scale-backoff-factor",
+        type=float,
+        default=0.5,
+        help="Loss scale backoff factor on overflow",
+    )
+    parser.add_argument(
+        "--loss-scale-growth-interval",
+        type=int,
+        default=2000,
+        help="Successful step interval before loss scale growth",
+    )
+    parser.add_argument(
+        "--loss-scale-min",
+        type=float,
+        default=1.0,
+        help="Minimum loss scale",
+    )
+    parser.add_argument(
+        "--loss-scale-max",
+        type=float,
+        default=16777216.0,
+        help="Maximum loss scale",
+    )
+    parser.add_argument(
+        "--fp8-param",
+        action="store_true",
+        help="Enable persistent FP8 parameter storage for selected modules",
+    )
+    parser.add_argument(
+        "--fp4-param",
+        action="store_true",
+        help="Enable persistent FP4 parameter storage for selected modules",
+    )
+    parser.add_argument(
+        "--fp4-param-format",
+        type=str,
+        default="nf4",
+        choices=["nf4"],
+        help="Persistent FP4 quantization format",
+    )
+    parser.add_argument(
+        "--persistent-scale-granularity",
+        type=str,
+        default="per_channel",
+        choices=["per_tensor", "per_channel"],
+        help="Scale granularity for persistent low-bit quantization",
+    )
+    parser.add_argument(
+        "--module-pattern-type",
+        type=str,
+        default="regex",
+        choices=["regex", "glob"],
+        help="Pattern matcher type for module precision policies",
+    )
+    parser.add_argument(
+        "--compute-lowbit-mode",
+        type=str,
+        default=None,
+        choices=["fp8", "fp4"],
+        help="Per-module low-bit compute mode override",
+    )
+    parser.add_argument(
+        "--compute-lowbit-include",
+        action="append",
+        default=None,
+        help="Repeatable include patterns for low-bit compute module selection",
+    )
+    parser.add_argument(
+        "--compute-lowbit-exclude",
+        action="append",
+        default=None,
+        help="Repeatable exclude patterns for low-bit compute module selection",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-mode",
+        type=str,
+        default="off",
+        choices=["off", "fp8", "fp4"],
+        help="Per-module persistent low-bit storage mode",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-include",
+        action="append",
+        default=None,
+        help="Repeatable include patterns for persistent low-bit module selection",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-exclude",
+        action="append",
+        default=None,
+        help="Repeatable exclude patterns for persistent low-bit module selection",
+    )
     return parser.parse_args()
 
 
@@ -175,10 +383,16 @@ class DDPBootstrap(RuntimeBootstrap):
             logger.info("  Backend: %s", backend)
             logger.info("  Device: %s", device)
 
+        precision_config = resolve_precision_config(args, device)
+
         return RuntimeContext(
             parallel=parallel,
             mode="ddp" if world_size > 1 else "single",
-            run_config=RunConfig(args=args, pp_layer_splits=None),
+            run_config=RunConfig(
+                args=args,
+                pp_layer_splits=None,
+                precision_config=precision_config,
+            ),
         )
 
 
@@ -189,8 +403,33 @@ class DDPModelProvider:
         """Build model and wrap with DDP when world size is greater than one."""
         args = ctx.run_config.args
         parallel = ctx.parallel
+        precision_config = ctx.run_config.precision_config
+        if precision_config is None:
+            raise RuntimeError("precision_config must be resolved in DDPBootstrap")
 
-        model: torch.nn.Module = SimpleModel(hidden_size=args.hidden_size).to(parallel.device)
+        model: torch.nn.Module = SimpleModel(
+            hidden_size=args.hidden_size,
+            param_dtype=dtype_alias_to_torch(precision_config.params_dtype),
+            param_device=parallel.device,
+        )
+        policy = precision_config.module_precision_policy
+        if policy is not None:
+            precision_plan = build_model_precision_plan(model, policy)
+            apply_model_precision_plan(model, precision_plan)
+            ensure_lowbit_compute_assignments(
+                precision_config,
+                precision_plan,
+                script_name="train_ddp.py",
+            )
+            if parallel.rank == 0:
+                logger.info(
+                    "DDP per-module low-bit policy: compute_modules=%d "
+                    "persistent_modules=%d",
+                    precision_plan.compute_lowbit_module_count,
+                    precision_plan.persistent_lowbit_module_count,
+                )
+        refresh_persistent_lowbit_params(model)
+
         if parallel.world_size > 1:
             if parallel.device.type == "cuda":
                 model = DDP(model, device_ids=[parallel.local_rank])
@@ -240,10 +479,29 @@ class DDPOptimizerRuntime:
     def initialize(self, model: torch.nn.Module, ctx: RuntimeContext) -> OptimizerState:
         """Initialize AdamW optimizer state for DDP tutorial training."""
         args = ctx.run_config.args
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        precision_config = ctx.run_config.precision_config
+        if precision_config is None:
+            raise RuntimeError("precision_config must be resolved in DDPBootstrap")
+
+        optimizer = PrecisionAdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=0.0,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            main_params_dtype=precision_config.main_params_dtype,
+            main_grads_dtype=precision_config.main_grads_dtype,
+            exp_avg_dtype=precision_config.exp_avg_dtype,
+            exp_avg_sq_dtype=precision_config.exp_avg_sq_dtype,
+        )
+        precision_controller = MixedPrecisionController(
+            precision_config,
+            device=ctx.parallel.device,
+        )
         return OptimizerState(
             optimizer=optimizer,
             shard_info=ParamShardInfo(set(), set()),
+            extra_state={"precision_controller": precision_controller},
         )
 
     def zero_grad(self, state: OptimizerState) -> None:
@@ -259,9 +517,10 @@ class DDPOptimizerRuntime:
         ctx: RuntimeContext,
     ) -> None:
         """Apply one optimizer step; DDP handles gradient synchronization."""
-        del model, ctx
+        del ctx
         step = getattr(state.optimizer, "step")
         step()
+        refresh_persistent_lowbit_params(model)
 
 
 @dataclass
@@ -278,16 +537,48 @@ class DDPStepSchedule:
         device = step_ctx.runtime_context.parallel.device
         data = step_ctx.batch["data"].to(device)
         target = step_ctx.batch["target"].to(device)
+        args = step_ctx.runtime_context.run_config.args
+        precision_controller = step_ctx.optimizer_state.extra_state.get("precision_controller")
+        if precision_controller is not None and not isinstance(
+            precision_controller, MixedPrecisionController
+        ):
+            raise TypeError("precision_controller must be MixedPrecisionController when provided")
 
         self.optimizer_runtime.zero_grad(step_ctx.optimizer_state)
-        output = step_ctx.model(data)
-        loss = nn.functional.mse_loss(output, target)
-        loss.backward()
-        self.optimizer_runtime.step(
-            model=step_ctx.model,
-            state=step_ctx.optimizer_state,
-            ctx=step_ctx.runtime_context,
-        )
+        if precision_controller is None:
+            output = step_ctx.model(data)
+            loss = nn.functional.mse_loss(output, target)
+            loss.backward()
+            should_step = True
+        else:
+            with precision_controller.autocast_context():
+                output = step_ctx.model(data)
+                loss = nn.functional.mse_loss(output, target)
+            precision_controller.backward(loss)
+            should_step = precision_controller.prepare_optimizer_step(step_ctx.model)
+
+        if should_step:
+            self.optimizer_runtime.step(
+                model=step_ctx.model,
+                state=step_ctx.optimizer_state,
+                ctx=step_ctx.runtime_context,
+            )
+
+        if precision_controller is not None:
+            precision_controller.update_after_step(step_applied=should_step)
+            if (
+                step_ctx.runtime_context.parallel.rank == 0
+                and args.log_every > 0
+                and step_ctx.train_state.global_step % args.log_every == 0
+                and precision_controller.uses_loss_scaling
+            ):
+                logger.info(
+                    "precision step=%d mode=%s loss_scale=%.4f skipped_steps=%d",
+                    step_ctx.train_state.global_step,
+                    precision_controller.config.mode,
+                    precision_controller.runtime_state.loss_scale,
+                    precision_controller.runtime_state.skipped_steps,
+                )
 
         return StepOutput(
             task_loss=float(loss.item()),

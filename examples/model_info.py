@@ -48,6 +48,8 @@ def create_simple_demo_models():
 
     # 3. Small Transformer (actual GPT-style model)
     config = ModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
         vocab_size=1000,
         hidden_size=256,
         num_layers=4,
@@ -132,6 +134,8 @@ def demo_transformer_model():
 
     # Create small transformer
     config = ModelConfig(
+        param_dtype=torch.float32,
+        param_device=None,
         vocab_size=100,
         hidden_size=128,
         num_layers=2,

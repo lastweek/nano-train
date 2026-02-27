@@ -9,21 +9,21 @@ Execution patterns:
 Usage:
     # TP tutorial on 4 ranks (TP-only)
     python3 examples/launch.py --world-size 4 --backend gloo \
-        --script examples/tp.py --script-args --tensor-model-parallel-size 4
+        --script examples/train_tp.py --script-args --tensor-model-parallel-size 4
 
     # TP tutorial on 4 ranks (TP=2, DP=2)
     python3 examples/launch.py --world-size 4 --backend gloo \
-        --script examples/tp.py --script-args --tensor-model-parallel-size 2
+        --script examples/train_tp.py --script-args --tensor-model-parallel-size 2
 
     # 4P tutorial on 8 ranks (Tensor MP=2, Expert MP=2, Data Parallel=2)
     python3 examples/launch.py --world-size 8 --backend gloo \
-        --script examples/train_4p.py --script-args \
+        --script examples/train_4d.py --script-args \
         --tensor-model-parallel-size 2 \
         --pipeline-model-parallel-size 1 \
         --expert-model-parallel-size 2
 
     # Multi-GPU NCCL (recommended launch path)
-    torchrun --nproc_per_node=4 examples/tp.py --tensor-model-parallel-size 2
+    torchrun --nproc_per_node=4 examples/train_tp.py --tensor-model-parallel-size 2
 
 Pass target-script flags after `--script-args`.
 """
@@ -66,8 +66,8 @@ def parse_args():
     parser.add_argument(
         "--script",
         type=str,
-        default="examples/ddp.py",
-        help="Training script to run (default: examples/ddp.py).",
+        default="examples/train_ddp.py",
+        help="Training script to run (default: examples/train_ddp.py).",
     )
     parser.add_argument(
         "--dry-run",

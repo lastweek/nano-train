@@ -49,7 +49,11 @@ from src.runtime.contracts import StepOutput
 from src.runtime.contracts import TrainDataBundle
 from src.runtime.engine import RuntimeEngine
 from src.runtime.mixed_precision import MixedPrecisionController
+from src.runtime.mixed_precision import apply_model_precision_plan
+from src.runtime.mixed_precision import build_model_precision_plan
 from src.runtime.mixed_precision import dtype_alias_to_torch
+from src.runtime.mixed_precision import ensure_lowbit_compute_assignments
+from src.runtime.mixed_precision import refresh_persistent_lowbit_params
 from src.runtime.mixed_precision import resolve_precision_config
 from src.runtime.optimizer_runtime import step_with_sync_policy
 from src.runtime.optimizer_runtime import PrecisionAdamW
@@ -348,6 +352,75 @@ def parse_args() -> argparse.Namespace:
         default=16777216.0,
         help="Maximum loss scale",
     )
+    parser.add_argument(
+        "--fp8-param",
+        action="store_true",
+        help="Enable persistent FP8 parameter storage for selected modules",
+    )
+    parser.add_argument(
+        "--fp4-param",
+        action="store_true",
+        help="Enable persistent FP4 parameter storage for selected modules",
+    )
+    parser.add_argument(
+        "--fp4-param-format",
+        type=str,
+        default="nf4",
+        choices=["nf4"],
+        help="Persistent FP4 quantization format",
+    )
+    parser.add_argument(
+        "--persistent-scale-granularity",
+        type=str,
+        default="per_channel",
+        choices=["per_tensor", "per_channel"],
+        help="Scale granularity for persistent low-bit quantization",
+    )
+    parser.add_argument(
+        "--module-pattern-type",
+        type=str,
+        default="regex",
+        choices=["regex", "glob"],
+        help="Pattern matcher type for module precision policies",
+    )
+    parser.add_argument(
+        "--compute-lowbit-mode",
+        type=str,
+        default=None,
+        choices=["fp8", "fp4"],
+        help="Per-module low-bit compute mode override",
+    )
+    parser.add_argument(
+        "--compute-lowbit-include",
+        action="append",
+        default=None,
+        help="Repeatable include patterns for low-bit compute module selection",
+    )
+    parser.add_argument(
+        "--compute-lowbit-exclude",
+        action="append",
+        default=None,
+        help="Repeatable exclude patterns for low-bit compute module selection",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-mode",
+        type=str,
+        default="off",
+        choices=["off", "fp8", "fp4"],
+        help="Per-module persistent low-bit storage mode",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-include",
+        action="append",
+        default=None,
+        help="Repeatable include patterns for persistent low-bit module selection",
+    )
+    parser.add_argument(
+        "--persistent-lowbit-exclude",
+        action="append",
+        default=None,
+        help="Repeatable exclude patterns for persistent low-bit module selection",
+    )
     return parser.parse_args()
 
 
@@ -370,9 +443,16 @@ class DummyTokenDataset(Dataset):
         return {"input_ids": self.input_ids[index]}
 
 
-def build_tiny_deepseek_config(args: argparse.Namespace) -> DeepSeekModelConfig:
+def build_tiny_deepseek_config(
+    args: argparse.Namespace,
+    *,
+    param_dtype: torch.dtype,
+    param_device: torch.device | None,
+) -> DeepSeekModelConfig:
     """Build a small DeepSeek config for TP/PP/EP/DP learning runs."""
     return DeepSeekModelConfig(
+        param_dtype=param_dtype,
+        param_device=param_device,
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_layers,
@@ -460,7 +540,16 @@ def _build_model_for_context(ctx: RuntimeContext) -> DeepSeekModel:
     if parallel.device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed + seed_offset)
 
-    model_config = build_tiny_deepseek_config(args)
+    precision_config = ctx.run_config.precision_config
+    if precision_config is None:
+        raise RuntimeError("precision_config must be resolved in Train4PBootstrap")
+    param_dtype = dtype_alias_to_torch(precision_config.params_dtype)
+
+    model_config = build_tiny_deepseek_config(
+        args,
+        param_dtype=param_dtype,
+        param_device=parallel.device,
+    )
     parallel_context = DeepSeekParallelContext(
         tensor_model_parallel_rank=parallel.tensor_model_parallel_rank,
         tensor_model_parallel_size=parallel.tensor_model_parallel_size,
@@ -479,12 +568,23 @@ def _build_model_for_context(ctx: RuntimeContext) -> DeepSeekModel:
         expert_tensor_parallel_size=args.expert_tensor_parallel_size,
         sequence_parallel=True,
     )
-    model = DeepSeekModel(model_config, parallel_context=parallel_context).to(parallel.device)
-
-    precision_config = ctx.run_config.precision_config
-    if precision_config is not None:
-        param_dtype = dtype_alias_to_torch(precision_config.params_dtype)
-        model = model.to(device=parallel.device, dtype=param_dtype)
+    model = DeepSeekModel(model_config, parallel_context=parallel_context)
+    policy = precision_config.module_precision_policy
+    if policy is not None:
+        precision_plan = build_model_precision_plan(model, policy)
+        apply_model_precision_plan(model, precision_plan)
+        ensure_lowbit_compute_assignments(
+            precision_config,
+            precision_plan,
+            script_name="train_4d.py",
+        )
+        if parallel.rank == 0:
+            logger.info(
+                "Per-module low-bit policy: compute_modules=%d persistent_modules=%d",
+                precision_plan.compute_lowbit_module_count,
+                precision_plan.persistent_lowbit_module_count,
+            )
+    refresh_persistent_lowbit_params(model)
 
     return model
 
@@ -583,7 +683,8 @@ def _log_training_start(
     )
     logger.info(
         "Precision: mode=%s activation_dtype=%s params_dtype=%s main_params_dtype=%s "
-        "main_grads_dtype=%s exp_avg_dtype=%s exp_avg_sq_dtype=%s fp8_backend=%s fp4_backend=%s",
+        "main_grads_dtype=%s exp_avg_dtype=%s exp_avg_sq_dtype=%s fp8_backend=%s fp4_backend=%s "
+        "fp8_param=%s fp4_param=%s persistent_scale=%s",
         precision_config.mode,
         precision_config.activation_dtype,
         precision_config.params_dtype,
@@ -593,6 +694,9 @@ def _log_training_start(
         precision_config.exp_avg_sq_dtype,
         precision_config.fp8_backend,
         precision_config.fp4_backend,
+        precision_config.fp8_param,
+        precision_config.fp4_param,
+        precision_config.persistent_scale_granularity,
     )
     logger.info("Starting training: epochs=%d, max_steps=%d", args.epochs, args.max_steps)
 
@@ -610,7 +714,7 @@ def _infer_mode(parallel: ModelParallelTopology) -> str:
 
 @dataclass
 class Train4PBootstrap(RuntimeBootstrap):
-    """Build runtime context for train_4p CLI arguments."""
+    """Build runtime context for train_4d CLI arguments."""
 
     def build_context(self, args: argparse.Namespace) -> RuntimeContext:
         """Validate args, initialize topology, and construct runtime context."""
@@ -638,16 +742,16 @@ class Train4PBootstrap(RuntimeBootstrap):
 
 @dataclass
 class Train4PModelProvider:
-    """Model provider for train_4p DeepSeek tutorial stack."""
+    """Model provider for train_4d DeepSeek tutorial stack."""
 
     def build_model(self, ctx: RuntimeContext) -> torch.nn.Module:
-        """Build the train_4p model for the current rank context."""
+        """Build the train_4d model for the current rank context."""
         return _build_model_for_context(ctx)
 
 
 @dataclass
 class Train4PDataProvider:
-    """Data provider for train_4p deterministic token batches."""
+    """Data provider for train_4d deterministic token batches."""
 
     def build_train_data(self, ctx: RuntimeContext) -> TrainDataBundle:
         """Build deterministic token data for the current DP shard."""
@@ -670,7 +774,7 @@ class Train4PDataProvider:
 
 @dataclass
 class Train4POptimizerRuntime:
-    """Optimizer runtime for train_4p ZeRO and DP/EDP sync policies."""
+    """Optimizer runtime for train_4d ZeRO and DP/EDP sync policies."""
 
     def initialize(self, model: torch.nn.Module, ctx: RuntimeContext) -> OptimizerState:
         """Initialize shard metadata, parameter sync, and optimizer state."""
@@ -728,7 +832,7 @@ class Train4POptimizerRuntime:
 
 @dataclass
 class Train4PNonPipelineSchedule:
-    """Schedule implementation for non-pipeline train_4p steps."""
+    """Schedule implementation for non-pipeline train_4d steps."""
 
     optimizer_runtime: Train4POptimizerRuntime
 
@@ -786,6 +890,7 @@ class Train4PNonPipelineSchedule:
                 state=step_ctx.optimizer_state,
                 ctx=step_ctx.runtime_context,
             )
+            refresh_persistent_lowbit_params(step_ctx.model)
 
         if precision_controller is not None:
             precision_controller.update_after_step(step_applied=should_step)
@@ -814,7 +919,7 @@ class Train4PNonPipelineSchedule:
 
 @dataclass
 class Train4PPipelineSchedule:
-    """Schedule implementation for train_4p non-interleaved 1F1B pipeline."""
+    """Schedule implementation for train_4d non-interleaved 1F1B pipeline."""
 
     optimizer_runtime: Train4POptimizerRuntime
 
@@ -855,6 +960,7 @@ class Train4PPipelineSchedule:
             apply_optimizer_step_fn=_apply_optimizer_step,
             sync_plugin=None,
             zero_grad_fn=lambda _: self.optimizer_runtime.zero_grad(step_ctx.optimizer_state),
+            refresh_persistent_params_fn=refresh_persistent_lowbit_params,
             precision_controller=precision_controller,
             precision_config=precision_config,
         )
@@ -884,7 +990,7 @@ class Train4PPipelineSchedule:
 
 @dataclass
 class Train4PScheduleSelector:
-    """Select train_4p schedule based on pipeline model-parallel size."""
+    """Select train_4d schedule based on pipeline model-parallel size."""
 
     optimizer_runtime: Train4POptimizerRuntime
 
@@ -904,7 +1010,7 @@ class Train4PScheduleSelector:
 
 
 class Train4PCheckpointManager(NoOpCheckpointManager):
-    """Checkpoint manager for train_4p runtime path (no-op save/load parity)."""
+    """Checkpoint manager for train_4d runtime path (no-op save/load parity)."""
 
     def load(
         self,
@@ -918,8 +1024,8 @@ class Train4PCheckpointManager(NoOpCheckpointManager):
         return ResumeState()
 
 
-def build_train_4p_components() -> RuntimeComponents:
-    """Build runtime component bundle for train_4p tutorial."""
+def build_train_4d_components() -> RuntimeComponents:
+    """Build runtime component bundle for train_4d tutorial."""
     optimizer_runtime = Train4POptimizerRuntime()
     return RuntimeComponents(
         bootstrap=Train4PBootstrap(),
@@ -929,6 +1035,11 @@ def build_train_4p_components() -> RuntimeComponents:
         schedule_selector=Train4PScheduleSelector(optimizer_runtime=optimizer_runtime),
         checkpoint_manager=Train4PCheckpointManager(),
     )
+
+
+def build_train_4p_components() -> RuntimeComponents:
+    """Backward-compatible alias for legacy test and script integrations."""
+    return build_train_4d_components()
 
 
 def setup_process_logging(rank: int) -> None:
@@ -944,7 +1055,7 @@ def main() -> None:
     rank_pre = int(os.environ.get("RANK", "0"))
     setup_process_logging(rank_pre)
 
-    components = build_train_4p_components()
+    components = build_train_4d_components()
     engine = RuntimeEngine()
     engine.run(components=components, args=args)
 

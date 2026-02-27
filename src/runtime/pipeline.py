@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Callable
+from typing import TYPE_CHECKING
 from typing import Optional
 
 import torch
@@ -14,7 +15,12 @@ import torch.nn.functional as F
 
 from src.distributed.topology import ModelParallelTopology
 from src.models.deepseek import DeepSeekModel
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import dtype_alias_to_torch
 from src.runtime.sync import ParamShardInfo
+
+if TYPE_CHECKING:
+    from src.runtime.mixed_precision import MixedPrecisionController
 
 
 def activation_tag(microbatch_idx: int) -> int:
@@ -143,6 +149,7 @@ def pipeline_forward_microbatch(
     activation_dtype: torch.dtype,
     device: torch.device,
     gather_moe_metrics_fn: Callable[[nn.Module, torch.device], tuple[torch.Tensor, float]],
+    precision_controller: Optional["MixedPrecisionController"] = None,
 ) -> None:
     """Run one forward microbatch and stage outputs/metadata for later backward."""
     label_tensor: Optional[torch.Tensor] = None
@@ -162,11 +169,19 @@ def pipeline_forward_microbatch(
                 )
             )
 
-        stage_output = model.forward_stage(
-            input_ids=local_input_ids,
-            hidden_states=None,
-            attention_mask=None,
-        )
+        if precision_controller is None:
+            stage_output = model.forward_stage(
+                input_ids=local_input_ids,
+                hidden_states=None,
+                attention_mask=None,
+            )
+        else:
+            with precision_controller.autocast_context():
+                stage_output = model.forward_stage(
+                    input_ids=local_input_ids,
+                    hidden_states=None,
+                    attention_mask=None,
+                )
         if model.is_last_pp_stage:
             label_tensor = local_input_ids
     else:
@@ -180,11 +195,19 @@ def pipeline_forward_microbatch(
             raise RuntimeError("Missing previous PP rank")
         dist.recv(stage_input, src=peers.prev_rank, tag=activation_tag(microbatch_idx))
 
-        stage_output = model.forward_stage(
-            input_ids=None,
-            hidden_states=stage_input,
-            attention_mask=None,
-        )
+        if precision_controller is None:
+            stage_output = model.forward_stage(
+                input_ids=None,
+                hidden_states=stage_input,
+                attention_mask=None,
+            )
+        else:
+            with precision_controller.autocast_context():
+                stage_output = model.forward_stage(
+                    input_ids=None,
+                    hidden_states=stage_input,
+                    attention_mask=None,
+                )
 
         if model.is_last_pp_stage:
             label_tensor = torch.empty(
@@ -230,6 +253,7 @@ def pipeline_backward_microbatch(
     hidden_size: int,
     activation_dtype: torch.dtype,
     device: torch.device,
+    precision_controller: Optional["MixedPrecisionController"] = None,
 ) -> None:
     """Run one backward microbatch and send dX to previous stage when needed."""
     stage_input = state.stage_inputs.pop(0)
@@ -254,7 +278,10 @@ def pipeline_backward_microbatch(
         state.task_loss_sum += float(task_loss.detach().item())
         scale = 1.0 / float(num_microbatches)
         total = (task_loss * scale) + (aux_loss_coef * scale * aux_loss)
-        total.backward()
+        if precision_controller is None:
+            total.backward()
+        else:
+            precision_controller.backward(total)
 
         if not model.is_first_pp_stage:
             if stage_input is None or stage_input.grad is None:
@@ -282,8 +309,11 @@ def pipeline_backward_microbatch(
     dist.recv(grad_output, src=peers.next_rank, tag=grad_tag(microbatch_idx))
 
     if aux_loss.requires_grad:
+        aux_loss_scale = 1.0
+        if precision_controller is not None and precision_controller.uses_loss_scaling:
+            aux_loss_scale = float(precision_controller.runtime_state.loss_scale)
         aux_scale = torch.tensor(
-            aux_loss_coef / float(num_microbatches),
+            (aux_loss_coef / float(num_microbatches)) * aux_loss_scale,
             dtype=aux_loss.dtype,
             device=device,
         )
@@ -361,13 +391,19 @@ def train_step_pipeline(
     apply_optimizer_step_fn: Callable[..., None],
     sync_plugin,
     zero_grad_fn: Optional[Callable[[object], None]] = None,
+    refresh_persistent_params_fn: Optional[Callable[[nn.Module], None]] = None,
+    precision_controller: Optional["MixedPrecisionController"] = None,
+    precision_config: Optional[PrecisionConfig] = None,
 ) -> tuple[float, float, float, int, int]:
     """One TP+PP+EP+DP training step using non-interleaved 1F1B schedule."""
     if parallel.pipeline_model_parallel_size <= 1:
         raise ValueError("train_step_pipeline requires pipeline_model_parallel_size > 1")
 
     device = parallel.device
-    activation_dtype = next(model.parameters()).dtype
+    if precision_config is None:
+        activation_dtype = next(model.parameters()).dtype
+    else:
+        activation_dtype = dtype_alias_to_torch(precision_config.activation_dtype)
     hidden_size = model.config.hidden_size
     microbatch_batch_size = expected_local_batch // num_microbatches
     peers = resolve_pipeline_peers(parallel)
@@ -400,6 +436,7 @@ def train_step_pipeline(
             activation_dtype=activation_dtype,
             device=device,
             gather_moe_metrics_fn=gather_moe_metrics_fn,
+            precision_controller=precision_controller,
         ),
         run_backward=lambda microbatch_idx: pipeline_backward_microbatch(
             microbatch_idx=microbatch_idx,
@@ -413,21 +450,32 @@ def train_step_pipeline(
             hidden_size=hidden_size,
             activation_dtype=activation_dtype,
             device=device,
+            precision_controller=precision_controller,
         ),
     )
     finalize_pipeline_sends(state)
 
-    apply_optimizer_step_fn(
-        model=model,
-        optimizer=optimizer,
-        use_distributed_optimizer=use_distributed_optimizer,
-        shard_info=shard_info,
-        data_parallel_size=parallel.data_parallel_size,
-        expert_data_parallel_size=parallel.expert_data_parallel_size,
-        data_parallel_group=parallel.data_parallel_group,
-        expert_data_parallel_group=parallel.expert_data_parallel_group,
-        sync_plugin=sync_plugin,
-    )
+    should_step = True
+    if precision_controller is not None:
+        should_step = precision_controller.prepare_optimizer_step(model)
+
+    if should_step:
+        apply_optimizer_step_fn(
+            model=model,
+            optimizer=optimizer,
+            use_distributed_optimizer=use_distributed_optimizer,
+            shard_info=shard_info,
+            data_parallel_size=parallel.data_parallel_size,
+            expert_data_parallel_size=parallel.expert_data_parallel_size,
+            data_parallel_group=parallel.data_parallel_group,
+            expert_data_parallel_group=parallel.expert_data_parallel_group,
+            sync_plugin=sync_plugin,
+        )
+        if refresh_persistent_params_fn is not None:
+            refresh_persistent_params_fn(model)
+
+    if precision_controller is not None:
+        precision_controller.update_after_step(step_applied=should_step)
 
     objective_count = num_microbatches if model.is_last_pp_stage else 0
     return (
