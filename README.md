@@ -1,3 +1,5 @@
+[![DeepWiki](https://img.shields.io/badge/DeepWiki-Project%20Docs-0EA5E9?style=flat-square)](https://deepwiki.com/lastweek/nano-train)
+
 # Nano-Train
 
 `nano-train` is a learning-first distributed LLM training repo built around Megatron-style
