@@ -62,7 +62,8 @@ Code path:
 - Router loss computation:
   [src/models/moe.py](../src/models/moe.py) in `TopKRouter._compute_aux_loss`
 - Training objective composition:
-  [examples/train_4d.py](../examples/train_4d.py) in `train_step`
+  [examples/train_4d.py](../examples/train_4d.py) in the runtime schedule path
+  (`Train4PNonPipelineSchedule.run_step`)
 
 Implemented form:
 
@@ -101,3 +102,15 @@ When reading logs in `examples/train_4d.py`:
 ## 7) Reference
 
 - DeepSeekMoE paper: https://arxiv.org/abs/2401.06066
+
+## 8) Precision Policy Interaction
+
+Current mixed-precision support does not change the auxiliary loss definition itself.
+
+- Router auxiliary objectives remain the same mathematical terms described above.
+- Precision policy changes the numeric execution path, not the objective formula.
+- DeepSeek-V3 recipe support may also enable low-precision MoE dispatch/combine payloads,
+  but metadata tensors and routing structure remain unchanged.
+
+For DeepSeek module-level precision control, prefer
+[DeepSeek Precision Configuration](deepseek_precision_configuration.md).

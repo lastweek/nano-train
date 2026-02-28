@@ -95,6 +95,13 @@ Compared with TP+EP+DP without PP, PP adds:
 - Backward activation-gradient sends to previous stage
 - Label sends from first stage to last stage
 
+With the `deepseek_v3` precision recipe enabled, MoE dispatch/combine payload tensors may also
+use FP8 communication quantization on the expert-parallel path. Metadata tensors remain
+unquantized, and collective ordering does not change.
+
+For module-level DeepSeek precision control, see
+[DeepSeek Precision Configuration](deepseek_precision_configuration.md).
+
 All other TP/EP/DP collectives remain unchanged.
 
 ## 8) Practical checklist

@@ -212,9 +212,9 @@ Precision note:
 - Optimizer/schedule implementations can use this for autocast policy, low-bit backend routing,
   and loss-scaling behavior.
 - Low-bit compute is strict per-module: layers only dispatch low-bit when a
-  `ModulePrecisionAssignment` is applied via
-  `build_model_precision_plan(...)` + `apply_model_precision_plan(...)`.
-  Active low-bit runtime context does not act as a global fallback selector.
+  `ModulePrecisionAssignment` is resolved and bound at module construction time via
+  `build_module_precision_resolver(...)`.
+  There is no global runtime low-bit context fallback.
 
 ## 6) How to Use the Runtime Pattern
 
@@ -314,11 +314,32 @@ Test references for runtime behavior:
 
 `train_4d` integrates mixed precision while keeping `RuntimeEngine` APIs unchanged:
 
-1. Bootstrap resolves `PrecisionConfig` from Megatron-style precision flags.
-2. `Train4POptimizerRuntime` creates a mixed-precision controller and stores it in
-   `OptimizerState.extra_state`.
-3. Schedules wrap forward/loss in precision context and run scaled backward where needed.
-4. Before optimizer step, controller logic unscales grads, checks global finiteness, and can skip
-   unsafe steps consistently across ranks.
-5. Low-bit (`fp8`/`fp4`) linear execution routes through runtime backend dispatch used by
-   `src/layers.py`.
+1. Scripts use shared precision CLI helpers in `src/runtime/precision_args.py`.
+2. Bootstrap resolves `PrecisionConfig` and builds a constructor-time
+   `ModulePrecisionResolver`.
+3. Each parameterized module binds its own precision state at initialization using explicit
+   `module_path` (no global low-bit runtime context fallback).
+4. Low-bit (`fp8`/`fp4`) linear execution is strict per-module and backend-backed
+   (`emulated` or Transformer Engine when available).
+5. Recipe presets are resolved in shared precision args:
+   - `--precision-recipe default`
+   - `--precision-recipe deepseek_v3` (FP8 tile/block granularity defaults, stochastic
+     rounding, and MoE payload communication quantization enabled).
+   Recipe defaults can be overridden by explicit `--fp8-*` flags.
+6. DeepSeek-V3 high-precision exception patterns are enforced at resolver finalization:
+   selected exception modules are forced out of low-bit compute/persistent paths.
+7. Optional optimizer-owned master parameters are materialized via
+   `src/runtime/master_store.py` when `--lowbit-master-ownership optimizer` is selected.
+8. Runtime owns the generic precision resolver and low-bit routing policy. `DeepSeekModel`
+   adds a model-local exact-path layer on top through
+   `DeepSeekModelConfig.module_compute_dtype_overrides`.
+9. For DeepSeek, prefer exact-path config overrides such as
+   `{"blocks.0.attn.q_a_norm": "fp16"}`. Generic runtime fallback remains available with
+   `--module-compute-dtype-rule '<pattern>=<fp32|bf16|fp16>'`.
+10. `MixedPrecisionController` remains run-level for autocast, loss scaling, overflow checks,
+   and step-skip policy.
+11. ZeRO checkpoint payloads are versioned as format v2; previous format versions are
+   intentionally unsupported.
+
+See [DeepSeek Precision Configuration](deepseek_precision_configuration.md) for the
+config-first DeepSeek path and exact module-path examples.

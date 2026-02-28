@@ -60,6 +60,7 @@ python3 examples/train_4d.py \
   --expert-model-parallel-size 1 \
   --fp8 \
   --fp8-backend emulated \
+  --lowbit-master-ownership optimizer \
   --params-dtype bf16 \
   --main-params-dtype fp32 \
   --main-grads-dtype fp32 \
@@ -67,6 +68,52 @@ python3 examples/train_4d.py \
   --exp-avg-sq-dtype fp32 \
   --max_steps 1
 ```
+
+Notes:
+- Low-bit execution is strict per-module and bound at module construction time.
+- ZeRO checkpoint optimizer payloads now use format v2 only (old formats are unsupported).
+
+### DeepSeek-V3 Recipe Smoke (FP8 Emulated)
+
+```bash
+python3 examples/train_4d.py \
+  --tensor-model-parallel-size 1 \
+  --pipeline-model-parallel-size 1 \
+  --expert-model-parallel-size 1 \
+  --precision-recipe deepseek_v3 \
+  --fp8 \
+  --fp8-backend emulated \
+  --max_steps 1
+```
+
+Recipe notes:
+- `--precision-recipe deepseek_v3` defaults to FP8 with:
+  - activation quant granularity `tile_1x128`
+  - weight quant granularity `block_128x128`
+  - rounding mode `stochastic`
+  - MoE dispatch/combine payload comm-quant enabled
+- You can override each recipe field with `--fp8-*` flags.
+- For `DeepSeekModel`, prefer exact-path config overrides through
+  `DeepSeekModelConfig.module_compute_dtype_overrides`.
+- Generic CLI fallback is still available for quick experiments or non-DeepSeek scripts:
+  `--module-compute-dtype-rule '<module_pattern>=<fp32|bf16|fp16>'`.
+
+DeepSeek config-first example:
+
+```python
+model_config = build_tiny_deepseek_config(
+    args,
+    param_dtype=param_dtype,
+    param_device=parallel.device,
+    precision_resolver=build_module_precision_resolver(precision_config),
+    module_compute_dtype_overrides={
+        "blocks.0.attn.q_a_norm": "fp16",
+    },
+)
+```
+
+See [DeepSeek Precision Configuration](docs/deepseek_precision_configuration.md) for
+exact module-path control, precedence, and fallback behavior.
 
 ## Key Entrypoints
 
@@ -221,7 +268,7 @@ flowchart TD
 | Status | Milestone | Expected Focus Files |
 |---|---|---|
 | In Progress | Canonical TP+EP mapping (remove TP+EP guard, avoid expert replication) | `examples/train_4d.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md`, `docs/pp_tp_ep_dp_communication.md` |
-| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/train_4d.py`, `src/models/moe.py`, `tests/test_train_4p_script_logic.py` |
+| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/train_4d.py`, `src/models/moe.py`, `tests/test_train_4d_script_logic.py` |
 | Planned | DeepSeek parallel context cleanup and simplification | `src/models/deepseek.py`, `tests/test_deepseek_model.py` |
 | Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/train_4d.py`, `docs/deepseek_moe_aux_losses.md` |
 | Planned | Checkpoint resume path for ZeRO sharded optimizer in trainer | `src/trainer.py`, `src/distributed/zero.py`, `docs/zero1_zero2_quickstart.md` |

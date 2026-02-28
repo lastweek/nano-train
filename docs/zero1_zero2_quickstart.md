@@ -117,6 +117,7 @@ python3 examples/launch.py --world-size 2 --backend gloo \
   --data-parallel-sharding-strategy optim \
   --fp8 \
   --fp8-backend emulated \
+  --lowbit-master-ownership optimizer \
   --params-dtype bf16 \
   --main-params-dtype fp32 \
   --main-grads-dtype fp32 \
@@ -124,6 +125,37 @@ python3 examples/launch.py --world-size 2 --backend gloo \
   --exp-avg-sq-dtype fp32 \
   --max_steps 1
 ```
+
+DeepSeek-V3 FP8 recipe path (recipe defaults + explicit backend):
+
+```bash
+python3 examples/launch.py --world-size 2 --backend gloo \
+  --script examples/train_4d.py --script-args \
+  --tensor-model-parallel-size 1 \
+  --pipeline-model-parallel-size 1 \
+  --expert-model-parallel-size 1 \
+  --use-distributed-optimizer \
+  --data-parallel-sharding-strategy optim \
+  --precision-recipe deepseek_v3 \
+  --fp8 \
+  --fp8-backend emulated \
+  --max_steps 1
+```
+
+Recipe defaults for `deepseek_v3`:
+- activation quant granularity `tile_1x128`
+- weight quant granularity `block_128x128`
+- rounding `stochastic`
+- MoE communication quantization enabled
+
+DeepSeek config-first override note:
+- If you need an exact DeepSeek module override such as `q_a_norm -> fp16`, prefer
+  `DeepSeekModelConfig.module_compute_dtype_overrides` in
+  [examples/train_4d.py](../examples/train_4d.py).
+- Use `--module-compute-dtype-rule` only as a generic fallback for quick experiments or
+  non-DeepSeek runtime scripts.
+- See [DeepSeek Precision Configuration](deepseek_precision_configuration.md) for exact
+  module-path examples and precedence rules.
 
 ## Interface Contract
 
@@ -158,6 +190,10 @@ When ZeRO is enabled, each checkpoint directory writes:
 - `optimizer_nonparam.pt`
 - `optimizer_manifest.json`
 - `optimizer_shard_rank{rank}.pt`
+
+Checkpoint format notes:
+- ZeRO optimizer checkpoint payloads use `format_version = 2`.
+- Older checkpoint payload versions are intentionally unsupported.
 
 ## Troubleshooting
 
