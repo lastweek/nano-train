@@ -11,6 +11,8 @@ DeepSeek-style model stack.
   not just how a single training loop runs.
 - A runtime-backed training system where orchestration lives in `src/runtime/*` and scenario
   wiring lives in thin entry scripts under `examples/`.
+- A reusable model-building stack where parallelism-aware and precision-aware primitives in
+  `src/layers.py` are composed into reusable blocks and full model stacks.
 - A place to study Megatron-style concepts concretely: tensor parallelism, pipeline
   parallelism, expert parallelism, data parallelism, optimizer sharding, and low-bit training.
 
@@ -25,7 +27,8 @@ DeepSeek-style model stack.
   implemented in the current runtime/tutorial path.
 - **Checkpoint/runtime interface**: the current ZeRO checkpoint path uses format v2 in the
   current implementation.
-- **Model/tutorial stack**: a DeepSeek-style decoder + MoE stack, TP/DDP/MVP examples,
+- **Model/tutorial stack**: low-level precision-aware and parallelism-aware layer primitives,
+  reusable attention/MLP/MoE blocks, `TransformerModel`, `DeepSeekModel`, TP/DDP/MVP examples,
   monitoring utilities, and model inspection tooling are included.
 
 ## Start Here
@@ -113,10 +116,15 @@ DeepSeek precision notes:
 
 ## Architecture Today
 
-The system is now organized around a clear boundary: the runtime engine owns orchestration,
-entry scripts own composition, and models/layers own the math, parameterization, and precision
-behavior. That split is what let the repo evolve from isolated scripts into a reusable training
-runtime without flattening everything into one framework.
+`nano-train` now has two important architectural layers. The runtime layer explains how
+training is orchestrated across scripts, schedules, and checkpoint hooks. The model-building
+layer explains how reusable low-level layer primitives are composed into blocks and then into
+concrete model stacks such as `TransformerModel` and `DeepSeekModel`.
+
+### Training Orchestration View
+
+This view shows how training runs. Entry scripts stay thin, assemble `RuntimeComponents`, and
+delegate orchestration to `RuntimeEngine`.
 
 ```mermaid
 flowchart TD
@@ -199,8 +207,84 @@ flowchart TD
     R0 -. uses .-> H4
 ```
 
+### Model Construction View
+
+This view shows the reusable internal architecture that sits below the runtime shell. Precision
+policy and parallel-aware execution feed into low-level layer primitives, which are composed
+into model blocks and then concrete model stacks.
+
+```mermaid
+flowchart TD
+    subgraph P["Precision / Parallel Support"]
+        P1["mixed_precision.py"]
+        P2["te_backend.py"]
+        P3["master_store.py"]
+    end
+
+    subgraph L["Low-Level Layer Primitives (`src/layers.py`)"]
+        L1["Linear family<br/>Linear / ColumnParallelLinear / RowParallelLinear"]
+        L2["State + norm family<br/>Embedding / LayerNorm / RMSNorm"]
+        L3["Utility ops<br/>Dropout / GELU / TP collectives"]
+    end
+
+    subgraph B["Reusable Model Blocks (`src/models/*`)"]
+        B1["Attention blocks<br/>MultiHeadAttention / MLA"]
+        B2["MLP blocks<br/>MLP / GatedMLP"]
+        B3["MoE blocks<br/>TopKRouter / ExpertMLP / LocalRoutedMoE / ExpertParallelMoE"]
+    end
+
+    subgraph M["Concrete Model Stacks"]
+        M1["TransformerModel"]
+        M2["DeepSeekModel"]
+        M3["Custom models from the same blocks"]
+    end
+
+    subgraph E2["Runtime Entry Scripts"]
+        E21["train_tp.py"]
+        E22["train_ddp.py"]
+        E23["train_mvp.py"]
+        E24["train_4d.py"]
+    end
+
+    P1 --> L1
+    P1 --> L2
+    P2 --> L1
+    P3 --> L1
+
+    L1 --> B1
+    L1 --> B2
+    L1 --> B3
+    L2 --> B1
+    L2 --> B2
+    L2 --> B3
+    L3 --> B1
+    L3 --> B2
+
+    B1 --> M1
+    B2 --> M1
+    B1 --> M2
+    B2 --> M2
+    B3 --> M2
+    B1 --> M3
+    B2 --> M3
+    B3 --> M3
+
+    M1 --> E21
+    M1 --> E22
+    M1 --> E23
+    M2 --> E24
+    M3 --> E24
+```
+
+`src/layers.py` is the reusable foundation for both precision-aware and parallelism-aware
+execution. `src/models/*` builds higher-level attention, MLP, and MoE blocks on top of those
+primitives. `TransformerModel` and `DeepSeekModel` are concrete examples, not special cases,
+and additional models can be built from the same internal layer stack.
+
 If you want the architecture and API details, read
-[docs/runtime_core_design.md](docs/runtime_core_design.md).
+[docs/runtime_core_design.md](docs/runtime_core_design.md). For DeepSeek-specific precision
+overrides and precedence rules, see
+[docs/deepseek_precision_configuration.md](docs/deepseek_precision_configuration.md).
 
 ## Key Entrypoints
 
@@ -214,6 +298,9 @@ If you want the architecture and API details, read
 | `src/runtime/contracts.py` | Component interfaces and runtime dataclasses |
 | `src/runtime/mixed_precision.py` | Precision policy, autocast, scaling, and low-bit wiring |
 | `src/distributed/zero.py` | Megatron-style ZeRO-1/2 optimizer implementation |
+| `src/layers.py` | Low-level parallelism-aware and precision-aware layer primitives |
+| `src/models/attention.py` | Reusable attention blocks used by transformer-style models |
+| `src/models/mlp.py` | Reusable feed-forward blocks used across model stacks |
 | `src/models/deepseek.py` | DeepSeek-style decoder and parallel-context model path |
 | `src/models/moe.py` | Routed MoE layers and expert-parallel communication |
 
