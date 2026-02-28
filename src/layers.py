@@ -25,17 +25,36 @@ import torch.nn.functional as F
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from src.runtime.te_backend import ActiveLowBitContext
-from src.runtime.te_backend import get_active_lowbit_context
-
 if TYPE_CHECKING:
+    from src.runtime.contracts import LowBitKernelSpec
     from src.runtime.contracts import LowBitComputeMode
-    from src.runtime.contracts import ModulePrecisionAssignment
+    from src.runtime.contracts import LowBitCapableModuleType
+    from src.runtime.contracts import ModulePrecisionInitState
+    from src.runtime.contracts import ModulePrecisionResolver
     from src.runtime.contracts import PersistentScaleGranularity
 else:
+    LowBitKernelSpec = object
     LowBitComputeMode = str
-    ModulePrecisionAssignment = object
+    LowBitCapableModuleType = str
+    ModulePrecisionInitState = object
+    ModulePrecisionResolver = object
     PersistentScaleGranularity = str
+
+
+_COMPUTE_DTYPE_ALIAS_TO_TORCH = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
+
+
+def _resolve_compute_torch_dtype(dtype_alias: str) -> torch.dtype:
+    try:
+        return _COMPUTE_DTYPE_ALIAS_TO_TORCH[dtype_alias]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported compute dtype override alias: {dtype_alias}"
+        ) from exc
 
 
 def _nf4_codebook(device: torch.device) -> torch.Tensor:
@@ -165,11 +184,54 @@ def _dequantize_nf4_persistent(
     return dequant.to(dtype=target_dtype)
 
 
-class _LowBitPrecisionLinearMixin:
+class _ModulePrecisionStateMixin:
+    """Attach constructor-time module precision state to parameterized layers."""
+
+    def _init_module_precision_state(
+        self,
+        *,
+        module_path: str,
+        module_type: str,
+        precision_resolver: "ModulePrecisionResolver",
+        lowbit_capable_type: Optional["LowBitCapableModuleType"],
+        kernel_spec: Optional["LowBitKernelSpec"],
+    ) -> None:
+        self._module_precision_state: "ModulePrecisionInitState" = (
+            precision_resolver.resolve_module_init_state(
+                module_path=module_path,
+                module_type=module_type,
+                lowbit_capable_type=lowbit_capable_type,
+                kernel_spec=kernel_spec,
+            )
+        )
+
+    def _module_compute_dtype_override(self) -> Optional[torch.dtype]:
+        assignment = self._module_precision_state.assignment
+        dtype_alias = getattr(assignment, "compute_dtype_override", None)
+        if dtype_alias is None:
+            return None
+        return _resolve_compute_torch_dtype(str(dtype_alias))
+
+
+class _LowBitPrecisionLinearMixin(_ModulePrecisionStateMixin):
     """Reusable per-module low-bit compute and persistent parameter hooks."""
 
-    def _init_lowbit_precision_state(self) -> None:
-        self._precision_assignment: Optional["ModulePrecisionAssignment"] = None
+    def _init_lowbit_precision_state(
+        self,
+        *,
+        module_path: str,
+        module_type: str,
+        precision_resolver: "ModulePrecisionResolver",
+        lowbit_capable_type: "LowBitCapableModuleType",
+        kernel_spec: "LowBitKernelSpec",
+    ) -> None:
+        self._init_module_precision_state(
+            module_path=module_path,
+            module_type=module_type,
+            precision_resolver=precision_resolver,
+            lowbit_capable_type=lowbit_capable_type,
+            kernel_spec=kernel_spec,
+        )
         self.register_buffer("_persistent_fp8_weight", torch.empty(0), persistent=True)
         self.register_buffer(
             "_persistent_fp4_codes",
@@ -182,6 +244,38 @@ class _LowBitPrecisionLinearMixin:
             torch.zeros((), dtype=torch.int64),
             persistent=True,
         )
+        backend = self._module_precision_state.lowbit_backend
+        bind_fn = getattr(backend, "bind_parameters", None)
+        if callable(bind_fn):
+            bind_fn(self.weight, self.bias)
+
+    @property
+    def module_precision_assignment(self):
+        """Return constructor-time precision assignment resolved for this module."""
+        return self._module_precision_state.assignment
+
+    @property
+    def module_path(self) -> str:
+        """Return canonical module path used by precision policy matching."""
+        return str(self._module_precision_state.assignment.module_name)
+
+    @property
+    def master_ownership_mode(self) -> str:
+        """Return configured master ownership mode for this module."""
+        return str(getattr(self._module_precision_state, "master_ownership_mode", "module"))
+
+    def bind_optimizer_master_weight(self, master_weight: nn.Parameter) -> None:
+        """Bind optimizer-owned master weight parameter to this module."""
+        if not isinstance(master_weight, nn.Parameter):
+            raise TypeError("master_weight must be nn.Parameter")
+        if master_weight.shape != self.weight.shape:
+            raise ValueError(
+                "optimizer master weight shape mismatch: "
+                f"expected={tuple(self.weight.shape)} got={tuple(master_weight.shape)}"
+            )
+        with torch.no_grad():
+            master_weight.copy_(self.weight.detach().to(device=master_weight.device))
+        self.weight = master_weight
 
     def _load_from_state_dict(
         self,
@@ -212,30 +306,18 @@ class _LowBitPrecisionLinearMixin:
         optional_keys = {f"{prefix}{suffix}" for suffix in optional_suffixes}
         missing_keys[:] = [key for key in missing_keys if key not in optional_keys]
 
-    def set_precision_assignment(self, assignment: "ModulePrecisionAssignment") -> None:
-        """Set per-module precision assignment resolved by runtime policy."""
-        self._precision_assignment = assignment
-        self.refresh_persistent_lowbit_params()
-
     def _persistent_mode(self) -> str:
-        assignment = self._precision_assignment
-        if assignment is None:
-            return "off"
+        assignment = self._module_precision_state.assignment
         return str(getattr(assignment, "persistent_lowbit_mode", "off"))
 
     def _persistent_granularity(self) -> str:
-        assignment = self._precision_assignment
-        if assignment is None:
-            return "per_channel"
+        assignment = self._module_precision_state.assignment
         return str(getattr(assignment, "persistent_scale_granularity", "per_channel"))
 
     def _compute_lowbit_mode(
         self,
     ) -> Optional["LowBitComputeMode"]:
-        assignment = self._precision_assignment
-        if assignment is None:
-            return None
-
+        assignment = self._module_precision_state.assignment
         assignment_mode = getattr(assignment, "compute_lowbit_mode", None)
         if assignment_mode is None:
             return None
@@ -243,6 +325,24 @@ class _LowBitPrecisionLinearMixin:
         if mode_text not in ("fp8", "fp4"):
             return None
         return mode_text  # type: ignore[return-value]
+
+    def _compute_dtype_override(self) -> Optional[torch.dtype]:
+        return self._module_compute_dtype_override()
+
+    def _linear_with_dtype_override(
+        self,
+        *,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        compute_dtype = self._compute_dtype_override()
+        if compute_dtype is None:
+            return None
+        x_compute = x.to(dtype=compute_dtype)
+        weight_compute = weight.to(dtype=compute_dtype)
+        bias_compute = bias.to(dtype=compute_dtype) if bias is not None else None
+        return F.linear(x_compute, weight_compute, bias_compute)
 
     def _clear_persistent_lowbit_buffers(self) -> None:
         self._persistent_fp8_weight = torch.empty(0, device=self.weight.device)
@@ -285,7 +385,8 @@ class _LowBitPrecisionLinearMixin:
             return
 
         if mode == "fp4":
-            fp4_format = str(getattr(self._precision_assignment, "fp4_persistent_format", "nf4"))
+            assignment = self._module_precision_state.assignment
+            fp4_format = str(getattr(assignment, "fp4_persistent_format", "nf4"))
             if fp4_format != "nf4":
                 raise ValueError("Only nf4 is supported for FP4 persistent params")
 
@@ -340,44 +441,21 @@ class _LowBitPrecisionLinearMixin:
         x: torch.Tensor,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
-        lowbit_context: Optional[ActiveLowBitContext],
     ) -> Optional[torch.Tensor]:
         """Run low-bit backend if module policy selects one; otherwise return None."""
         compute_mode = self._compute_lowbit_mode()
         if compute_mode is None:
-            if (
-                self._precision_assignment is None
-                and lowbit_context is not None
-                and lowbit_context.backend_by_mode
-            ):
-                module_name = getattr(self._precision_assignment, "module_name", None)
-                module_label = module_name if module_name else "<unassigned>"
-                raise RuntimeError(
-                    "Low-bit context is active, but module "
-                    f"{self.__class__.__name__} ({module_label}) has no precision assignment. "
-                    "Apply per-module assignments via "
-                    "build_model_precision_plan(...) and apply_model_precision_plan(...)."
-                )
             return None
-        if lowbit_context is None:
+
+        backend = self._module_precision_state.lowbit_backend
+        if backend is None:
+            module_name = self._module_precision_state.assignment.module_name
             raise RuntimeError(
-                f"Module {self.__class__.__name__} requested compute mode {compute_mode} "
-                "without active low-bit runtime context"
+                f"Module {self.__class__.__name__} ({module_name}) requested compute mode "
+                f"{compute_mode} without a bound low-bit backend"
             )
 
-        backend = lowbit_context.backend_by_mode.get(str(compute_mode))
-        if backend is None:
-            raise RuntimeError(
-                f"No active low-bit backend for compute mode {compute_mode}. "
-                "Check --compute-lowbit-mode and backend flags."
-            )
-        return backend.linear(
-            x,
-            weight,
-            bias,
-            mode=compute_mode,
-            config=lowbit_context.config,
-        )
+        return backend.linear(x, weight, bias)
 
 
 # =============================================================================
@@ -457,6 +535,8 @@ class Linear(_LowBitPrecisionLinearMixin, nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        module_path: str,
+        precision_resolver: "ModulePrecisionResolver",
     ):
         """
         Args:
@@ -497,7 +577,20 @@ class Linear(_LowBitPrecisionLinearMixin, nn.Module):
         nn.init.normal_(self.weight, std=0.02)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-        self._init_lowbit_precision_state()
+        from src.runtime.contracts import LowBitKernelSpec
+
+        self._init_lowbit_precision_state(
+            module_path=module_path,
+            module_type=self.__class__.__name__,
+            precision_resolver=precision_resolver,
+            lowbit_capable_type="linear",
+            kernel_spec=LowBitKernelSpec(
+                module_type="linear",
+                in_features=in_features,
+                out_features=out_features,
+                has_bias=self.bias is not None,
+            ),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -515,16 +608,22 @@ class Linear(_LowBitPrecisionLinearMixin, nn.Module):
         Returns:
             Tensor of shape (*, out_features)
         """
-        lowbit = get_active_lowbit_context()
         weight = self._persistent_weight_ste()
         lowbit_output = self._dispatch_lowbit_linear(
             x=x,
             weight=weight,
             bias=self.bias,
-            lowbit_context=lowbit,
         )
         if lowbit_output is not None:
             return lowbit_output
+
+        dtype_override_output = self._linear_with_dtype_override(
+            x=x,
+            weight=weight,
+            bias=self.bias,
+        )
+        if dtype_override_output is not None:
+            return dtype_override_output
 
         # F.linear is equivalent to x @ weight.T + bias
         # But more numerically stable and optimized
@@ -537,7 +636,7 @@ class Linear(_LowBitPrecisionLinearMixin, nn.Module):
 # LAYER NORMALIZATION
 # =============================================================================
 
-class LayerNorm(nn.Module):
+class LayerNorm(_ModulePrecisionStateMixin, nn.Module):
     """
     Layer Normalization: Normalize features to have zero mean, unit variance
 
@@ -609,6 +708,8 @@ class LayerNorm(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        module_path: str,
+        precision_resolver: "ModulePrecisionResolver",
     ):
         """
         Args:
@@ -636,6 +737,13 @@ class LayerNorm(nn.Module):
                 device=param_device,
             )
         )
+        self._init_module_precision_state(
+            module_path=module_path,
+            module_type=self.__class__.__name__,
+            precision_resolver=precision_resolver,
+            lowbit_capable_type=None,
+            kernel_spec=None,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -652,27 +760,32 @@ class LayerNorm(nn.Module):
         Returns:
             Normalized tensor of same shape
         """
+        compute_dtype = self._module_compute_dtype_override()
+        x_compute = x.to(dtype=compute_dtype) if compute_dtype is not None else x
+        weight = self.weight.to(dtype=compute_dtype) if compute_dtype is not None else self.weight
+        bias = self.bias.to(dtype=compute_dtype) if compute_dtype is not None else self.bias
+
         # Compute mean over last dimension
         # Shape: (*) - one value per sample
-        mean = x.mean(dim=-1, keepdim=True)
+        mean = x_compute.mean(dim=-1, keepdim=True)
 
         # Compute variance over last dimension
         # Shape: (*) - one value per sample
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        var = x_compute.var(dim=-1, keepdim=True, unbiased=False)
 
         # Normalize: (x - mean) / sqrt(var + eps)
         # This centers at 0 and scales to unit variance
-        x_normalized = (x - mean) / torch.sqrt(var + self.eps)
+        x_normalized = (x_compute - mean) / torch.sqrt(var + self.eps)
 
         # Scale and shift with learnable parameters
-        return self.weight * x_normalized + self.bias
+        return weight * x_normalized + bias
 
 
 # =============================================================================
 # EMBEDDING LAYER
 # =============================================================================
 
-class Embedding(nn.Module):
+class Embedding(_ModulePrecisionStateMixin, nn.Module):
     """
     Embedding layer: Map discrete token IDs to continuous vectors
 
@@ -736,6 +849,8 @@ class Embedding(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        module_path: str,
+        precision_resolver: "ModulePrecisionResolver",
     ):
         """
         Args:
@@ -760,6 +875,13 @@ class Embedding(nn.Module):
         # Initialize with normal distribution (std=0.02)
         # This is common for transformers (similar to GPT-2)
         nn.init.normal_(self.weight, std=0.02)
+        self._init_module_precision_state(
+            module_path=module_path,
+            module_type=self.__class__.__name__,
+            precision_resolver=precision_resolver,
+            lowbit_capable_type=None,
+            kernel_spec=None,
+        )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """
@@ -1138,6 +1260,8 @@ class ColumnParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        module_path: str,
+        precision_resolver: "ModulePrecisionResolver",
     ):
         """
         Args:
@@ -1186,7 +1310,20 @@ class ColumnParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
         nn.init.normal_(self.weight, std=0.02)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-        self._init_lowbit_precision_state()
+        from src.runtime.contracts import LowBitKernelSpec
+
+        self._init_lowbit_precision_state(
+            module_path=module_path,
+            module_type=self.__class__.__name__,
+            precision_resolver=precision_resolver,
+            lowbit_capable_type="column_parallel_linear",
+            kernel_spec=LowBitKernelSpec(
+                module_type="column_parallel_linear",
+                in_features=in_features,
+                out_features=self.shard_size,
+                has_bias=self.bias is not None,
+            ),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1201,16 +1338,22 @@ class ColumnParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
         if self.tp_size > 1:
             x = _CopyToTensorParallelRegion.apply(x, self.tp_group)
 
-        lowbit = get_active_lowbit_context()
         weight = self._persistent_weight_ste()
         lowbit_output = self._dispatch_lowbit_linear(
             x=x,
             weight=weight,
             bias=self.bias,
-            lowbit_context=lowbit,
         )
         if lowbit_output is not None:
             return lowbit_output
+
+        dtype_override_output = self._linear_with_dtype_override(
+            x=x,
+            weight=weight,
+            bias=self.bias,
+        )
+        if dtype_override_output is not None:
+            return dtype_override_output
 
         if self.bias is not None:
             return F.linear(x, weight, self.bias)
@@ -1247,6 +1390,8 @@ class RowParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        module_path: str,
+        precision_resolver: "ModulePrecisionResolver",
     ):
         """
         Args:
@@ -1295,7 +1440,20 @@ class RowParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
         nn.init.normal_(self.weight, std=0.02)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-        self._init_lowbit_precision_state()
+        from src.runtime.contracts import LowBitKernelSpec
+
+        self._init_lowbit_precision_state(
+            module_path=module_path,
+            module_type=self.__class__.__name__,
+            precision_resolver=precision_resolver,
+            lowbit_capable_type="row_parallel_linear",
+            kernel_spec=LowBitKernelSpec(
+                module_type="row_parallel_linear",
+                in_features=self.shard_size,
+                out_features=out_features,
+                has_bias=self.bias is not None,
+            ),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1307,17 +1465,23 @@ class RowParallelLinear(_LowBitPrecisionLinearMixin, nn.Module):
         Returns:
             Tensor of shape (*, out_features) - full output on all GPUs
         """
-        lowbit = get_active_lowbit_context()
         weight = self._persistent_weight_ste()
         lowbit_output = self._dispatch_lowbit_linear(
             x=x,
             weight=weight,
             bias=None,
-            lowbit_context=lowbit,
         )
         if lowbit_output is None:
             # Compute partial output from local input/weight shards.
-            partial_output = F.linear(x, weight, None)
+            dtype_override_output = self._linear_with_dtype_override(
+                x=x,
+                weight=weight,
+                bias=None,
+            )
+            if dtype_override_output is not None:
+                partial_output = dtype_override_output
+            else:
+                partial_output = F.linear(x, weight, None)
         else:
             partial_output = lowbit_output
 

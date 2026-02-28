@@ -7,20 +7,29 @@ import argparse
 import torch
 
 from src.layers import Linear
-from src.runtime.mixed_precision import build_model_precision_plan
+from src.layers import LayerNorm
+from src.runtime.mixed_precision import build_module_precision_resolver
 from src.runtime.mixed_precision import resolve_precision_config
 
 
 class _TinyModel(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, *, precision_resolver) -> None:
         super().__init__()
         self.proj = Linear(
             4,
             4,
             param_dtype=torch.float32,
             param_device=None,
+            module_path="proj",
+            precision_resolver=precision_resolver,
         )
-        self.relu = torch.nn.ReLU()
+        self.norm = LayerNorm(
+            4,
+            param_dtype=torch.float32,
+            param_device=None,
+            module_path="norm",
+            precision_resolver=precision_resolver,
+        )
 
 
 
@@ -52,7 +61,7 @@ def _args() -> argparse.Namespace:
         persistent_scale_granularity="per_channel",
         module_pattern_type="regex",
         compute_lowbit_mode="fp8",
-        compute_lowbit_include=[".*relu"],
+        compute_lowbit_include=[".*norm"],
         compute_lowbit_exclude=None,
         persistent_lowbit_mode="off",
         persistent_lowbit_include=None,
@@ -61,14 +70,12 @@ def _args() -> argparse.Namespace:
 
 
 
-def test_build_model_precision_plan_rejects_unsupported_module_match() -> None:
-    model = _TinyModel()
+def test_resolver_rejects_unsupported_module_match() -> None:
     cfg = resolve_precision_config(_args(), torch.device("cpu"))
-    policy = cfg.module_precision_policy
-    assert policy is not None
+    resolver = build_module_precision_resolver(cfg)
 
     try:
-        build_model_precision_plan(model, policy)
+        _ = _TinyModel(precision_resolver=resolver)
     except ValueError as exc:
         assert "without low-bit support" in str(exc)
     else:

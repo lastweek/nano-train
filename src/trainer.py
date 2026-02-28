@@ -29,6 +29,7 @@ except ImportError:
             SummaryWriter = None
 
 from src.config import Config
+from src.config import config_to_serializable_dict
 from src.logging import get_logger
 from src.losses import CrossEntropyLoss
 from src.monitoring import (
@@ -100,6 +101,19 @@ class _TrainWindow:
 
     def elapsed_seconds(self, *, now: float) -> float:
         return max(0.0, float(now) - float(self.start_time))
+
+
+@dataclass
+class _RuntimeStepState:
+    """Cached per-step metadata shared across runtime step lifecycle hooks."""
+
+    labels_used: torch.Tensor
+    tokens: int
+    effective_tokens: int
+    samples: int
+    hist_this_step: bool
+    blocks_to_monitor: set[int]
+    log_this_step: bool
 
 
 class Trainer:
@@ -1229,15 +1243,15 @@ class Trainer:
             final_loss=float(last_loss) if last_loss is not None else float("nan"),
         )
 
-    def training_step(self, batch, step: int, log_this_step: bool):
-        """
-        Run a single training step.
-
-        Args:
-            batch: A batch dict from the dataloader.
-            step: Current global step (for logging).
-            log_this_step: Whether to emit detailed monitoring this step.
-        """
+    def runtime_forward_loss(
+        self,
+        batch,
+        *,
+        step: int,
+        log_this_step: bool,
+        use_internal_autocast: bool,
+    ) -> tuple[torch.Tensor, _RuntimeStepState]:
+        """Run data move + forward + loss and return step cache for post-backward hooks."""
         input_ids = batch["input_ids"].to(self.device)
         labels = batch["labels"].to(self.device)
         tokens = input_ids.numel()
@@ -1276,7 +1290,7 @@ class Trainer:
         self._residual_log_step = step
         self._residual_log_enabled = log_this_step and self.monitoring_mode != "minimal"
 
-        if self.config.training.bf16 and torch.cuda.is_bf16_supported():
+        if use_internal_autocast and self.config.training.bf16 and torch.cuda.is_bf16_supported():
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 logits = self.model(input_ids)
                 loss = self._compute_loss(logits, labels)
@@ -1289,7 +1303,28 @@ class Trainer:
                 self.writer.add_scalar("Health/non_finite_loss", 1.0, step)
             raise FloatingPointError(f"Non-finite loss at step {step}: {loss.detach().item()}")
 
-        loss.backward()
+        step_state = _RuntimeStepState(
+            labels_used=labels_used,
+            tokens=int(tokens),
+            effective_tokens=int(effective_tokens),
+            samples=int(samples),
+            hist_this_step=hist_this_step,
+            blocks_to_monitor=blocks_to_monitor,
+            log_this_step=log_this_step,
+        )
+        return loss, step_state
+
+    def runtime_post_backward_metrics(
+        self,
+        *,
+        step: int,
+        step_state: _RuntimeStepState,
+    ) -> Optional[float]:
+        """Run clipping and metric/monitoring hooks after backward."""
+        log_this_step = step_state.log_this_step
+        hist_this_step = step_state.hist_this_step
+        labels_used = step_state.labels_used
+        blocks_to_monitor = step_state.blocks_to_monitor
 
         grad_norm: Optional[float] = None
         clip_coef = 1.0
@@ -1389,20 +1424,57 @@ class Trainer:
                 lr_used=lr_used,
                 grad_norm=grad_norm,
                 clip_coef=clip_coef,
-            )
+                    )
 
         if hist_this_step:
             self._log_gradient_histograms(step)
 
-        if hasattr(self.optimizer, "step_with_ready_grads"):
-            self.optimizer.step_with_ready_grads()
-        else:
-            self.optimizer.step()
-        self.scheduler.step()
-        self._check_opt_state_finite(step)
-        self.optimizer.zero_grad()
+        return grad_norm
 
-        return loss, grad_norm, tokens, effective_tokens, samples
+    def runtime_apply_optimizer_step(
+        self,
+        *,
+        step: int,
+        step_applied: bool,
+    ) -> None:
+        """Apply optimizer/scheduler policy for runtime-managed steps."""
+        if step_applied:
+            if hasattr(self.optimizer, "step_with_ready_grads"):
+                self.optimizer.step_with_ready_grads()
+            else:
+                self.optimizer.step()
+            self.scheduler.step()
+            self._check_opt_state_finite(step)
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def training_step(self, batch, step: int, log_this_step: bool):
+        """
+        Run a single training step.
+
+        Args:
+            batch: A batch dict from the dataloader.
+            step: Current global step (for logging).
+            log_this_step: Whether to emit detailed monitoring this step.
+        """
+        loss, step_state = self.runtime_forward_loss(
+            batch,
+            step=step,
+            log_this_step=log_this_step,
+            use_internal_autocast=True,
+        )
+        loss.backward()
+        grad_norm = self.runtime_post_backward_metrics(
+            step=step,
+            step_state=step_state,
+        )
+        self.runtime_apply_optimizer_step(step=step, step_applied=True)
+        return (
+            loss,
+            grad_norm,
+            step_state.tokens,
+            step_state.effective_tokens,
+            step_state.samples,
+        )
 
     @torch.no_grad()
     def evaluate(self, loader, *, step: int, max_batches: Optional[int] = None) -> dict[str, float]:
@@ -1522,8 +1594,6 @@ class Trainer:
         try:
             torch.save(self.model.state_dict(), model_path)
             torch.save(self.scheduler.state_dict(), scheduler_path)
-            from dataclasses import asdict
-
             if hasattr(self.optimizer, "save_parameter_state"):
                 rank = int(os.environ.get("RANK", "0"))
                 world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1540,7 +1610,7 @@ class Trainer:
                     )
                 else:
                     manifest = {
-                        "format_version": 1,
+                        "format_version": 2,
                         "optimizer_type": type(self.optimizer).__name__,
                         "rank": rank,
                         "world_size": world_size,
@@ -1555,7 +1625,7 @@ class Trainer:
                 torch.save(self.optimizer.state_dict(), optimizer_path)
 
             with open(config_path, "w") as f:
-                json.dump(asdict(self.config), f, indent=2)
+                json.dump(config_to_serializable_dict(self.config), f, indent=2)
 
             size_bytes = 0
             tracked_paths = [model_path, scheduler_path, config_path]

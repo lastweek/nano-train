@@ -8,6 +8,8 @@ Tests verify:
 4. Integration: Layers work together in a network
 """
 
+from itertools import count
+
 import pytest
 import torch
 import torch.nn as nn
@@ -19,20 +21,54 @@ from src.layers import GELU
 from src.layers import LayerNorm as _LayerNorm
 from src.layers import Linear as _Linear
 from src.layers import clip_grad_norm
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 from conftest import assert_grad_close
 from conftest import assert_tensor_close
 
 
+_MODULE_COUNTER = count()
+
+
+def _next_module_path(prefix: str) -> str:
+    return f"tests.{prefix}.{next(_MODULE_COUNTER)}"
+
+
+def _new_resolver():
+    return build_module_precision_resolver(PrecisionConfig(mode="fp32"))
+
+
 def Linear(*args, **kwargs):  # noqa: N802
-    return _Linear(*args, param_dtype=torch.float32, param_device=None, **kwargs)
+    return _Linear(
+        *args,
+        param_dtype=torch.float32,
+        param_device=None,
+        module_path=_next_module_path("linear"),
+        precision_resolver=_new_resolver(),
+        **kwargs,
+    )
 
 
 def LayerNorm(*args, **kwargs):  # noqa: N802
-    return _LayerNorm(*args, param_dtype=torch.float32, param_device=None, **kwargs)
+    return _LayerNorm(
+        *args,
+        param_dtype=torch.float32,
+        param_device=None,
+        module_path=_next_module_path("layernorm"),
+        precision_resolver=_new_resolver(),
+        **kwargs,
+    )
 
 
 def Embedding(*args, **kwargs):  # noqa: N802
-    return _Embedding(*args, param_dtype=torch.float32, param_device=None, **kwargs)
+    return _Embedding(
+        *args,
+        param_dtype=torch.float32,
+        param_device=None,
+        module_path=_next_module_path("embedding"),
+        precision_resolver=_new_resolver(),
+        **kwargs,
+    )
 
 
 # =============================================================================

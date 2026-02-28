@@ -22,7 +22,7 @@ def _load_module(path: Path, module_name: str) -> ModuleType:
 def test_example_scripts_parse_new_precision_flags(monkeypatch) -> None:
     repo_root = Path(__file__).parent.parent
 
-    train_4p = _load_module(repo_root / "examples" / "train_4d.py", "train_4p_precision_wiring")
+    train_4d = _load_module(repo_root / "examples" / "train_4d.py", "train_4d_precision_wiring")
     monkeypatch.setattr(
         sys,
         "argv",
@@ -39,7 +39,7 @@ def test_example_scripts_parse_new_precision_flags(monkeypatch) -> None:
             "lm_head",
         ],
     )
-    args = train_4p.parse_args()
+    args = train_4d.parse_args()
     assert args.fp8_param is True
     assert args.compute_lowbit_include == ["lm_head"]
 
@@ -76,6 +76,7 @@ def test_example_scripts_wire_strict_lowbit_assignment_guard() -> None:
     )
     for script_name in scripts:
         source = (repo_root / "examples" / script_name).read_text()
-        assert "build_model_precision_plan" in source
-        assert "apply_model_precision_plan" in source
-        assert "ensure_lowbit_compute_assignments" in source
+        assert "build_module_precision_resolver" in source
+        assert "finalize_module_precision_resolver" in source
+        assert "build_model_precision_plan" not in source
+        assert "apply_model_precision_plan" not in source

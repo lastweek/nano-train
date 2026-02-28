@@ -10,13 +10,25 @@ Tests:
 
 import sys
 from pathlib import Path
+from itertools import count
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 
 device = torch.device('cpu')
+_MODULE_COUNTER = count()
+
+
+def _next_module_path(prefix: str) -> str:
+    return f"tests.run_all.{prefix}.{next(_MODULE_COUNTER)}"
+
+
+def _resolver():
+    return build_module_precision_resolver(PrecisionConfig(mode="fp32"))
 
 print("=" * 70)
 print("Nano-Train: Running All Unit Tests")
@@ -42,6 +54,8 @@ try:
         20,
         param_dtype=torch.float32,
         param_device=None,
+        module_path=_next_module_path("linear"),
+        precision_resolver=_resolver(),
     ).to(device)
     ref = torch.nn.Linear(10, 20).to(device)
     with torch.no_grad():
@@ -60,6 +74,8 @@ try:
         20,
         param_dtype=torch.float32,
         param_device=None,
+        module_path=_next_module_path("layernorm"),
+        precision_resolver=_resolver(),
     ).to(device)
     ref = torch.nn.LayerNorm(20).to(device)
     with torch.no_grad():
@@ -79,6 +95,8 @@ try:
         20,
         param_dtype=torch.float32,
         param_device=None,
+        module_path=_next_module_path("embedding"),
+        precision_resolver=_resolver(),
     ).to(device)
     ref = torch.nn.Embedding(100, 20).to(device)
     with torch.no_grad():

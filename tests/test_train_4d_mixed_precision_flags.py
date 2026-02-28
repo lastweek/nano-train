@@ -1,4 +1,4 @@
-"""Mixed-precision CLI and validation coverage for train_4p script."""
+"""Mixed-precision CLI and validation coverage for train_4d script."""
 
 from __future__ import annotations
 
@@ -9,12 +9,13 @@ import sys
 from types import ModuleType
 
 import pytest
+import torch
 
 
-def _load_train_4p_module() -> ModuleType:
+def _load_train_4d_module() -> ModuleType:
     repo_root = Path(__file__).parent.parent
     module_path = repo_root / "examples" / "train_4d.py"
-    module_name = "train_4p_mixed_precision_test_module"
+    module_name = "train_4d_mixed_precision_test_module"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError("Failed to load examples/train_4d.py for tests")
@@ -24,7 +25,7 @@ def _load_train_4p_module() -> ModuleType:
     return module
 
 
-EP_MODULE = _load_train_4p_module()
+EP_MODULE = _load_train_4d_module()
 
 
 def _build_args_for_validate(**overrides) -> argparse.Namespace:
@@ -104,10 +105,10 @@ def test_parse_args_accepts_fp8_precision_flags(monkeypatch) -> None:
 def test_validate_args_rejects_conflicting_precision_flags() -> None:
     args = _build_args_for_validate(fp16=True, fp8=True)
     with pytest.raises(ValueError, match="At most one of"):
-        EP_MODULE.validate_args(args, world_size=1, pp_layer_splits=None)
+        EP_MODULE.normalize_and_resolve_precision(args, torch.device("cpu"))
 
 
 def test_validate_args_rejects_invalid_fp8_backend() -> None:
     args = _build_args_for_validate(fp8=True, fp8_backend="invalid_backend")
-    with pytest.raises(ValueError, match="fp8_backend"):
-        EP_MODULE.validate_args(args, world_size=1, pp_layer_splits=None)
+    with pytest.raises(ValueError, match="fp8-backend"):
+        EP_MODULE.normalize_and_resolve_precision(args, torch.device("cpu"))

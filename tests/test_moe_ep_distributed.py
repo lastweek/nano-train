@@ -13,6 +13,8 @@ import torch.multiprocessing as mp
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models.moe import ExpertParallelMoE
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 
 
 def _free_port() -> int:
@@ -42,6 +44,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         ep_group=dist.group.WORLD,
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
+        module_prefix=f"moe_ep.rank{rank}",
         dropout=0.0,
         n_shared_experts=1,
         scoring_func="sigmoid",

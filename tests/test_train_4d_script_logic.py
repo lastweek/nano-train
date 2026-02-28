@@ -13,10 +13,10 @@ import torch
 import torch.nn as nn
 
 
-def _load_train_4p_module() -> ModuleType:
+def _load_train_4d_module() -> ModuleType:
     repo_root = Path(__file__).parent.parent
     module_path = repo_root / "examples" / "train_4d.py"
-    module_name = "train_4p_example_test_module"
+    module_name = "train_4d_example_test_module"
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError("Failed to load examples/train_4d.py for tests")
@@ -26,7 +26,7 @@ def _load_train_4p_module() -> ModuleType:
     return module
 
 
-EP_MODULE = _load_train_4p_module()
+EP_MODULE = _load_train_4d_module()
 
 
 class _TinyModel(nn.Module):

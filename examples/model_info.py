@@ -19,8 +19,14 @@ import torch.nn as nn
 
 from src.config import ModelConfig
 from src.logging import setup_logging, get_logger
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 from src.utils.model_info import dump_model_info
 from src.models.transformer import TransformerModel
+
+
+def _default_precision_resolver():
+    return build_module_precision_resolver(PrecisionConfig(mode="fp32"))
 
 
 def create_simple_demo_models():
@@ -50,6 +56,7 @@ def create_simple_demo_models():
     config = ModelConfig(
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=_default_precision_resolver(),
         vocab_size=1000,
         hidden_size=256,
         num_layers=4,
@@ -136,6 +143,7 @@ def demo_transformer_model():
     config = ModelConfig(
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=_default_precision_resolver(),
         vocab_size=100,
         hidden_size=128,
         num_layers=2,

@@ -21,6 +21,8 @@ from src.config import Config
 from src.dataset import TextDataset, create_dataloader
 from src.logging import get_logger, setup_logging
 from src.models.deepseek import DeepSeekModel, DeepSeekModelConfig
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 from src.trainer import Trainer
 from src.utils import dump_model_info
 
@@ -44,6 +46,7 @@ def build_deepseek_config(
     *,
     param_dtype: torch.dtype,
     param_device: Optional[torch.device],
+    precision_resolver,
     vocab_size: Optional[int] = None,
 ) -> DeepSeekModelConfig:
     """
@@ -57,6 +60,7 @@ def build_deepseek_config(
         return DeepSeekModelConfig(
             param_dtype=param_dtype,
             param_device=param_device,
+            precision_resolver=precision_resolver,
         )
 
     if model_preset == "tiny":
@@ -65,6 +69,7 @@ def build_deepseek_config(
         return DeepSeekModelConfig(
             param_dtype=param_dtype,
             param_device=param_device,
+            precision_resolver=precision_resolver,
             vocab_size=vocab_size,
             hidden_size=384,
             num_hidden_layers=8,
@@ -176,6 +181,7 @@ def main() -> None:
         model_preset=args.model_preset,
         param_dtype=torch.float32,
         param_device=None if args.meta_init else device,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
         vocab_size=dataset.vocab_size if dataset is not None else None,
     )
     if args.meta_init:

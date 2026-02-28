@@ -39,6 +39,7 @@ from src.runtime.checkpoint import NoOpCheckpointManager
 from src.runtime.context import RunConfig
 from src.runtime.context import RuntimeContext
 from src.runtime.contracts import OptimizerState
+from src.runtime.contracts import ModulePrecisionResolver
 from src.runtime.contracts import PrecisionConfig
 from src.runtime.contracts import ResumeState
 from src.runtime.contracts import RuntimeBootstrap
@@ -49,16 +50,17 @@ from src.runtime.contracts import StepOutput
 from src.runtime.contracts import TrainDataBundle
 from src.runtime.engine import RuntimeEngine
 from src.runtime.mixed_precision import MixedPrecisionController
-from src.runtime.mixed_precision import apply_model_precision_plan
-from src.runtime.mixed_precision import build_model_precision_plan
+from src.runtime.mixed_precision import build_module_precision_resolver
 from src.runtime.mixed_precision import dtype_alias_to_torch
-from src.runtime.mixed_precision import ensure_lowbit_compute_assignments
+from src.runtime.mixed_precision import finalize_module_precision_resolver
 from src.runtime.mixed_precision import refresh_persistent_lowbit_params
-from src.runtime.mixed_precision import resolve_precision_config
+from src.runtime.master_store import materialize_optimizer_owned_masters
 from src.runtime.optimizer_runtime import step_with_sync_policy
 from src.runtime.optimizer_runtime import PrecisionAdamW
 from src.runtime.optimizer_runtime import zero_grad_optimizer
 from src.runtime.pipeline import train_step_pipeline as runtime_train_step_pipeline
+from src.runtime.precision_args import add_mixed_precision_args
+from src.runtime.precision_args import normalize_and_resolve_precision
 from src.runtime import sync as runtime_sync
 from src.runtime import validation as runtime_validation
 from src.runtime.schedules.non_pipeline import NonPipelineSchedule
@@ -243,184 +245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aux_loss_coef", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--bf16", action="store_true", help="Enable BF16 mixed precision")
-    parser.add_argument("--fp16", action="store_true", help="Enable FP16 mixed precision")
-    parser.add_argument("--fp8", action="store_true", help="Enable FP8 mixed precision")
-    parser.add_argument("--fp4", action="store_true", help="Enable FP4 mixed precision (emulated)")
-    parser.add_argument(
-        "--fp8-backend",
-        type=str,
-        default="transformer_engine",
-        choices=["transformer_engine", "emulated"],
-        help="FP8 backend implementation",
-    )
-    parser.add_argument(
-        "--fp8-format",
-        type=str,
-        default="e4m3",
-        choices=["e4m3", "hybrid"],
-        help="FP8 format recipe",
-    )
-    parser.add_argument(
-        "--fp8-amax-history-len",
-        type=int,
-        default=16,
-        help="FP8 amax history length",
-    )
-    parser.add_argument(
-        "--fp8-amax-compute-algo",
-        type=str,
-        default="most_recent",
-        choices=["most_recent", "max"],
-        help="FP8 amax compute algorithm",
-    )
-    parser.add_argument(
-        "--fp4-backend",
-        type=str,
-        default="emulated",
-        choices=["emulated"],
-        help="FP4 backend implementation",
-    )
-    parser.add_argument(
-        "--params-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Model parameter storage dtype",
-    )
-    parser.add_argument(
-        "--main-params-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Main optimizer parameter dtype",
-    )
-    parser.add_argument(
-        "--main-grads-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Main optimizer gradient dtype",
-    )
-    parser.add_argument(
-        "--exp-avg-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Adam exp_avg state dtype",
-    )
-    parser.add_argument(
-        "--exp-avg-sq-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Adam exp_avg_sq state dtype",
-    )
-    parser.add_argument(
-        "--loss-scale-init",
-        type=float,
-        default=65536.0,
-        help="Initial dynamic loss scale value",
-    )
-    parser.add_argument(
-        "--loss-scale-growth-factor",
-        type=float,
-        default=2.0,
-        help="Loss scale growth factor",
-    )
-    parser.add_argument(
-        "--loss-scale-backoff-factor",
-        type=float,
-        default=0.5,
-        help="Loss scale backoff factor on overflow",
-    )
-    parser.add_argument(
-        "--loss-scale-growth-interval",
-        type=int,
-        default=2000,
-        help="Successful step interval before loss scale growth",
-    )
-    parser.add_argument(
-        "--loss-scale-min",
-        type=float,
-        default=1.0,
-        help="Minimum loss scale",
-    )
-    parser.add_argument(
-        "--loss-scale-max",
-        type=float,
-        default=16777216.0,
-        help="Maximum loss scale",
-    )
-    parser.add_argument(
-        "--fp8-param",
-        action="store_true",
-        help="Enable persistent FP8 parameter storage for selected modules",
-    )
-    parser.add_argument(
-        "--fp4-param",
-        action="store_true",
-        help="Enable persistent FP4 parameter storage for selected modules",
-    )
-    parser.add_argument(
-        "--fp4-param-format",
-        type=str,
-        default="nf4",
-        choices=["nf4"],
-        help="Persistent FP4 quantization format",
-    )
-    parser.add_argument(
-        "--persistent-scale-granularity",
-        type=str,
-        default="per_channel",
-        choices=["per_tensor", "per_channel"],
-        help="Scale granularity for persistent low-bit quantization",
-    )
-    parser.add_argument(
-        "--module-pattern-type",
-        type=str,
-        default="regex",
-        choices=["regex", "glob"],
-        help="Pattern matcher type for module precision policies",
-    )
-    parser.add_argument(
-        "--compute-lowbit-mode",
-        type=str,
-        default=None,
-        choices=["fp8", "fp4"],
-        help="Per-module low-bit compute mode override",
-    )
-    parser.add_argument(
-        "--compute-lowbit-include",
-        action="append",
-        default=None,
-        help="Repeatable include patterns for low-bit compute module selection",
-    )
-    parser.add_argument(
-        "--compute-lowbit-exclude",
-        action="append",
-        default=None,
-        help="Repeatable exclude patterns for low-bit compute module selection",
-    )
-    parser.add_argument(
-        "--persistent-lowbit-mode",
-        type=str,
-        default="off",
-        choices=["off", "fp8", "fp4"],
-        help="Per-module persistent low-bit storage mode",
-    )
-    parser.add_argument(
-        "--persistent-lowbit-include",
-        action="append",
-        default=None,
-        help="Repeatable include patterns for persistent low-bit module selection",
-    )
-    parser.add_argument(
-        "--persistent-lowbit-exclude",
-        action="append",
-        default=None,
-        help="Repeatable exclude patterns for persistent low-bit module selection",
-    )
+    add_mixed_precision_args(parser)
     return parser.parse_args()
 
 
@@ -448,11 +273,17 @@ def build_tiny_deepseek_config(
     *,
     param_dtype: torch.dtype,
     param_device: torch.device | None,
+    precision_resolver: ModulePrecisionResolver,
+    module_compute_dtype_overrides: dict[str, str] | None = None,
 ) -> DeepSeekModelConfig:
     """Build a small DeepSeek config for TP/PP/EP/DP learning runs."""
     return DeepSeekModelConfig(
         param_dtype=param_dtype,
         param_device=param_device,
+        precision_resolver=precision_resolver,
+        module_compute_dtype_overrides=(
+            {} if module_compute_dtype_overrides is None else module_compute_dtype_overrides
+        ),
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_layers,
@@ -549,6 +380,12 @@ def _build_model_for_context(ctx: RuntimeContext) -> DeepSeekModel:
         args,
         param_dtype=param_dtype,
         param_device=parallel.device,
+        precision_resolver=build_module_precision_resolver(precision_config),
+        module_compute_dtype_overrides={
+            # Example (exact module path): force this norm to fp16 while
+            # linears still follow low-bit policy.
+            # "blocks.0.attn.q_a_norm": "fp16",
+        },
     )
     parallel_context = DeepSeekParallelContext(
         tensor_model_parallel_rank=parallel.tensor_model_parallel_rank,
@@ -569,21 +406,24 @@ def _build_model_for_context(ctx: RuntimeContext) -> DeepSeekModel:
         sequence_parallel=True,
     )
     model = DeepSeekModel(model_config, parallel_context=parallel_context)
-    policy = precision_config.module_precision_policy
-    if policy is not None:
-        precision_plan = build_model_precision_plan(model, policy)
-        apply_model_precision_plan(model, precision_plan)
-        ensure_lowbit_compute_assignments(
-            precision_config,
-            precision_plan,
-            script_name="train_4d.py",
+    precision_summary = finalize_module_precision_resolver(model_config.precision_resolver)
+    master_store = materialize_optimizer_owned_masters(
+        model,
+        precision_config=precision_config,
+    )
+    if parallel.rank == 0:
+        logger.info(
+            "Per-module low-bit policy: compute_modules=%d persistent_modules=%d "
+            "high_precision_exceptions=%d",
+            precision_summary.compute_lowbit_module_count,
+            precision_summary.persistent_lowbit_module_count,
+            precision_summary.high_precision_exception_module_count,
         )
-        if parallel.rank == 0:
-            logger.info(
-                "Per-module low-bit policy: compute_modules=%d persistent_modules=%d",
-                precision_plan.compute_lowbit_module_count,
-                precision_plan.persistent_lowbit_module_count,
-            )
+        logger.info(
+            "Low-bit master ownership: mode=%s bound_modules=%d",
+            precision_config.lowbit_master_ownership,
+            0 if master_store is None else len(master_store.metadata),
+        )
     refresh_persistent_lowbit_params(model)
 
     return model
@@ -600,6 +440,7 @@ def _build_optimizer(
     args = ctx.run_config.args
     parallel = ctx.parallel
     if args.use_distributed_optimizer:
+        recipe = precision_config.deepseek_v3_recipe
         return MegatronZeroOptimizer(
             model=model,
             config=DistributedOptimizerConfig(
@@ -615,6 +456,18 @@ def _build_optimizer(
                 main_grads_dtype=precision_config.main_grads_dtype,
                 exp_avg_dtype=precision_config.exp_avg_dtype,
                 exp_avg_sq_dtype=precision_config.exp_avg_sq_dtype,
+                precision_recipe_name=precision_config.precision_recipe_name,
+                fp8_rounding="nearest" if recipe is None else recipe.rounding_mode,
+                fp8_activation_quant_granularity=(
+                    "tensor" if recipe is None else recipe.activation_quant_granularity
+                ),
+                fp8_weight_quant_granularity=(
+                    "tensor" if recipe is None else recipe.weight_quant_granularity
+                ),
+                fp8_comm_quant_enabled=False if recipe is None else recipe.comm_quant_enabled,
+                fp8_comm_quant_granularity=(
+                    "tensor" if recipe is None else recipe.comm_quant_granularity
+                ),
                 debug=args.zero_debug,
                 debug_max_steps=args.zero_debug_max_steps,
                 debug_max_params=args.zero_debug_max_params,
@@ -682,10 +535,11 @@ def _log_training_start(
         args.zero_debug_max_params,
     )
     logger.info(
-        "Precision: mode=%s activation_dtype=%s params_dtype=%s main_params_dtype=%s "
+        "Precision: mode=%s recipe=%s activation_dtype=%s params_dtype=%s main_params_dtype=%s "
         "main_grads_dtype=%s exp_avg_dtype=%s exp_avg_sq_dtype=%s fp8_backend=%s fp4_backend=%s "
         "fp8_param=%s fp4_param=%s persistent_scale=%s",
         precision_config.mode,
+        precision_config.precision_recipe_name,
         precision_config.activation_dtype,
         precision_config.params_dtype,
         precision_config.main_params_dtype,
@@ -698,6 +552,17 @@ def _log_training_start(
         precision_config.fp4_param,
         precision_config.persistent_scale_granularity,
     )
+    if precision_config.deepseek_v3_recipe is not None:
+        recipe = precision_config.deepseek_v3_recipe
+        logger.info(
+            "DeepSeek-V3 recipe: act_granularity=%s weight_granularity=%s rounding=%s "
+            "comm_quant=%s comm_granularity=%s",
+            recipe.activation_quant_granularity,
+            recipe.weight_quant_granularity,
+            recipe.rounding_mode,
+            recipe.comm_quant_enabled,
+            recipe.comm_quant_granularity,
+        )
     logger.info("Starting training: epochs=%d, max_steps=%d", args.epochs, args.max_steps)
 
 
@@ -728,7 +593,7 @@ class Train4PBootstrap(RuntimeBootstrap):
             expert_model_parallel_size=args.expert_model_parallel_size,
             context_parallel_size=args.context_parallel_size,
         )
-        precision_config = resolve_precision_config(args, parallel.device)
+        precision_config = normalize_and_resolve_precision(args, parallel.device)
         return RuntimeContext(
             parallel=parallel,
             mode=_infer_mode(parallel),
@@ -1035,11 +900,6 @@ def build_train_4d_components() -> RuntimeComponents:
         schedule_selector=Train4PScheduleSelector(optimizer_runtime=optimizer_runtime),
         checkpoint_manager=Train4PCheckpointManager(),
     )
-
-
-def build_train_4p_components() -> RuntimeComponents:
-    """Backward-compatible alias for legacy test and script integrations."""
-    return build_train_4d_components()
 
 
 def setup_process_logging(rank: int) -> None:

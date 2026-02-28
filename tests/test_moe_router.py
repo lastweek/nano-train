@@ -9,6 +9,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models.moe import TopKRouter
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 
 
 def test_router_shapes_and_ranges() -> None:
@@ -21,6 +23,8 @@ def test_router_shapes_and_ranges() -> None:
         top_k=2,
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
+        module_prefix="router0",
         scoring_func="sigmoid",
         n_group=1,
         topk_group=1,
@@ -50,6 +54,8 @@ def test_router_group_routing_masks_other_groups() -> None:
         top_k=2,
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
+        module_prefix="router1",
         scoring_func="sigmoid",
         n_group=n_group,
         topk_group=1,
@@ -74,6 +80,8 @@ def test_router_aux_loss_backward_is_finite() -> None:
         top_k=2,
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
+        module_prefix="router2",
         scoring_func="softmax",
         n_group=1,
         topk_group=1,

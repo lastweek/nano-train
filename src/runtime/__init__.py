@@ -21,8 +21,11 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "OptimizerRuntime": ("src.runtime.contracts", "OptimizerRuntime"),
     "OptimizerState": ("src.runtime.contracts", "OptimizerState"),
     "ModulePrecisionAssignment": ("src.runtime.contracts", "ModulePrecisionAssignment"),
+    "DeepSeekV3PrecisionRecipe": ("src.runtime.contracts", "DeepSeekV3PrecisionRecipe"),
     "ModulePrecisionPolicy": ("src.runtime.contracts", "ModulePrecisionPolicy"),
     "ModelPrecisionPlan": ("src.runtime.contracts", "ModelPrecisionPlan"),
+    "LowBitKernelSpec": ("src.runtime.contracts", "LowBitKernelSpec"),
+    "MasterOwnershipMode": ("src.runtime.contracts", "MasterOwnershipMode"),
     "PrecisionConfig": ("src.runtime.contracts", "PrecisionConfig"),
     "PrecisionRuntimeState": ("src.runtime.contracts", "PrecisionRuntimeState"),
     "ResumeState": ("src.runtime.contracts", "ResumeState"),
@@ -35,14 +38,31 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "TrainDataBundle": ("src.runtime.contracts", "TrainDataBundle"),
     "RuntimeEngine": ("src.runtime.engine", "RuntimeEngine"),
     "MixedPrecisionController": ("src.runtime.mixed_precision", "MixedPrecisionController"),
-    "apply_model_precision_plan": ("src.runtime.mixed_precision", "apply_model_precision_plan"),
-    "build_model_precision_plan": ("src.runtime.mixed_precision", "build_model_precision_plan"),
+    "build_module_precision_resolver": (
+        "src.runtime.mixed_precision",
+        "build_module_precision_resolver",
+    ),
     "dtype_alias_to_torch": ("src.runtime.mixed_precision", "dtype_alias_to_torch"),
+    "finalize_module_precision_resolver": (
+        "src.runtime.mixed_precision",
+        "finalize_module_precision_resolver",
+    ),
     "refresh_persistent_lowbit_params": (
         "src.runtime.mixed_precision",
         "refresh_persistent_lowbit_params",
     ),
-    "resolve_precision_config": ("src.runtime.mixed_precision", "resolve_precision_config"),
+    "add_mixed_precision_args": (
+        "src.runtime.precision_args",
+        "add_mixed_precision_args",
+    ),
+    "normalize_and_resolve_precision": (
+        "src.runtime.precision_args",
+        "normalize_and_resolve_precision",
+    ),
+    "materialize_optimizer_owned_masters": (
+        "src.runtime.master_store",
+        "materialize_optimizer_owned_masters",
+    ),
     "ParamShardInfo": ("src.runtime.sync", "ParamShardInfo"),
 }
 

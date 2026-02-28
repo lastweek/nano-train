@@ -11,7 +11,9 @@ configuration fields, but remains a compact approximation for local training:
 
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from typing import Dict, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -28,12 +30,27 @@ from src.models.moe import ExpertMLP
 from src.models.moe import ExpertParallelMoE
 from src.models.moe import LocalRoutedMoE
 
+if TYPE_CHECKING:
+    from src.runtime.contracts import DeepSeekV3PrecisionRecipe
+    from src.runtime.contracts import ModulePrecisionInitState
+    from src.runtime.contracts import ModulePrecisionResolver
+    from src.runtime.contracts import ModulePrecisionSummary
+    from src.runtime.contracts import PrecisionDType
+else:
+    DeepSeekV3PrecisionRecipe = object
+    ModulePrecisionInitState = object
+    ModulePrecisionResolver = object
+    ModulePrecisionSummary = object
+    PrecisionDType = str
+
 
 @dataclass
 class DeepSeekModelConfig:
     """Configuration shaped after DeepSeek-V3 key parameters."""
     param_dtype: torch.dtype
     param_device: Optional[torch.device]
+    precision_resolver: ModulePrecisionResolver
+    module_compute_dtype_overrides: dict[str, "PrecisionDType"] = field(default_factory=dict)
 
     # Core architecture
     vocab_size: int = 129280
@@ -127,6 +144,69 @@ class DeepSeekModelConfig:
             raise ValueError("first_k_dense_replace must be non-negative")
         if self.scoring_func not in {"sigmoid", "softmax"}:
             raise ValueError("scoring_func must be 'sigmoid' or 'softmax'")
+        valid_compute_dtypes = {"fp32", "bf16", "fp16"}
+        for module_name, dtype_alias in self.module_compute_dtype_overrides.items():
+            if not module_name:
+                raise ValueError("module_compute_dtype_overrides keys must be non-empty")
+            if dtype_alias not in valid_compute_dtypes:
+                raise ValueError(
+                    "module_compute_dtype_overrides values must be one of fp32, bf16, fp16"
+                )
+
+
+class _DeepSeekConfigPrecisionResolver:
+    """Resolver wrapper that applies exact module-path dtype overrides from config."""
+
+    def __init__(
+        self,
+        base: ModulePrecisionResolver,
+        module_compute_dtype_overrides: dict[str, "PrecisionDType"],
+    ) -> None:
+        self._base = base
+        self._overrides = dict(module_compute_dtype_overrides)
+        self._matched: set[str] = set()
+
+    def resolve_module_init_state(
+        self,
+        *,
+        module_path: str,
+        module_type: str,
+        lowbit_capable_type,
+        kernel_spec=None,
+    ) -> "ModulePrecisionInitState":
+        state = self._base.resolve_module_init_state(
+            module_path=module_path,
+            module_type=module_type,
+            lowbit_capable_type=lowbit_capable_type,
+            kernel_spec=kernel_spec,
+        )
+        dtype_override = self._overrides.get(module_path)
+        if dtype_override is None:
+            return state
+
+        self._matched.add(module_path)
+        assignment = replace(
+            state.assignment,
+            compute_lowbit_mode=None,
+            compute_dtype_override=dtype_override,
+        )
+        return replace(state, assignment=assignment, lowbit_backend=None)
+
+    def finalize(self) -> "ModulePrecisionSummary":
+        summary = self._base.finalize()
+        missing = [name for name in self._overrides if name not in self._matched]
+        if missing:
+            raise ValueError(
+                "DeepSeek config module_compute_dtype_overrides matched zero modules: "
+                f"{missing[:5]}"
+            )
+        return summary
+
+    def deepseek_v3_recipe(self) -> Optional["DeepSeekV3PrecisionRecipe"]:
+        recipe_fn = getattr(self._base, "deepseek_v3_recipe", None)
+        if not callable(recipe_fn):
+            return None
+        return recipe_fn()
 
 
 @dataclass
@@ -313,9 +393,17 @@ class RMSNorm(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        module_path: str,
+        precision_resolver: ModulePrecisionResolver,
     ):
         super().__init__()
         self.eps = eps
+        self._module_precision_state = precision_resolver.resolve_module_init_state(
+            module_path=module_path,
+            module_type=self.__class__.__name__,
+            lowbit_capable_type=None,
+            kernel_spec=None,
+        )
         self.weight = nn.Parameter(
             torch.ones(
                 hidden_size,
@@ -325,9 +413,29 @@ class RMSNorm(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x * torch.rsqrt(var + self.eps)
-        return x_norm * self.weight
+        assignment = self._module_precision_state.assignment
+        dtype_alias = getattr(assignment, "compute_dtype_override", None)
+        if dtype_alias is None:
+            x_compute = x
+            weight = self.weight
+        else:
+            dtype_map = {
+                "fp32": torch.float32,
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+            }
+            try:
+                compute_dtype = dtype_map[str(dtype_alias)]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unsupported RMSNorm compute dtype override alias: {dtype_alias}"
+                ) from exc
+            x_compute = x.to(dtype=compute_dtype)
+            weight = self.weight.to(dtype=compute_dtype)
+
+        var = x_compute.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x_compute * torch.rsqrt(var + self.eps)
+        return x_norm * weight
 
 
 class GatedMLP(nn.Module):
@@ -340,6 +448,8 @@ class GatedMLP(nn.Module):
         dropout: float,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        precision_resolver: ModulePrecisionResolver,
+        module_prefix: str,
         parallel_context: Optional[DeepSeekParallelContext] = None,
     ):
         super().__init__()
@@ -356,6 +466,8 @@ class GatedMLP(nn.Module):
                 bias=True,
                 param_dtype=param_dtype,
                 param_device=param_device,
+                module_path=f"{module_prefix}.gate_proj",
+                precision_resolver=precision_resolver,
             )
             self.up_proj = ColumnParallelLinear(
                 hidden_size,
@@ -366,6 +478,8 @@ class GatedMLP(nn.Module):
                 bias=True,
                 param_dtype=param_dtype,
                 param_device=param_device,
+                module_path=f"{module_prefix}.up_proj",
+                precision_resolver=precision_resolver,
             )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
@@ -376,6 +490,8 @@ class GatedMLP(nn.Module):
                 bias=True,
                 param_dtype=param_dtype,
                 param_device=param_device,
+                module_path=f"{module_prefix}.down_proj",
+                precision_resolver=precision_resolver,
             )
             self.dropout = Dropout(dropout)
         else:
@@ -385,6 +501,8 @@ class GatedMLP(nn.Module):
                 dropout=dropout,
                 param_dtype=param_dtype,
                 param_device=param_device,
+                precision_resolver=precision_resolver,
+                module_prefix=f"{module_prefix}.mlp",
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -432,6 +550,8 @@ class MultiHeadLatentAttention(nn.Module):
         self,
         config: DeepSeekModelConfig,
         parallel_context: Optional[DeepSeekParallelContext] = None,
+        *,
+        module_prefix: str,
     ):
         super().__init__()
         self.parallel_context = parallel_context or DeepSeekParallelContext()
@@ -460,12 +580,16 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.q_a_proj",
+            precision_resolver=config.precision_resolver,
         )
         self.q_a_norm = RMSNorm(
             config.q_lora_rank,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.q_a_norm",
+            precision_resolver=config.precision_resolver,
         )
         if self.attention_tensor_model_parallel_size > 1:
             self.q_b_proj = ColumnParallelLinear(
@@ -477,6 +601,8 @@ class MultiHeadLatentAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.q_b_proj",
+                precision_resolver=config.precision_resolver,
             )
         else:
             self.q_b_proj = Linear(
@@ -485,6 +611,8 @@ class MultiHeadLatentAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.q_b_proj",
+                precision_resolver=config.precision_resolver,
             )
 
         self.kv_a_proj = Linear(
@@ -493,12 +621,16 @@ class MultiHeadLatentAttention(nn.Module):
             bias=False,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.kv_a_proj",
+            precision_resolver=config.precision_resolver,
         )
         self.kv_a_norm = RMSNorm(
             config.kv_lora_rank,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.kv_a_norm",
+            precision_resolver=config.precision_resolver,
         )
         if self.attention_tensor_model_parallel_size > 1:
             self.kv_b_proj = ColumnParallelLinear(
@@ -510,6 +642,8 @@ class MultiHeadLatentAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.kv_b_proj",
+                precision_resolver=config.precision_resolver,
             )
             self.out_proj = RowParallelLinear(
                 self.num_heads * self.v_head_dim,
@@ -520,6 +654,8 @@ class MultiHeadLatentAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.out_proj",
+                precision_resolver=config.precision_resolver,
             )
         else:
             self.kv_b_proj = Linear(
@@ -528,6 +664,8 @@ class MultiHeadLatentAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.kv_b_proj",
+                precision_resolver=config.precision_resolver,
             )
             self.out_proj = Linear(
                 self.num_heads * self.v_head_dim,
@@ -535,6 +673,8 @@ class MultiHeadLatentAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.out_proj",
+                precision_resolver=config.precision_resolver,
             )
         self.dropout = Dropout(config.attention_dropout)
 
@@ -588,7 +728,8 @@ class MultiHeadLatentAttention(nn.Module):
         scores_softmax = scores
         if scores_softmax.dtype not in (torch.float32, torch.float64):
             scores_softmax = scores_softmax.float()
-        probs = torch.softmax(scores_softmax, dim=-1).to(dtype=scores.dtype)
+        # Softmax in stable dtype, then align with value dtype for attention matmul.
+        probs = torch.softmax(scores_softmax, dim=-1).to(dtype=v.dtype)
         probs = self.dropout(probs)
 
         out = torch.matmul(probs, v)
@@ -604,6 +745,8 @@ class RoutedMoE(nn.Module):
         self,
         config: DeepSeekModelConfig,
         parallel_context: Optional[DeepSeekParallelContext] = None,
+        *,
+        module_prefix: str,
     ):
         super().__init__()
         self.parallel_context = parallel_context or DeepSeekParallelContext()
@@ -623,6 +766,8 @@ class RoutedMoE(nn.Module):
             "top_k": config.num_experts_per_tok,
             "param_dtype": config.param_dtype,
             "param_device": config.param_device,
+            "precision_resolver": config.precision_resolver,
+            "module_prefix": module_prefix,
             "dropout": config.dropout,
             "n_shared_experts": config.n_shared_experts,
             "scoring_func": config.scoring_func,
@@ -674,6 +819,8 @@ class DeepSeekDecoderBlock(nn.Module):
         config: DeepSeekModelConfig,
         layer_idx: int,
         parallel_context: Optional[DeepSeekParallelContext] = None,
+        *,
+        module_prefix: str,
     ):
         super().__init__()
         self.parallel_context = parallel_context or DeepSeekParallelContext()
@@ -682,13 +829,21 @@ class DeepSeekDecoderBlock(nn.Module):
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.attn_norm",
+            precision_resolver=config.precision_resolver,
         )
-        self.attn = MultiHeadLatentAttention(config, parallel_context=self.parallel_context)
+        self.attn = MultiHeadLatentAttention(
+            config,
+            parallel_context=self.parallel_context,
+            module_prefix=f"{module_prefix}.attn",
+        )
         self.ffn_norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.ffn_norm",
+            precision_resolver=config.precision_resolver,
         )
 
         use_dense = layer_idx < config.first_k_dense_replace
@@ -698,7 +853,11 @@ class DeepSeekDecoderBlock(nn.Module):
         )
 
         if use_moe:
-            self.ffn = RoutedMoE(config, parallel_context=self.parallel_context)
+            self.ffn = RoutedMoE(
+                config,
+                parallel_context=self.parallel_context,
+                module_prefix=f"{module_prefix}.ffn",
+            )
             self.ffn_type = "moe"
         else:
             self.ffn = GatedMLP(
@@ -707,6 +866,8 @@ class DeepSeekDecoderBlock(nn.Module):
                 dropout=config.dropout,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                precision_resolver=config.precision_resolver,
+                module_prefix=f"{module_prefix}.ffn",
                 parallel_context=self.parallel_context,
             )
             self.ffn_type = "dense"
@@ -733,6 +894,11 @@ class DeepSeekModel(nn.Module):
         parallel_context: Optional[DeepSeekParallelContext] = None,
     ):
         super().__init__()
+        if config.module_compute_dtype_overrides:
+            config.precision_resolver = _DeepSeekConfigPrecisionResolver(
+                config.precision_resolver,
+                config.module_compute_dtype_overrides,
+            )
         self.config = config
         self.parallel_context = parallel_context or DeepSeekParallelContext()
         _, attention_tensor_model_parallel_size, _ = (
@@ -780,6 +946,8 @@ class DeepSeekModel(nn.Module):
                 config.hidden_size,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path="token_embeddings",
+                precision_resolver=config.precision_resolver,
             )
             self.dropout = Dropout(config.dropout)
         else:
@@ -793,6 +961,7 @@ class DeepSeekModel(nn.Module):
                     config,
                     i,
                     parallel_context=self.parallel_context,
+                    module_prefix=f"blocks.{i}",
                 )
                 for i in range(self.pipeline_layer_start, self.pipeline_layer_end)
             ]
@@ -806,6 +975,8 @@ class DeepSeekModel(nn.Module):
                 eps=config.rms_norm_eps,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path="final_norm",
+                precision_resolver=config.precision_resolver,
             )
             self.lm_head = Linear(
                 config.hidden_size,
@@ -813,6 +984,8 @@ class DeepSeekModel(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path="lm_head",
+                precision_resolver=config.precision_resolver,
             )
         else:
             self.final_norm = None

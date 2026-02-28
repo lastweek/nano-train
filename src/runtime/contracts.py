@@ -9,6 +9,7 @@ from typing import Iterable
 from typing import Literal
 from typing import Optional
 from typing import Protocol
+from typing import TYPE_CHECKING
 
 import torch
 from torch.utils.data import DistributedSampler
@@ -16,6 +17,9 @@ from torch.utils.data import DistributedSampler
 from src.runtime.context import RuntimeContext
 from src.runtime.context import TrainState
 from src.runtime.sync import ParamShardInfo
+
+if TYPE_CHECKING:
+    from src.runtime.te_backend import LowBitBackend
 
 
 PrecisionMode = Literal["fp32", "bf16", "fp16", "fp8", "fp4"]
@@ -28,6 +32,37 @@ LowBitComputeMode = Literal["fp8", "fp4"]
 PersistentLowBitMode = Literal["off", "fp8", "fp4"]
 PersistentScaleGranularity = Literal["per_tensor", "per_channel"]
 FP4PersistentFormat = Literal["nf4"]
+LowBitCapableModuleType = Literal["linear", "column_parallel_linear", "row_parallel_linear"]
+MasterOwnershipMode = Literal["module", "optimizer"]
+QuantGranularity = Literal["tensor", "channel", "tile_1x128", "block_128x128"]
+RoundingMode = Literal["nearest", "stochastic"]
+PrecisionRecipeName = Literal["default", "deepseek_v3"]
+
+
+@dataclass(frozen=True)
+class DeepSeekV3PrecisionRecipe:
+    """DeepSeek-V3 style FP8 training recipe and precision exceptions."""
+
+    activation_quant_granularity: QuantGranularity = "tile_1x128"
+    weight_quant_granularity: QuantGranularity = "block_128x128"
+    rounding_mode: RoundingMode = "stochastic"
+    comm_quant_enabled: bool = True
+    comm_quant_granularity: QuantGranularity = "block_128x128"
+    high_precision_module_patterns: tuple[str, ...] = ()
+    high_precision_grad_patterns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LowBitKernelSpec:
+    """Kernel metadata needed by low-bit backend implementations."""
+
+    module_type: LowBitCapableModuleType
+    in_features: int
+    out_features: int
+    has_bias: bool
+    activation_quant_granularity: QuantGranularity = "tensor"
+    weight_quant_granularity: QuantGranularity = "tensor"
+    rounding_mode: RoundingMode = "nearest"
 
 
 @dataclass
@@ -43,6 +78,7 @@ class ModulePrecisionPolicy:
     persistent_lowbit_exclude: tuple[str, ...] = ()
     persistent_scale_granularity: PersistentScaleGranularity = "per_channel"
     fp4_persistent_format: FP4PersistentFormat = "nf4"
+    module_compute_dtype_rules: tuple[str, ...] = ()
 
 
 @dataclass
@@ -55,6 +91,7 @@ class ModulePrecisionAssignment:
     persistent_lowbit_mode: PersistentLowBitMode
     persistent_scale_granularity: PersistentScaleGranularity
     fp4_persistent_format: FP4PersistentFormat
+    compute_dtype_override: Optional[PrecisionDType] = None
 
 
 @dataclass
@@ -64,6 +101,50 @@ class ModelPrecisionPlan:
     assignments: dict[str, ModulePrecisionAssignment] = field(default_factory=dict)
     compute_lowbit_module_count: int = 0
     persistent_lowbit_module_count: int = 0
+
+
+@dataclass(frozen=True)
+class ModulePrecisionInitState:
+    """Constructor-time precision state for one concrete module instance."""
+
+    assignment: ModulePrecisionAssignment
+    lowbit_backend: Optional["LowBitBackend"] = None
+    lowbit_capable_type: Optional[LowBitCapableModuleType] = None
+    master_ownership_mode: MasterOwnershipMode = "module"
+
+
+@dataclass(frozen=True)
+class ModulePrecisionSummary:
+    """Resolved precision coverage summary emitted after model construction."""
+
+    parameterized_module_count: int = 0
+    lowbit_capable_module_count: int = 0
+    compute_lowbit_module_count: int = 0
+    persistent_lowbit_module_count: int = 0
+    high_precision_exception_module_count: int = 0
+
+
+class ModulePrecisionResolver(Protocol):
+    """Constructor-time precision resolver used by parameterized modules."""
+
+    def resolve_module_init_state(
+        self,
+        *,
+        module_path: str,
+        module_type: str,
+        lowbit_capable_type: Optional[LowBitCapableModuleType],
+        kernel_spec: Optional[LowBitKernelSpec] = None,
+    ) -> ModulePrecisionInitState:
+        """Resolve immutable precision init state for one module path."""
+        ...
+
+    def finalize(self) -> ModulePrecisionSummary:
+        """Validate include/exclude coverage and emit final assignment summary."""
+        ...
+
+    def deepseek_v3_recipe(self) -> Optional[DeepSeekV3PrecisionRecipe]:
+        """Return effective DeepSeek-V3 recipe when enabled for this run."""
+        ...
 
 
 @dataclass
@@ -90,6 +171,9 @@ class PrecisionConfig:
     fp4_param: bool = False
     fp4_param_format: FP4PersistentFormat = "nf4"
     persistent_scale_granularity: PersistentScaleGranularity = "per_channel"
+    lowbit_master_ownership: MasterOwnershipMode = "optimizer"
+    precision_recipe_name: PrecisionRecipeName = "default"
+    deepseek_v3_recipe: Optional[DeepSeekV3PrecisionRecipe] = None
 
     loss_scale_init: float = 65536.0
     loss_scale_growth_factor: float = 2.0

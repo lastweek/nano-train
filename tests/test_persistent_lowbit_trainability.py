@@ -5,31 +5,38 @@ from __future__ import annotations
 import torch
 
 from src.layers import Linear
-from src.runtime.contracts import ModulePrecisionAssignment
+from src.runtime.contracts import ModulePrecisionPolicy
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 
 
 
-def _assignment() -> ModulePrecisionAssignment:
-    return ModulePrecisionAssignment(
-        module_name="linear",
-        module_type="Linear",
-        compute_lowbit_mode=None,
-        persistent_lowbit_mode="fp4",
-        persistent_scale_granularity="per_channel",
-        fp4_persistent_format="nf4",
+def _resolver():
+    return build_module_precision_resolver(
+        PrecisionConfig(
+            mode="fp32",
+            module_precision_policy=ModulePrecisionPolicy(
+                persistent_lowbit_mode="fp4",
+                persistent_lowbit_include=("linear",),
+                persistent_scale_granularity="per_channel",
+                fp4_persistent_format="nf4",
+            ),
+        )
     )
 
 
 
 def test_persistent_lowbit_weights_train_through_master_param() -> None:
     torch.manual_seed(7)
+    resolver = _resolver()
     layer = Linear(
         4,
         1,
         param_dtype=torch.float32,
         param_device=None,
+        module_path="linear",
+        precision_resolver=resolver,
     )
-    layer.set_precision_assignment(_assignment())
 
     optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
     x = torch.randn(8, 4)

@@ -16,12 +16,15 @@ from src.models.deepseek import DeepSeekModel
 from src.models.deepseek import DeepSeekModelConfig
 from src.models.deepseek import DeepSeekParallelContext
 from src.models.moe import ExpertParallelMoE
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 
 
 def _tiny_cfg(num_hidden_layers: int = 2) -> DeepSeekModelConfig:
     return DeepSeekModelConfig(
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
         vocab_size=64,
         hidden_size=96,
         num_hidden_layers=num_hidden_layers,
@@ -55,6 +58,34 @@ def test_forward_shape() -> None:
 
     assert logits.shape == (2, 32, cfg.vocab_size)
     assert torch.isfinite(logits).all()
+
+
+def test_forward_with_bf16_params_and_float_mask_runs() -> None:
+    """Attention matmul should handle float-mask upcast with bf16 parameters."""
+    cfg = _tiny_cfg(num_hidden_layers=1)
+    cfg.param_dtype = torch.bfloat16
+    model = DeepSeekModel(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 16))
+    mask = torch.full((2, 1, 16, 16), float("-inf"), dtype=torch.float32)
+    mask = torch.triu(mask, diagonal=1)
+
+    with torch.no_grad():
+        logits = model(input_ids, attention_mask=mask)
+
+    assert logits.dtype == torch.bfloat16
+    assert logits.shape == (2, 16, cfg.vocab_size)
+
+
+def test_deepseek_config_module_compute_dtype_override_applies_to_exact_module() -> None:
+    """DeepSeekModelConfig should support exact module-path dtype overrides."""
+    cfg = _tiny_cfg(num_hidden_layers=1)
+    cfg.module_compute_dtype_overrides = {"blocks.0.attn.q_a_norm": "fp16"}
+    model = DeepSeekModel(cfg)
+    q_a_norm = model.blocks[0].attn.q_a_norm
+
+    x = torch.randn(2, 4, cfg.q_lora_rank, dtype=torch.float32)
+    y = q_a_norm(x)
+    assert y.dtype == torch.float16
 
 
 def test_backward_runs() -> None:
@@ -120,7 +151,7 @@ def test_moe_uses_expert_model_parallel_domain() -> None:
 
 def test_moe_expert_ranges_replicate_across_tensor_parallel() -> None:
     """With expert_model_parallel_size=2, each EP shard repeats across TP ranks."""
-    cfg = DeepSeekModelConfig(
+    cfg_kwargs = dict(
         param_dtype=torch.float32,
         param_device=None,
         vocab_size=64,
@@ -147,6 +178,10 @@ def test_moe_expert_ranges_replicate_across_tensor_parallel() -> None:
     ranges: dict[tuple[int, int], tuple[int, int]] = {}
     for tp_rank in range(2):
         for ep_rank in range(2):
+            cfg = DeepSeekModelConfig(
+                precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
+                **cfg_kwargs,
+            )
             context = DeepSeekParallelContext(
                 tensor_model_parallel_rank=tp_rank,
                 tensor_model_parallel_size=2,

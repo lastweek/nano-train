@@ -21,6 +21,8 @@ from src.distributed.zero import MegatronZeroOptimizer
 from src.models.deepseek import DeepSeekModel
 from src.models.deepseek import DeepSeekModelConfig
 from src.models.deepseek import DeepSeekParallelContext
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 
 
 def _free_port() -> int:
@@ -35,6 +37,7 @@ def _tiny_config() -> DeepSeekModelConfig:
     return DeepSeekModelConfig(
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
         vocab_size=64,
         hidden_size=64,
         num_hidden_layers=4,

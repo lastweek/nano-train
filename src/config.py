@@ -6,11 +6,82 @@ For Phase 1+: Will upgrade to OmegaConf + Hydra.
 """
 
 from dataclasses import dataclass
+from dataclasses import fields
 from dataclasses import field
+from dataclasses import is_dataclass
 from typing import Literal
 from typing import Optional
+from typing import Protocol
 import torch
 import torch.distributed as dist
+
+
+class _PrecisionResolverLike(Protocol):
+    def resolve_module_init_state(
+        self,
+        *,
+        module_path: str,
+        module_type: str,
+        lowbit_capable_type,
+        kernel_spec=None,
+    ):
+        ...
+
+    def finalize(self):
+        ...
+
+    def deepseek_v3_recipe(self):
+        ...
+
+
+@dataclass(frozen=True)
+class _NoOpAssignment:
+    module_name: str
+    module_type: str
+    compute_lowbit_mode: Optional[str] = None
+    persistent_lowbit_mode: str = "off"
+    persistent_scale_granularity: str = "per_channel"
+    fp4_persistent_format: str = "nf4"
+
+
+@dataclass(frozen=True)
+class _NoOpInitState:
+    assignment: _NoOpAssignment
+    lowbit_backend: Optional[object] = None
+    lowbit_capable_type: Optional[object] = None
+
+
+class _NoOpPrecisionResolver:
+    """Fallback resolver used by non-runtime callsites that do not enable low-bit policies."""
+
+    def resolve_module_init_state(
+        self,
+        *,
+        module_path: str,
+        module_type: str,
+        lowbit_capable_type,
+        kernel_spec=None,
+    ) -> _NoOpInitState:
+        del lowbit_capable_type, kernel_spec
+        assignment = _NoOpAssignment(
+            module_name=module_path,
+            module_type=module_type,
+        )
+        return _NoOpInitState(
+            assignment=assignment,
+            lowbit_backend=None,
+            lowbit_capable_type=None,
+        )
+
+    def finalize(self):
+        return None
+
+    def deepseek_v3_recipe(self):
+        return None
+
+
+def _default_precision_resolver() -> _PrecisionResolverLike:
+    return _NoOpPrecisionResolver()
 
 
 @dataclass
@@ -18,6 +89,7 @@ class ModelConfig:
     """Model architecture configuration (125M params for MVP)."""
     param_dtype: torch.dtype
     param_device: Optional[torch.device]
+    precision_resolver: _PrecisionResolverLike
     hidden_size: int = 768
     num_layers: int = 12
     num_attention_heads: int = 12
@@ -233,6 +305,7 @@ class Config:
         default_factory=lambda: ModelConfig(
             param_dtype=torch.float32,
             param_device=None,
+            precision_resolver=_default_precision_resolver(),
         )
     )
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -246,3 +319,34 @@ class Config:
     run_name: str = "nano_train_mvp"
     log_dir: str = "outputs"
     seed: int = 42
+
+
+def _serialize_config_value(value: object) -> object:
+    """Convert config values to JSON-serializable forms."""
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if is_dataclass(value):
+        output: dict[str, object] = {}
+        for item in fields(value):
+            output[item.name] = _serialize_config_value(getattr(value, item.name))
+        return output
+    if isinstance(value, dict):
+        serialized: dict[str, object] = {}
+        for key, item in value.items():
+            serialized[str(key)] = _serialize_config_value(item)
+        return serialized
+    if isinstance(value, (list, tuple)):
+        return [_serialize_config_value(item) for item in value]
+    return str(value)
+
+
+def config_to_serializable_dict(config: Config) -> dict[str, object]:
+    """Return JSON-safe dictionary for checkpoint config serialization."""
+    serialized = _serialize_config_value(config)
+    if not isinstance(serialized, dict):
+        raise ValueError("Config serialization must produce a dictionary")
+    return serialized

@@ -9,6 +9,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 import torch.nn as nn
 import math
+from itertools import count
+
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
+
+
+_MODULE_COUNTER = count()
+
+
+def _next_module_path(prefix: str) -> str:
+    return f"tests.simple.{prefix}.{next(_MODULE_COUNTER)}"
+
+
+def _resolver():
+    return build_module_precision_resolver(PrecisionConfig(mode="fp32"))
 
 
 def assert_tensor_close(actual, expected,
@@ -36,6 +51,8 @@ def test_linear():
         20,
         param_dtype=torch.float32,
         param_device=None,
+        module_path=_next_module_path("linear"),
+        precision_resolver=_resolver(),
     ).to(device)
     ref = nn.Linear(10, 20).to(device)
 
@@ -62,6 +79,8 @@ def test_layer_norm():
         20,
         param_dtype=torch.float32,
         param_device=None,
+        module_path=_next_module_path("layernorm"),
+        precision_resolver=_resolver(),
     ).to(device)
     ref = nn.LayerNorm(20).to(device)
 
@@ -89,6 +108,8 @@ def test_embedding():
         20,
         param_dtype=torch.float32,
         param_device=None,
+        module_path=_next_module_path("embedding"),
+        precision_resolver=_resolver(),
     ).to(device)
     ref = nn.Embedding(100, 20).to(device)
 
@@ -166,6 +187,8 @@ def test_integration():
             20,
             param_dtype=torch.float32,
             param_device=None,
+            module_path=_next_module_path("linear"),
+            precision_resolver=_resolver(),
         ),
         GELU(),
         Dropout(0.0),
@@ -174,6 +197,8 @@ def test_integration():
             15,
             param_dtype=torch.float32,
             param_device=None,
+            module_path=_next_module_path("linear"),
+            precision_resolver=_resolver(),
         )
     ).to(device)
 

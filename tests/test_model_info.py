@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 
 from src.models.deepseek import DeepSeekModel, DeepSeekModelConfig
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 from src.utils.model_info import (
     ExecutionModelConfig,
     LayerInfo,
@@ -38,6 +40,10 @@ from src.utils.model_info import (
     default_roofline_targets,
     dump_model_info,
 )
+
+
+def _default_precision_resolver():
+    return build_module_precision_resolver(PrecisionConfig(mode="fp32"))
 
 
 class SimpleModel(nn.Module):
@@ -871,6 +877,7 @@ def test_sensitivity_deepseek_does_not_scan_named_modules():
     cfg = DeepSeekModelConfig(
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=_default_precision_resolver(),
         vocab_size=128,
         hidden_size=32,
         num_hidden_layers=4,
@@ -948,6 +955,7 @@ def test_ep_inference_defaults_to_four_experts_per_gpu():
     cfg = DeepSeekModelConfig(
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=_default_precision_resolver(),
         vocab_size=128,
         hidden_size=32,
         num_hidden_layers=4,

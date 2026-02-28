@@ -14,6 +14,7 @@ from src.distributed.topology import ModelParallelTopology
 from src.layers import ColumnParallelLinear
 from src.layers import RowParallelLinear
 from src.models.moe import ExpertParallelMoE
+from src.runtime.master_store import get_lowbit_master_store
 
 
 @dataclass
@@ -73,6 +74,19 @@ def collect_param_shard_info(
             for expert in module.experts:
                 for param in expert.parameters():
                     expert_model_parallel_sharded_param_ids.add(id(param))
+
+    # Optimizer-owned master mappings can externalize ownership. Fold metadata
+    # domains into shard-classification sets so sync policy stays correct.
+    master_store = get_lowbit_master_store(model)
+    if master_store is not None:
+        for key, metadata in master_store.metadata.items():
+            if key not in master_store.masters:
+                continue
+            param = master_store.masters[key]
+            if metadata.shard_domain == "tensor_model_parallel":
+                tensor_model_parallel_sharded_param_ids.add(id(param))
+            elif metadata.shard_domain == "expert_model_parallel":
+                expert_model_parallel_sharded_param_ids.add(id(param))
 
     return ParamShardInfo(
         tensor_model_parallel_sharded_param_ids=tensor_model_parallel_sharded_param_ids,

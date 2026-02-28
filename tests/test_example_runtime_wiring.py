@@ -22,13 +22,13 @@ def _load_example_module(script_name: str, module_name: str) -> ModuleType:
     return module
 
 
-def test_train_4p_components_are_local_to_script() -> None:
+def test_train_4d_components_are_local_to_script() -> None:
     repo_root = Path(__file__).parent.parent
     text = (repo_root / "examples" / "train_4d.py").read_text(encoding="utf-8")
     assert "src.runtime.plugins" not in text
 
-    module = _load_example_module("train_4d.py", "train_4p_runtime_wiring")
-    components = module.build_train_4p_components()
+    module = _load_example_module("train_4d.py", "train_4d_runtime_wiring")
+    components = module.build_train_4d_components()
     assert isinstance(components, RuntimeComponents)
     assert components.bootstrap is not None
 

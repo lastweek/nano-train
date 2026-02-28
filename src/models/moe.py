@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -15,6 +16,11 @@ import torch.nn.functional as F
 
 from src.layers import Dropout
 from src.layers import Linear
+
+if TYPE_CHECKING:
+    from src.runtime.contracts import ModulePrecisionResolver
+else:
+    ModulePrecisionResolver = object
 
 
 @dataclass
@@ -63,6 +69,80 @@ class _ReturnPayload:
     autograd_fallback: torch.Tensor
 
 
+def _comm_stochastic_round(values: torch.Tensor) -> torch.Tensor:
+    noise = torch.rand_like(values)
+    positive = torch.floor(values + noise)
+    negative = torch.ceil(values - noise)
+    return torch.where(values >= 0, positive, negative)
+
+
+def _comm_quant_dequant(
+    tensor: torch.Tensor,
+    *,
+    granularity: str,
+    rounding_mode: str,
+    bits: int = 8,
+) -> torch.Tensor:
+    """Apply fake quant-dequant for comm payloads while preserving autograd."""
+    if tensor.numel() == 0:
+        return tensor
+
+    x = tensor.float()
+    qmax = (1 << (bits - 1)) - 1
+
+    def _quantize_block(block: torch.Tensor) -> torch.Tensor:
+        scale = block.detach().abs().amax()
+        if not torch.isfinite(scale) or scale <= 0:
+            scale = block.new_tensor(1.0)
+        else:
+            scale = scale / float(qmax)
+        normalized = block / scale
+        if rounding_mode == "stochastic":
+            q = _comm_stochastic_round(normalized)
+        else:
+            q = torch.round(normalized)
+        q = torch.clamp(q, min=-qmax, max=qmax)
+        return q * scale
+
+    if granularity == "tensor":
+        dq = _quantize_block(x)
+        dq = dq.to(dtype=tensor.dtype)
+        return tensor + (dq - tensor).detach()
+
+    if granularity == "channel":
+        if x.dim() < 2:
+            dq = _quantize_block(x)
+            dq = dq.to(dtype=tensor.dtype)
+            return tensor + (dq - tensor).detach()
+        chunks = []
+        for idx in range(x.shape[-1]):
+            chunks.append(_quantize_block(x[..., idx : idx + 1]))
+        dq = torch.cat(chunks, dim=-1).to(dtype=tensor.dtype)
+        return tensor + (dq - tensor).detach()
+
+    if granularity in {"tile_1x128", "block_128x128"}:
+        tile = 128
+        x2d = x.reshape(-1, x.shape[-1])
+        width = x2d.shape[-1]
+        n_tiles = (width + tile - 1) // tile
+        pad = n_tiles * tile - width
+        if pad > 0:
+            x2d = F.pad(x2d, (0, pad))
+        blocks = []
+        for block_idx in range(n_tiles):
+            start = block_idx * tile
+            end = (block_idx + 1) * tile
+            blocks.append(_quantize_block(x2d[:, start:end]))
+        dq2d = torch.cat(blocks, dim=-1)
+        if pad > 0:
+            dq2d = dq2d[:, :width]
+        dq = dq2d.reshape_as(x).to(dtype=tensor.dtype)
+        return tensor + (dq - tensor).detach()
+
+    dq = _quantize_block(x).to(dtype=tensor.dtype)
+    return tensor + (dq - tensor).detach()
+
+
 class ExpertMLP(nn.Module):
     """SwiGLU expert MLP used by routed MoE layers."""
 
@@ -74,6 +154,8 @@ class ExpertMLP(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: torch.device | None,
+        precision_resolver: ModulePrecisionResolver,
+        module_prefix: str,
     ) -> None:
         super().__init__()
         self.gate_proj = Linear(
@@ -82,6 +164,8 @@ class ExpertMLP(nn.Module):
             bias=False,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path=f"{module_prefix}.gate_proj",
+            precision_resolver=precision_resolver,
         )
         self.up_proj = Linear(
             hidden_size,
@@ -89,6 +173,8 @@ class ExpertMLP(nn.Module):
             bias=False,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path=f"{module_prefix}.up_proj",
+            precision_resolver=precision_resolver,
         )
         self.down_proj = Linear(
             intermediate_size,
@@ -96,6 +182,8 @@ class ExpertMLP(nn.Module):
             bias=False,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path=f"{module_prefix}.down_proj",
+            precision_resolver=precision_resolver,
         )
         self.dropout = Dropout(dropout)
 
@@ -116,6 +204,8 @@ class TopKRouter(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: torch.device | None,
+        precision_resolver: ModulePrecisionResolver,
+        module_prefix: str,
         scoring_func: str = "sigmoid",
         n_group: int = 1,
         topk_group: int = 1,
@@ -152,6 +242,8 @@ class TopKRouter(nn.Module):
             bias=False,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path=f"{module_prefix}.router",
+            precision_resolver=precision_resolver,
         )
 
     def _score_experts(self, logits: torch.Tensor) -> torch.Tensor:
@@ -270,6 +362,8 @@ class LocalRoutedMoE(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: torch.device | None,
+        precision_resolver: ModulePrecisionResolver,
+        module_prefix: str,
         dropout: float = 0.0,
         n_shared_experts: int = 0,
         scoring_func: str = "sigmoid",
@@ -294,6 +388,8 @@ class LocalRoutedMoE(nn.Module):
             top_k=top_k,
             param_dtype=param_dtype,
             param_device=param_device,
+            precision_resolver=precision_resolver,
+            module_prefix=f"{module_prefix}.router",
             scoring_func=scoring_func,
             n_group=n_group,
             topk_group=topk_group,
@@ -308,8 +404,10 @@ class LocalRoutedMoE(nn.Module):
                     dropout=dropout,
                     param_dtype=param_dtype,
                     param_device=param_device,
+                    precision_resolver=precision_resolver,
+                    module_prefix=f"{module_prefix}.experts.{idx}",
                 )
-                for _ in range(num_experts)
+                for idx in range(num_experts)
             ]
         )
         self.shared_experts = nn.ModuleList(
@@ -320,8 +418,10 @@ class LocalRoutedMoE(nn.Module):
                     dropout=dropout,
                     param_dtype=param_dtype,
                     param_device=param_device,
+                    precision_resolver=precision_resolver,
+                    module_prefix=f"{module_prefix}.shared_experts.{idx}",
                 )
-                for _ in range(n_shared_experts)
+                for idx in range(n_shared_experts)
             ]
         )
 
@@ -435,6 +535,8 @@ class ExpertParallelMoE(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: torch.device | None,
+        precision_resolver: ModulePrecisionResolver,
+        module_prefix: str,
         dropout: float = 0.0,
         n_shared_experts: int = 0,
         scoring_func: str = "sigmoid",
@@ -474,6 +576,8 @@ class ExpertParallelMoE(nn.Module):
             top_k=top_k,
             param_dtype=param_dtype,
             param_device=param_device,
+            precision_resolver=precision_resolver,
+            module_prefix=f"{module_prefix}.router",
             scoring_func=scoring_func,
             n_group=n_group,
             topk_group=topk_group,
@@ -489,8 +593,10 @@ class ExpertParallelMoE(nn.Module):
                     dropout=dropout,
                     param_dtype=param_dtype,
                     param_device=param_device,
+                    precision_resolver=precision_resolver,
+                    module_prefix=f"{module_prefix}.experts.{idx}",
                 )
-                for _ in range(self.experts_per_rank)
+                for idx in range(self.experts_per_rank)
             ]
         )
 
@@ -502,14 +608,26 @@ class ExpertParallelMoE(nn.Module):
                     dropout=dropout,
                     param_dtype=param_dtype,
                     param_device=param_device,
+                    precision_resolver=precision_resolver,
+                    module_prefix=f"{module_prefix}.shared_experts.{idx}",
                 )
-                for _ in range(n_shared_experts)
+                for idx in range(n_shared_experts)
             ]
         )
 
         self._last_aux_loss = torch.zeros(())
         self._last_dropped_fraction = 0.0
         self._last_local_expert_counts = torch.zeros(self.experts_per_rank, dtype=torch.long)
+
+        recipe_fn = getattr(precision_resolver, "deepseek_v3_recipe", None)
+        recipe = recipe_fn() if callable(recipe_fn) else None
+        self._comm_quant_enabled = bool(recipe is not None and recipe.comm_quant_enabled)
+        self._comm_quant_granularity = (
+            "tensor" if recipe is None else str(recipe.comm_quant_granularity)
+        )
+        self._comm_quant_rounding_mode = (
+            "nearest" if recipe is None else str(recipe.rounding_mode)
+        )
 
     @property
     def last_aux_loss(self) -> torch.Tensor:
@@ -686,12 +804,23 @@ class ExpertParallelMoE(nn.Module):
 
         # A2A #1 (dispatch): token payloads move from source EP rank -> expert-owner EP rank.
         # recv_tokens shape: [N_recv, H].
+        send_tokens = self._flatten_splits(plan.send_tokens, tokens.dtype, tokens.device)
+        if self._comm_quant_enabled:
+            send_tokens = _comm_quant_dequant(
+                send_tokens,
+                granularity=self._comm_quant_granularity,
+                rounding_mode=self._comm_quant_rounding_mode,
+                bits=8,
+            )
+
         recv_tokens = self._all_to_all_autograd(
-            send_tensor=self._flatten_splits(plan.send_tokens, tokens.dtype, tokens.device),
+            send_tensor=send_tokens,
             send_counts=plan.send_counts,
             recv_counts=recv_counts,
             output_shape_tail=(self.hidden_size,),
         )
+        if self._comm_quant_enabled:
+            recv_tokens = recv_tokens.to(dtype=tokens.dtype)
 
         # Metadata A2A mirrors payload routing; each tensor below has shape [N_recv].
         recv_token_idx = self._all_to_all_metadata(
@@ -848,15 +977,26 @@ class ExpertParallelMoE(nn.Module):
 
         # A2A #2 (return): send expert outputs back to original source ranks.
         # recv_back_features shape: [N_back, H].
+        send_back_features = self._flatten_splits_for_autograd(
+            payload.send_back_features,
+            fallback=payload.autograd_fallback,
+        )
+        if self._comm_quant_enabled:
+            send_back_features = _comm_quant_dequant(
+                send_back_features,
+                granularity=self._comm_quant_granularity,
+                rounding_mode=self._comm_quant_rounding_mode,
+                bits=8,
+            )
+
         recv_back_features = self._all_to_all_autograd(
-            send_tensor=self._flatten_splits_for_autograd(
-                payload.send_back_features,
-                fallback=payload.autograd_fallback,
-            ),
+            send_tensor=send_back_features,
             send_counts=send_back_counts,
             recv_counts=recv_back_counts,
             output_shape_tail=(self.hidden_size,),
         )
+        if self._comm_quant_enabled:
+            recv_back_features = recv_back_features.to(dtype=tokens.dtype)
 
         send_back_token_idx_flat = self._flatten_splits(
             payload.send_back_token_idx,

@@ -33,9 +33,16 @@ class MLP(nn.Module):
         - No communication
     """
 
-    def __init__(self, config: ModelConfig, tp_config: Optional[TPConfig] = None) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        tp_config: Optional[TPConfig] = None,
+        *,
+        module_prefix: str,
+    ) -> None:
         super().__init__()
         tp_config = tp_config or TPConfig()
+        precision_resolver = config.precision_resolver
 
         self.tp_enabled = tp_config.enabled
         self.tp_rank = tp_config.rank
@@ -59,6 +66,8 @@ class MLP(nn.Module):
                 tp_group=self.tp_group,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.fc1",
+                precision_resolver=precision_resolver,
             )
 
             # RowParallelLinear expects GLOBAL in_features and consumes local shard.
@@ -70,6 +79,8 @@ class MLP(nn.Module):
                 tp_group=self.tp_group,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.fc2",
+                precision_resolver=precision_resolver,
             )
         else:
             # Standard Linear layers
@@ -78,12 +89,16 @@ class MLP(nn.Module):
                 config.intermediate_size,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.fc1",
+                precision_resolver=precision_resolver,
             )
             self.fc2 = Linear(
                 config.intermediate_size,
                 config.hidden_size,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.fc2",
+                precision_resolver=precision_resolver,
             )
 
         self.dropout = Dropout(config.dropout)

@@ -9,6 +9,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models.moe import LocalRoutedMoE
+from src.runtime.contracts import PrecisionConfig
+from src.runtime.mixed_precision import build_module_precision_resolver
 
 
 def test_local_moe_forward_backward_and_stats() -> None:
@@ -22,6 +24,8 @@ def test_local_moe_forward_backward_and_stats() -> None:
         top_k=2,
         param_dtype=torch.float32,
         param_device=None,
+        precision_resolver=build_module_precision_resolver(PrecisionConfig(mode="fp32")),
+        module_prefix="moe_local",
         dropout=0.0,
         n_shared_experts=1,
         scoring_func="sigmoid",

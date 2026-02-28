@@ -34,22 +34,36 @@ class TransformerBlock(nn.Module):
         config: ModelConfig,
         layer_idx: int,
         tp_config: Optional[TPConfig] = None,
+        *,
+        module_prefix: str,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
 
-        self.attention = MultiHeadAttention(config, tp_config)
+        self.attention = MultiHeadAttention(
+            config,
+            tp_config,
+            module_prefix=f"{module_prefix}.attention",
+        )
         self.attn_norm = LayerNorm(
             config.hidden_size,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.attn_norm",
+            precision_resolver=config.precision_resolver,
         )
 
-        self.mlp = MLP(config, tp_config)
+        self.mlp = MLP(
+            config,
+            tp_config,
+            module_prefix=f"{module_prefix}.mlp",
+        )
         self.mlp_norm = LayerNorm(
             config.hidden_size,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path=f"{module_prefix}.mlp_norm",
+            precision_resolver=config.precision_resolver,
         )
 
     def forward(
@@ -113,18 +127,27 @@ class TransformerModel(nn.Module):
             config.hidden_size,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path="token_embeddings",
+            precision_resolver=config.precision_resolver,
         )
         self.position_embeddings = Embedding(
             config.max_position_embeddings,
             config.hidden_size,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path="position_embeddings",
+            precision_resolver=config.precision_resolver,
         )
         self.dropout = Dropout(config.dropout)
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(config, layer_idx=i, tp_config=tp_config)
+            TransformerBlock(
+                config,
+                layer_idx=i,
+                tp_config=tp_config,
+                module_prefix=f"blocks.{i}",
+            )
             for i in range(config.num_layers)
         ])
 
@@ -133,6 +156,8 @@ class TransformerModel(nn.Module):
             config.hidden_size,
             param_dtype=config.param_dtype,
             param_device=config.param_device,
+            module_path="ln_f",
+            precision_resolver=config.precision_resolver,
         )
 
         # LM head
@@ -154,6 +179,8 @@ class TransformerModel(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path="lm_head",
+                precision_resolver=config.precision_resolver,
             )
         else:
             # Standard Linear
@@ -163,6 +190,8 @@ class TransformerModel(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path="lm_head",
+                precision_resolver=config.precision_resolver,
             )
             # Weight tying: share embeddings and lm_head weights
             # Note: Not done in TP mode due to shape mismatch

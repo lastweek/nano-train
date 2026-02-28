@@ -34,9 +34,16 @@ class MultiHeadAttention(nn.Module):
         - No communication
     """
 
-    def __init__(self, config: ModelConfig, tp_config: Optional[TPConfig] = None) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        tp_config: Optional[TPConfig] = None,
+        *,
+        module_prefix: str,
+    ) -> None:
         super().__init__()
         tp_config = tp_config or TPConfig()
+        precision_resolver = config.precision_resolver
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -71,6 +78,8 @@ class MultiHeadAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.qkv_proj",
+                precision_resolver=precision_resolver,
             )
 
             # RowParallelLinear expects the GLOBAL input size and consumes a local shard.
@@ -83,6 +92,8 @@ class MultiHeadAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.out_proj",
+                precision_resolver=precision_resolver,
             )
         else:
             # Standard Linear layers
@@ -92,6 +103,8 @@ class MultiHeadAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.qkv_proj",
+                precision_resolver=precision_resolver,
             )
             self.out_proj = Linear(
                 config.hidden_size,
@@ -99,6 +112,8 @@ class MultiHeadAttention(nn.Module):
                 bias=False,
                 param_dtype=config.param_dtype,
                 param_device=config.param_device,
+                module_path=f"{module_prefix}.out_proj",
+                precision_resolver=precision_resolver,
             )
 
         self.dropout = Dropout(config.dropout)
@@ -156,7 +171,11 @@ class MultiHeadAttention(nn.Module):
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
 
-        attn_probs = torch.softmax(attn_scores, dim=-1)
+        scores_softmax = attn_scores
+        if scores_softmax.dtype not in (torch.float32, torch.float64):
+            scores_softmax = scores_softmax.float()
+        # Keep softmax numerically stable while matching value dtype for matmul.
+        attn_probs = torch.softmax(scores_softmax, dim=-1).to(dtype=v.dtype)
 
         if self._monitor_enabled:
             with torch.no_grad():

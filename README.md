@@ -1,21 +1,39 @@
 # Nano-Train
 
-Learning-first distributed training repo focused on Megatron-style parallelism:
-Tensor (TP), Pipeline (PP), Expert (EP), Data (DP), and ZeRO-1/2.
+`nano-train` is a learning-first distributed LLM training repo built around Megatron-style
+parallelism. It started as a compact training sandbox and has gradually grown into a reusable
+runtime-backed system that now covers TP, PP, EP, DP, ZeRO-1/2, and mixed precision on a
+DeepSeek-style model stack.
 
-## Current Status
+## What Nano-Train Is
 
-- Main tutorial entrypoint: `examples/train_4d.py` (TP/PP/EP/DP + ZeRO-1/2).
-- Focused TP/DP learning path: `examples/train_tp.py`.
-- ZeRO implementation: `src/distributed/zero.py` (`optim`, `optim_grads`).
-- DeepSeek-style model stack:
-  - `src/models/deepseek.py`
-  - `src/models/moe.py`
-- Current tutorial constraints in `examples/train_4d.py`:
-  - `tensor-model-parallel-size > 1` with `expert-model-parallel-size > 1` is disallowed.
-  - `expert-tensor-parallel-size == 1`.
-  - `context-parallel-size == 1`.
-  - ZeRO-3 (`optim_grads_params`) is out of scope.
+- A practical repo for understanding how modern distributed training systems are assembled,
+  not just how a single training loop runs.
+- A runtime-backed training system where orchestration lives in `src/runtime/*` and scenario
+  wiring lives in thin entry scripts under `examples/`.
+- A place to study Megatron-style concepts concretely: tensor parallelism, pipeline
+  parallelism, expert parallelism, data parallelism, optimizer sharding, and low-bit training.
+
+## What It Can Do Today
+
+- **Parallel training**: TP, PP, EP, DP, and their combined 4D tutorial path are built and
+  runnable through `examples/train_4d.py`.
+- **Training runtime**: a reusable `RuntimeEngine` and `RuntimeComponents` model now powers
+  `train_4d`, `train_tp`, `train_ddp`, and `train_mvp`.
+- **Optimization/runtime systems**: ZeRO-1/2, mixed precision (`bf16`, `fp16`, `fp8`, `fp4`),
+  DeepSeek-V3-style FP8 recipe support, and optimizer-owned low-bit master weight paths are
+  implemented in the current runtime/tutorial path.
+- **Checkpoint/runtime interface**: the current ZeRO checkpoint path uses format v2 in the
+  current implementation.
+- **Model/tutorial stack**: a DeepSeek-style decoder + MoE stack, TP/DDP/MVP examples,
+  monitoring utilities, and model inspection tooling are included.
+
+## Start Here
+
+1. Start with `examples/train_4d.py` for the canonical TP/PP/EP/DP + ZeRO tutorial path.
+2. Use `examples/train_tp.py` for a smaller TP/DP-focused learning path.
+3. Use `examples/train_ddp.py` and `examples/train_mvp.py` for narrower runtime-backed
+   examples.
 
 ## Quick Start
 
@@ -27,7 +45,7 @@ cd nano-train
 pip install -r requirements.txt
 ```
 
-### Single-Rank Smoke
+Run this first to confirm the canonical entrypoint works on one process:
 
 ```bash
 python3 examples/train_4d.py \
@@ -37,7 +55,7 @@ python3 examples/train_4d.py \
   --max_steps 2
 ```
 
-### 4P + ZeRO-2 Smoke
+Run this next to exercise the full 4D runtime path with ZeRO-2 style optimizer sharding:
 
 ```bash
 python3 examples/launch.py --world-size 4 --backend gloo \
@@ -51,7 +69,7 @@ python3 examples/launch.py --world-size 4 --backend gloo \
   --max_steps 1
 ```
 
-### Mixed Precision Smoke (FP8 Emulated)
+Use this to validate the low-bit mixed-precision path without depending on Transformer Engine:
 
 ```bash
 python3 examples/train_4d.py \
@@ -69,11 +87,7 @@ python3 examples/train_4d.py \
   --max_steps 1
 ```
 
-Notes:
-- Low-bit execution is strict per-module and bound at module construction time.
-- ZeRO checkpoint optimizer payloads now use format v2 only (old formats are unsupported).
-
-### DeepSeek-V3 Recipe Smoke (FP8 Emulated)
+Use this to validate the DeepSeek-V3 recipe defaults:
 
 ```bash
 python3 examples/train_4d.py \
@@ -86,63 +100,23 @@ python3 examples/train_4d.py \
   --max_steps 1
 ```
 
-Recipe notes:
-- `--precision-recipe deepseek_v3` defaults to FP8 with:
-  - activation quant granularity `tile_1x128`
-  - weight quant granularity `block_128x128`
-  - rounding mode `stochastic`
-  - MoE dispatch/combine payload comm-quant enabled
-- You can override each recipe field with `--fp8-*` flags.
+DeepSeek precision notes:
+
+- `--precision-recipe deepseek_v3` defaults to FP8 with `tile_1x128` activation granularity,
+  `block_128x128` weight granularity, stochastic rounding, and MoE payload comm-quant enabled.
 - For `DeepSeekModel`, prefer exact-path config overrides through
   `DeepSeekModelConfig.module_compute_dtype_overrides`.
-- Generic CLI fallback is still available for quick experiments or non-DeepSeek scripts:
-  `--module-compute-dtype-rule '<module_pattern>=<fp32|bf16|fp16>'`.
+- `--module-compute-dtype-rule '<module_pattern>=<fp32|bf16|fp16>'` remains available as a
+  generic fallback for fast experiments or non-DeepSeek scripts.
+- DeepSeek precision details and precedence rules live in
+  [docs/deepseek_precision_configuration.md](docs/deepseek_precision_configuration.md).
 
-DeepSeek config-first example:
+## Architecture Today
 
-```python
-model_config = build_tiny_deepseek_config(
-    args,
-    param_dtype=param_dtype,
-    param_device=parallel.device,
-    precision_resolver=build_module_precision_resolver(precision_config),
-    module_compute_dtype_overrides={
-        "blocks.0.attn.q_a_norm": "fp16",
-    },
-)
-```
-
-See [DeepSeek Precision Configuration](docs/deepseek_precision_configuration.md) for
-exact module-path control, precedence, and fallback behavior.
-
-## Key Entrypoints
-
-| Path | Purpose |
-|---|---|
-| `examples/train_4d.py` | Canonical TP/PP/EP/DP tutorial script with optional ZeRO-1/2 |
-| `examples/train_tp.py` | TP-only and TP+DP tutorial path |
-| `examples/launch.py` | Multi-process launcher for local distributed runs |
-| `src/distributed/topology.py` | Parallel group/rank topology setup |
-| `src/distributed/zero.py` | Megatron-style ZeRO-1/2 optimizer implementation |
-| `src/runtime/engine.py` | Runtime orchestration engine (mode dispatch + loops) |
-| `src/runtime/contracts.py` | Runtime component contracts (`providers`, `schedule`, `optimizer`, `checkpoint`) |
-| `src/trainer.py` | Shared trainer loop and checkpoint integration hooks |
-
-## Runtime Core
-
-`examples/train_4d.py`, `examples/train_tp.py`, `examples/train_ddp.py`, and `examples/train_mvp.py`
-now use a thin-script pattern:
-
-- Script owns CLI and component wiring.
-- `src/runtime/engine.py` owns orchestration flow.
-- Model/data/optimizer/schedule/checkpoint behavior is provided through components.
-  Example-specific component implementations live in each script under `examples/`.
-- See [Runtime Core Design](docs/runtime_core_design.md) for architecture, API,
-  responsibilities, and script usage patterns.
-
-## Architecture Diagram
-
-See `docs/runtime_core_design.md` for full API and extension details.
+The system is now organized around a clear boundary: the runtime engine owns orchestration,
+entry scripts own composition, and models/layers own the math, parameterization, and precision
+behavior. That split is what let the repo evolve from isolated scripts into a reusable training
+runtime without flattening everything into one framework.
 
 ```mermaid
 flowchart TD
@@ -184,11 +158,6 @@ flowchart TD
         H4["checkpoint.py"]
     end
 
-    subgraph V["Verification & Docs"]
-        V1["tests/* runtime + script wiring"]
-        V2["docs/runtime_core_design.md"]
-    end
-
     E1 --> E5
     E2 --> E5
     E3 --> E5
@@ -228,19 +197,75 @@ flowchart TD
     C7 -. uses .-> H4
     R0 -. uses .-> H2
     R0 -. uses .-> H4
-
-    V1 -. validates .-> R0
-    V1 -. validates .-> E1
-    V1 -. validates .-> E2
-    V1 -. validates .-> E3
-    V1 -. validates .-> E4
-    V2 -. documents .-> R0
-    V2 -. documents .-> C0
 ```
+
+If you want the architecture and API details, read
+[docs/runtime_core_design.md](docs/runtime_core_design.md).
+
+## Key Entrypoints
+
+| Path | Purpose |
+|---|---|
+| `examples/train_4d.py` | Canonical 4D tutorial path: TP/PP/EP/DP + ZeRO-1/2 |
+| `examples/train_tp.py` | Smaller TP + DP runtime-backed tutorial |
+| `examples/train_ddp.py` | DDP-focused runtime-backed example |
+| `examples/train_mvp.py` | MVP training path wired through the runtime |
+| `src/runtime/engine.py` | Orchestration engine for runtime-backed scripts |
+| `src/runtime/contracts.py` | Component interfaces and runtime dataclasses |
+| `src/runtime/mixed_precision.py` | Precision policy, autocast, scaling, and low-bit wiring |
+| `src/distributed/zero.py` | Megatron-style ZeRO-1/2 optimizer implementation |
+| `src/models/deepseek.py` | DeepSeek-style decoder and parallel-context model path |
+| `src/models/moe.py` | Routed MoE layers and expert-parallel communication |
+
+## How We Got Here
+
+1. **Bootstrap**: the repo started as a compact training playground with native layers,
+   basic model pieces, and runnable examples so the core mechanics were easy to inspect.
+2. **MVP trainer/model stack**: the training loop and model/config stack became structured
+   enough to support more than one toy path, which created a base for later refactors.
+3. **Monitoring and observability**: stability and performance metrics were added so training
+   behavior could be diagnosed instead of guessed.
+4. **TP + DP tutorial path**: tensor/data parallelism moved the repo from single-process
+   demos into real distributed tutorial territory.
+5. **EP + DeepSeek-style MoE**: routed experts, expert parallelism, and a DeepSeek-style
+   model stack made the repo reflect more modern large-model training patterns.
+6. **PP + 4D entrypoint**: pipeline support and `train_4d.py` made the project a true
+   TP/PP/EP/DP tutorial system instead of separate isolated modes.
+7. **ZeRO-1/2 integration**: optimizer sharding added a memory/system dimension that matters
+   for serious large-scale training.
+8. **Runtime core refactor**: orchestration was moved into `src/runtime/*`, leaving thin
+   scripts and reusable engine/components rather than one-off training entrypoints.
+9. **Mixed precision expansion**: Megatron-style precision flags, DeepSeek-V3 recipe support,
+   per-module low-bit policy, and config-first DeepSeek precision overrides completed the
+   current runtime stack.
+
+## Current Guardrails
+
+- `examples/train_4d.py` currently disallows `tensor-model-parallel-size > 1` together with
+  `expert-model-parallel-size > 1`.
+- `expert_tensor_parallel_size == 1` is currently required.
+- `context_parallel_size == 1` is currently required.
+- ZeRO-3 (`optim_grads_params`) is out of scope in the current tutorial/runtime path.
+- Low-bit kernel coverage today is primarily the linear family; other modules can still carry
+  per-module precision state, but they do not all have dedicated low-bit kernels.
+
+## Validation Status
+
+At the time of this README refresh, the local full test suite passed with:
+
+```bash
+pytest -q
+# 220 passed
+```
+
+This is a point-in-time local validation result, not a blanket guarantee for every machine,
+backend, or optional dependency combination.
 
 ## Learning Guides
 
 - [Docs Index](docs/README.md)
+- [Runtime Core Design](docs/runtime_core_design.md)
+- [DeepSeek Precision Configuration](docs/deepseek_precision_configuration.md)
 - [TP + DP Communication](docs/tp_dp_communication.md)
 - [TP + EP + DP Communication](docs/ep_tp_dp_communication.md)
 - [TP + PP + EP + DP Communication](docs/pp_tp_ep_dp_communication.md)
@@ -248,40 +273,6 @@ flowchart TD
 - [Megatron ZeRO-1/2 Design](docs/megatron_zero1_zero2_design.md)
 - [ZeRO-1/2 Intuitive Summary](docs/zero1_zero2_intuitive_summary.md)
 - [ZeRO-1/2 Quickstart](docs/zero1_zero2_quickstart.md)
-
-## Progress Tracker
-
-### Completed Milestones
-
-| Date | Commit | Milestone | Major Files Changed |
-|---|---|---|---|
-| 2026-02-09 | `5cfeb63` | Initial repo bootstrap | `README.md`, `src/*`, `examples/*`, `tests/*` |
-| 2026-02-13 | `8044208` | MVP stack refactor + model efficiency reporting | `src/trainer.py`, `src/utils/model_info.py`, `docs/model_info.md` |
-| 2026-02-19 | `9c12e7e` | Monitoring stability/perf metrics | `src/trainer.py`, `src/config.py`, `src/monitoring.py`, `docs/training_monitoring_metrics_reference.md` |
-| 2026-02-24 | `5206984` | Canonical TP + DP tutorial pipeline | `examples/train_tp.py`, `src/layers.py`, `docs/tp_dp_communication.md` |
-| 2026-02-25 | `64b9df3` | EP tutorial path (TP + EP + DP) | `examples/train_4d.py`, `src/models/moe.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md` |
-| 2026-02-25 | `5855268` | Docs IA/readability overhaul | `docs/README.md`, `docs/*.md`, `README.md`, `src/utils/model_info.py` |
-| 2026-02-26 | `69188d8` | 4P entrypoint rename + ZeRO-1/2 integration and debug visibility | `examples/train_4d.py`, `src/distributed/zero.py`, `src/trainer.py`, `docs/zero1_zero2_*.md`, `tests/test_zero_*.py` |
-
-### Planned Next Milestones
-
-| Status | Milestone | Expected Focus Files |
-|---|---|---|
-| In Progress | Canonical TP+EP mapping (remove TP+EP guard, avoid expert replication) | `examples/train_4d.py`, `src/distributed/topology.py`, `src/models/deepseek.py`, `docs/ep_tp_dp_communication.md`, `docs/pp_tp_ep_dp_communication.md` |
-| Planned | EP robustness hardening (EDP sync/diagnostics + checks) | `examples/train_4d.py`, `src/models/moe.py`, `tests/test_train_4d_script_logic.py` |
-| Planned | DeepSeek parallel context cleanup and simplification | `src/models/deepseek.py`, `tests/test_deepseek_model.py` |
-| Planned | Device-level MoE aux loss (`L_devbal`) support | `src/models/moe.py`, `examples/train_4d.py`, `docs/deepseek_moe_aux_losses.md` |
-| Planned | Checkpoint resume path for ZeRO sharded optimizer in trainer | `src/trainer.py`, `src/distributed/zero.py`, `docs/zero1_zero2_quickstart.md` |
-
-## Repository Layout
-
-```text
-docs/         learning and implementation guides
-examples/     runnable training/tutorial scripts
-src/          core training/model/distributed modules
-tests/        unit and distributed smoke tests
-scripts/      local helper scripts
-```
 
 ## Development Checks
 

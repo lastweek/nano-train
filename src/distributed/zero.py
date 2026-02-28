@@ -30,6 +30,7 @@ import torch.nn as nn
 
 
 LOGGER = logging.getLogger(__name__)
+ZERO_CHECKPOINT_FORMAT_VERSION = 2
 
 
 DataParallelShardingStrategy = Literal["no_shard", "optim", "optim_grads"]
@@ -52,6 +53,12 @@ class DistributedOptimizerConfig:
     main_grads_dtype: OptimizerStateDType = "fp32"
     exp_avg_dtype: OptimizerStateDType = "fp32"
     exp_avg_sq_dtype: OptimizerStateDType = "fp32"
+    precision_recipe_name: str = "default"
+    fp8_rounding: str = "nearest"
+    fp8_activation_quant_granularity: str = "tensor"
+    fp8_weight_quant_granularity: str = "tensor"
+    fp8_comm_quant_enabled: bool = False
+    fp8_comm_quant_granularity: str = "tensor"
     debug: bool = False
     debug_max_steps: int = 1
     debug_max_params: int = 8
@@ -519,9 +526,17 @@ class MegatronZeroOptimizer:
         # This payload is replicated metadata (hyperparameters, signatures), not
         # sharded tensor state. Per-rank tensor shards are saved separately.
         return {
-            "format_version": 1,
+            "format_version": ZERO_CHECKPOINT_FORMAT_VERSION,
             "global_step": self._global_step,
             "config": asdict(self.config),
+            "precision_recipe": {
+                "name": self.config.precision_recipe_name,
+                "fp8_rounding": self.config.fp8_rounding,
+                "fp8_activation_quant_granularity": self.config.fp8_activation_quant_granularity,
+                "fp8_weight_quant_granularity": self.config.fp8_weight_quant_granularity,
+                "fp8_comm_quant_enabled": self.config.fp8_comm_quant_enabled,
+                "fp8_comm_quant_granularity": self.config.fp8_comm_quant_granularity,
+            },
             "param_groups": [
                 {
                     "lr": float(group["lr"]),
@@ -537,6 +552,27 @@ class MegatronZeroOptimizer:
 
     def load_state_dict(self, state: dict) -> None:
         """Load non-parameter optimizer metadata state."""
+        format_version = int(state.get("format_version", -1))
+        if format_version != ZERO_CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported ZeRO nonparam checkpoint format version: "
+                f"{format_version}. Expected {ZERO_CHECKPOINT_FORMAT_VERSION}."
+            )
+
+        expected_recipe = {
+            "name": self.config.precision_recipe_name,
+            "fp8_rounding": self.config.fp8_rounding,
+            "fp8_activation_quant_granularity": self.config.fp8_activation_quant_granularity,
+            "fp8_weight_quant_granularity": self.config.fp8_weight_quant_granularity,
+            "fp8_comm_quant_enabled": self.config.fp8_comm_quant_enabled,
+            "fp8_comm_quant_granularity": self.config.fp8_comm_quant_granularity,
+        }
+        loaded_recipe = state.get("precision_recipe")
+        if loaded_recipe is not None and loaded_recipe != expected_recipe:
+            raise ValueError(
+                "ZeRO precision recipe metadata mismatch between checkpoint and optimizer config"
+            )
+
         global_step = int(state.get("global_step", 0))
         self._global_step = global_step
 
@@ -554,10 +590,18 @@ class MegatronZeroOptimizer:
         """Return local shard parameter state for distributed checkpointing."""
         # This is the sharded parameter-dependent optimizer state payload.
         payload: dict[str, object] = {
-            "format_version": 1,
+            "format_version": ZERO_CHECKPOINT_FORMAT_VERSION,
             "global_step": self._global_step,
             "strategy": self._strategy(),
             "parameter_signature_hash": self.parameter_signature_hash(),
+            "precision_recipe": {
+                "name": self.config.precision_recipe_name,
+                "fp8_rounding": self.config.fp8_rounding,
+                "fp8_activation_quant_granularity": self.config.fp8_activation_quant_granularity,
+                "fp8_weight_quant_granularity": self.config.fp8_weight_quant_granularity,
+                "fp8_comm_quant_enabled": self.config.fp8_comm_quant_enabled,
+                "fp8_comm_quant_granularity": self.config.fp8_comm_quant_granularity,
+            },
             "optimizer_state_dtypes": {
                 "main_params_dtype": self.config.main_params_dtype,
                 "main_grads_dtype": self.config.main_grads_dtype,
@@ -595,6 +639,27 @@ class MegatronZeroOptimizer:
 
     def load_parameter_state_from_dp_zero(self, state_dict: dict, strict: bool = True) -> None:
         """Load local shard tensors from distributed checkpoint payload."""
+        format_version = int(state_dict.get("format_version", -1))
+        if format_version != ZERO_CHECKPOINT_FORMAT_VERSION:
+            raise ValueError(
+                "Unsupported ZeRO shard checkpoint format version: "
+                f"{format_version}. Expected {ZERO_CHECKPOINT_FORMAT_VERSION}."
+            )
+
+        expected_recipe = {
+            "name": self.config.precision_recipe_name,
+            "fp8_rounding": self.config.fp8_rounding,
+            "fp8_activation_quant_granularity": self.config.fp8_activation_quant_granularity,
+            "fp8_weight_quant_granularity": self.config.fp8_weight_quant_granularity,
+            "fp8_comm_quant_enabled": self.config.fp8_comm_quant_enabled,
+            "fp8_comm_quant_granularity": self.config.fp8_comm_quant_granularity,
+        }
+        loaded_recipe = state_dict.get("precision_recipe")
+        if loaded_recipe is not None and loaded_recipe != expected_recipe:
+            raise ValueError(
+                "ZeRO shard precision recipe metadata mismatch between checkpoint and optimizer config"
+            )
+
         expected_hash = self.parameter_signature_hash()
         found_hash = state_dict.get("parameter_signature_hash")
         if found_hash != expected_hash:
@@ -666,13 +731,21 @@ class MegatronZeroOptimizer:
         # Manifest ties together replicated metadata file and rank-local shard
         # file names with a parameter signature compatibility hash.
         return {
-            "format_version": 1,
+            "format_version": ZERO_CHECKPOINT_FORMAT_VERSION,
             "optimizer_type": "MegatronZeroOptimizer",
             "rank": rank,
             "world_size": world_size,
             "strategy": self._strategy(),
             "num_distributed_optimizer_instances": self.config.num_distributed_optimizer_instances,
             "parameter_signature_hash": self.parameter_signature_hash(),
+            "precision_recipe": {
+                "name": self.config.precision_recipe_name,
+                "fp8_rounding": self.config.fp8_rounding,
+                "fp8_activation_quant_granularity": self.config.fp8_activation_quant_granularity,
+                "fp8_weight_quant_granularity": self.config.fp8_weight_quant_granularity,
+                "fp8_comm_quant_enabled": self.config.fp8_comm_quant_enabled,
+                "fp8_comm_quant_granularity": self.config.fp8_comm_quant_granularity,
+            },
             "optimizer_state_dtypes": {
                 "main_params_dtype": self.config.main_params_dtype,
                 "main_grads_dtype": self.config.main_grads_dtype,

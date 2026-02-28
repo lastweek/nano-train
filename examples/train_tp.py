@@ -39,6 +39,7 @@ from src.logging import setup_logging
 from src.runtime.checkpoint import NoOpCheckpointManager
 from src.runtime.context import RunConfig
 from src.runtime.context import RuntimeContext
+from src.runtime.contracts import ModulePrecisionResolver
 from src.runtime.contracts import OptimizerState
 from src.runtime.contracts import RuntimeBootstrap
 from src.runtime.contracts import RuntimeComponents
@@ -47,14 +48,15 @@ from src.runtime.contracts import StepContext
 from src.runtime.contracts import StepOutput
 from src.runtime.contracts import TrainDataBundle
 from src.runtime.engine import RuntimeEngine
-from src.runtime.mixed_precision import apply_model_precision_plan
-from src.runtime.mixed_precision import build_model_precision_plan
+from src.runtime.mixed_precision import build_module_precision_resolver
 from src.runtime.mixed_precision import dtype_alias_to_torch
-from src.runtime.mixed_precision import ensure_lowbit_compute_assignments
+from src.runtime.mixed_precision import finalize_module_precision_resolver
 from src.runtime.mixed_precision import MixedPrecisionController
 from src.runtime.mixed_precision import refresh_persistent_lowbit_params
-from src.runtime.mixed_precision import resolve_precision_config
+from src.runtime.master_store import materialize_optimizer_owned_masters
 from src.runtime.optimizer_runtime import PrecisionAdamW
+from src.runtime.precision_args import add_mixed_precision_args
+from src.runtime.precision_args import normalize_and_resolve_precision
 from src.runtime.schedules.non_pipeline import NonPipelineSchedule
 from src.runtime.sync import ParamShardInfo
 
@@ -75,6 +77,8 @@ class ParallelMLP(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        precision_resolver: ModulePrecisionResolver,
+        module_prefix: str,
     ):
         super().__init__()
         self.fc1 = ColumnParallelLinear(
@@ -86,6 +90,8 @@ class ParallelMLP(nn.Module):
             bias=True,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path=f"{module_prefix}.fc1",
+            precision_resolver=precision_resolver,
         )
         self.fc2 = RowParallelLinear(
             intermediate_size,
@@ -96,6 +102,8 @@ class ParallelMLP(nn.Module):
             bias=True,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path=f"{module_prefix}.fc2",
+            precision_resolver=precision_resolver,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -121,6 +129,7 @@ class TutorialModel(nn.Module):
         *,
         param_dtype: torch.dtype,
         param_device: Optional[torch.device],
+        precision_resolver: ModulePrecisionResolver,
     ):
         super().__init__()
         self.input_proj = Linear(
@@ -128,6 +137,8 @@ class TutorialModel(nn.Module):
             hidden_size,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path="input_proj",
+            precision_resolver=precision_resolver,
         )
         self.mlp = ParallelMLP(
             hidden_size=hidden_size,
@@ -137,12 +148,16 @@ class TutorialModel(nn.Module):
             tp_group=tp_group,
             param_dtype=param_dtype,
             param_device=param_device,
+            precision_resolver=precision_resolver,
+            module_prefix="mlp",
         )
         self.output_proj = Linear(
             hidden_size,
             output_size,
             param_dtype=param_dtype,
             param_device=param_device,
+            module_path="output_proj",
+            precision_resolver=precision_resolver,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -193,184 +208,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate_size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--bf16", action="store_true", help="Enable BF16 mixed precision")
-    parser.add_argument("--fp16", action="store_true", help="Enable FP16 mixed precision")
-    parser.add_argument("--fp8", action="store_true", help="Enable FP8 mixed precision")
-    parser.add_argument("--fp4", action="store_true", help="Enable FP4 mixed precision (emulated)")
-    parser.add_argument(
-        "--fp8-backend",
-        type=str,
-        default="transformer_engine",
-        choices=["transformer_engine", "emulated"],
-        help="FP8 backend implementation",
-    )
-    parser.add_argument(
-        "--fp8-format",
-        type=str,
-        default="e4m3",
-        choices=["e4m3", "hybrid"],
-        help="FP8 format recipe",
-    )
-    parser.add_argument(
-        "--fp8-amax-history-len",
-        type=int,
-        default=16,
-        help="FP8 amax history length",
-    )
-    parser.add_argument(
-        "--fp8-amax-compute-algo",
-        type=str,
-        default="most_recent",
-        choices=["most_recent", "max"],
-        help="FP8 amax compute algorithm",
-    )
-    parser.add_argument(
-        "--fp4-backend",
-        type=str,
-        default="emulated",
-        choices=["emulated"],
-        help="FP4 backend implementation",
-    )
-    parser.add_argument(
-        "--params-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Model parameter storage dtype",
-    )
-    parser.add_argument(
-        "--main-params-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Main optimizer parameter dtype",
-    )
-    parser.add_argument(
-        "--main-grads-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Main optimizer gradient dtype",
-    )
-    parser.add_argument(
-        "--exp-avg-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Adam exp_avg state dtype",
-    )
-    parser.add_argument(
-        "--exp-avg-sq-dtype",
-        type=str,
-        default=None,
-        choices=["fp32", "bf16", "fp16"],
-        help="Adam exp_avg_sq state dtype",
-    )
-    parser.add_argument(
-        "--loss-scale-init",
-        type=float,
-        default=65536.0,
-        help="Initial dynamic loss scale value",
-    )
-    parser.add_argument(
-        "--loss-scale-growth-factor",
-        type=float,
-        default=2.0,
-        help="Loss scale growth factor",
-    )
-    parser.add_argument(
-        "--loss-scale-backoff-factor",
-        type=float,
-        default=0.5,
-        help="Loss scale backoff factor on overflow",
-    )
-    parser.add_argument(
-        "--loss-scale-growth-interval",
-        type=int,
-        default=2000,
-        help="Successful step interval before loss scale growth",
-    )
-    parser.add_argument(
-        "--loss-scale-min",
-        type=float,
-        default=1.0,
-        help="Minimum loss scale",
-    )
-    parser.add_argument(
-        "--loss-scale-max",
-        type=float,
-        default=16777216.0,
-        help="Maximum loss scale",
-    )
-    parser.add_argument(
-        "--fp8-param",
-        action="store_true",
-        help="Enable persistent FP8 parameter storage for selected modules",
-    )
-    parser.add_argument(
-        "--fp4-param",
-        action="store_true",
-        help="Enable persistent FP4 parameter storage for selected modules",
-    )
-    parser.add_argument(
-        "--fp4-param-format",
-        type=str,
-        default="nf4",
-        choices=["nf4"],
-        help="Persistent FP4 quantization format",
-    )
-    parser.add_argument(
-        "--persistent-scale-granularity",
-        type=str,
-        default="per_channel",
-        choices=["per_tensor", "per_channel"],
-        help="Scale granularity for persistent low-bit quantization",
-    )
-    parser.add_argument(
-        "--module-pattern-type",
-        type=str,
-        default="regex",
-        choices=["regex", "glob"],
-        help="Pattern matcher type for module precision policies",
-    )
-    parser.add_argument(
-        "--compute-lowbit-mode",
-        type=str,
-        default=None,
-        choices=["fp8", "fp4"],
-        help="Per-module low-bit compute mode override",
-    )
-    parser.add_argument(
-        "--compute-lowbit-include",
-        action="append",
-        default=None,
-        help="Repeatable include patterns for low-bit compute module selection",
-    )
-    parser.add_argument(
-        "--compute-lowbit-exclude",
-        action="append",
-        default=None,
-        help="Repeatable exclude patterns for low-bit compute module selection",
-    )
-    parser.add_argument(
-        "--persistent-lowbit-mode",
-        type=str,
-        default="off",
-        choices=["off", "fp8", "fp4"],
-        help="Per-module persistent low-bit storage mode",
-    )
-    parser.add_argument(
-        "--persistent-lowbit-include",
-        action="append",
-        default=None,
-        help="Repeatable include patterns for persistent low-bit module selection",
-    )
-    parser.add_argument(
-        "--persistent-lowbit-exclude",
-        action="append",
-        default=None,
-        help="Repeatable exclude patterns for persistent low-bit module selection",
-    )
+    add_mixed_precision_args(parser)
     args = parser.parse_args()
 
     if args.tensor_model_parallel_size is None and args.tp_size is not None:
@@ -594,7 +432,7 @@ class TPBootstrap(RuntimeBootstrap):
         else:
             mode = "tp_dp"
 
-        precision_config = resolve_precision_config(args, parallel.device)
+        precision_config = normalize_and_resolve_precision(args, parallel.device)
 
         return RuntimeContext(
             parallel=parallel,
@@ -618,6 +456,7 @@ class TPModelProvider:
         if precision_config is None:
             raise RuntimeError("precision_config must be resolved in TPBootstrap")
         param_dtype = dtype_alias_to_torch(precision_config.params_dtype)
+        precision_resolver = build_module_precision_resolver(precision_config)
 
         torch.manual_seed(args.seed + parallel.tensor_model_parallel_rank)
         if parallel.device.type == "cuda":
@@ -633,6 +472,7 @@ class TPModelProvider:
             tp_group=parallel.tensor_model_parallel_group,
             param_dtype=param_dtype,
             param_device=parallel.device,
+            precision_resolver=precision_resolver,
         )
 
         tp_sharded_param_ids = collect_tp_sharded_param_ids(model)
@@ -645,21 +485,24 @@ class TPModelProvider:
             dp_group=parallel.data_parallel_group,
         )
 
-        policy = precision_config.module_precision_policy
-        if policy is not None:
-            precision_plan = build_model_precision_plan(model, policy)
-            apply_model_precision_plan(model, precision_plan)
-            ensure_lowbit_compute_assignments(
-                precision_config,
-                precision_plan,
-                script_name="train_tp.py",
+        precision_summary = finalize_module_precision_resolver(precision_resolver)
+        master_store = materialize_optimizer_owned_masters(
+            model,
+            precision_config=precision_config,
+        )
+        if parallel.rank == 0:
+            logger.info(
+                "TP per-module low-bit policy: compute_modules=%d persistent_modules=%d "
+                "high_precision_exceptions=%d",
+                precision_summary.compute_lowbit_module_count,
+                precision_summary.persistent_lowbit_module_count,
+                precision_summary.high_precision_exception_module_count,
             )
-            if parallel.rank == 0:
-                logger.info(
-                    "TP per-module low-bit policy: compute_modules=%d persistent_modules=%d",
-                    precision_plan.compute_lowbit_module_count,
-                    precision_plan.persistent_lowbit_module_count,
-                )
+            logger.info(
+                "Low-bit master ownership: mode=%s bound_modules=%d",
+                precision_config.lowbit_master_ownership,
+                0 if master_store is None else len(master_store.metadata),
+            )
         refresh_persistent_lowbit_params(model)
 
         if parallel.rank == 0:

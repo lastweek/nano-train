@@ -14,29 +14,42 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from src.runtime.contracts import DeepSeekV3PrecisionRecipe
 from src.runtime.contracts import FP4PersistentFormat
+from src.runtime.contracts import LowBitKernelSpec
+from src.runtime.contracts import LowBitCapableModuleType
 from src.runtime.contracts import LowBitComputeMode
-from src.runtime.contracts import ModelPrecisionPlan
+from src.runtime.contracts import MasterOwnershipMode
 from src.runtime.contracts import ModulePatternType
 from src.runtime.contracts import ModulePrecisionAssignment
+from src.runtime.contracts import ModulePrecisionInitState
 from src.runtime.contracts import ModulePrecisionPolicy
+from src.runtime.contracts import ModulePrecisionResolver
+from src.runtime.contracts import ModulePrecisionSummary
 from src.runtime.contracts import PersistentLowBitMode
 from src.runtime.contracts import PersistentScaleGranularity
 from src.runtime.contracts import PrecisionConfig
 from src.runtime.contracts import PrecisionDType
 from src.runtime.contracts import PrecisionMode
+from src.runtime.contracts import PrecisionRecipeName
 from src.runtime.contracts import PrecisionRuntimeState
-from src.runtime.te_backend import ActiveLowBitContext
+from src.runtime.contracts import QuantGranularity
+from src.runtime.contracts import RoundingMode
 from src.runtime.te_backend import LowBitBackend
 from src.runtime.te_backend import build_lowbit_backend_for_mode
-from src.runtime.te_backend import clear_active_lowbit_context
-from src.runtime.te_backend import set_active_lowbit_context
 
 
 _DTYPE_ALIAS_TO_TORCH: dict[PrecisionDType, torch.dtype] = {
     "fp32": torch.float32,
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
+}
+
+
+_LOWBIT_CAPABLE_TYPES: set[str] = {
+    "linear",
+    "column_parallel_linear",
+    "row_parallel_linear",
 }
 
 
@@ -157,6 +170,131 @@ def _normalize_fp4_format(raw: object) -> FP4PersistentFormat:
     return "nf4"
 
 
+def _parse_module_compute_dtype_rules(raw_rules: object) -> tuple[tuple[str, PrecisionDType], ...]:
+    rules = _iter_patterns(raw_rules)
+    parsed: list[tuple[str, PrecisionDType]] = []
+    valid_dtypes = {"fp32", "bf16", "fp16"}
+    for rule in rules:
+        if "=" not in rule:
+            raise ValueError(
+                "--module-compute-dtype-rule must use '<pattern>=<fp32|bf16|fp16>' format"
+            )
+        pattern, dtype_raw = rule.split("=", 1)
+        pattern = pattern.strip()
+        dtype_raw = dtype_raw.strip()
+        if not pattern:
+            raise ValueError("--module-compute-dtype-rule pattern cannot be empty")
+        if dtype_raw not in valid_dtypes:
+            raise ValueError(
+                "--module-compute-dtype-rule dtype must be one of fp32, bf16, fp16"
+            )
+        parsed.append((pattern, dtype_raw))  # type: ignore[arg-type]
+    return tuple(parsed)
+
+
+def _normalize_precision_recipe_name(raw: object) -> PrecisionRecipeName:
+    value = str(raw or "default")
+    if value not in ("default", "deepseek_v3"):
+        raise ValueError("--precision-recipe must be default or deepseek_v3")
+    return value  # type: ignore[return-value]
+
+
+def _normalize_quant_granularity(
+    raw: object,
+    *,
+    flag_name: str,
+) -> QuantGranularity:
+    value = str(raw)
+    if value not in ("tensor", "channel", "tile_1x128", "block_128x128"):
+        raise ValueError(
+            f"{flag_name} must be one of tensor, channel, tile_1x128, block_128x128"
+        )
+    return value  # type: ignore[return-value]
+
+
+def _normalize_rounding_mode(raw: object) -> RoundingMode:
+    value = str(raw)
+    if value not in ("nearest", "stochastic"):
+        raise ValueError("--fp8-rounding must be nearest or stochastic")
+    return value  # type: ignore[return-value]
+
+
+def _default_deepseek_v3_recipe() -> DeepSeekV3PrecisionRecipe:
+    """Return DeepSeek-V3 default precision recipe with conservative exceptions."""
+    return DeepSeekV3PrecisionRecipe(
+        activation_quant_granularity="tile_1x128",
+        weight_quant_granularity="block_128x128",
+        rounding_mode="stochastic",
+        comm_quant_enabled=True,
+        comm_quant_granularity="block_128x128",
+        high_precision_module_patterns=(
+            r"(^|\\.)token_embeddings$",
+            r"(^|\\.)position_embeddings$",
+            r"(^|\\.)lm_head$",
+            r"(^|\\.)final_norm$",
+            r"(^|\\.).*norm$",
+            r"(^|\\.).*router(\\.|$)",
+        ),
+        high_precision_grad_patterns=(
+            r"(^|\\.)lm_head(\\.|$)",
+            r"(^|\\.).*router(\\.|$)",
+        ),
+    )
+
+
+def _build_deepseek_v3_recipe_from_args(args) -> DeepSeekV3PrecisionRecipe:
+    default = _default_deepseek_v3_recipe()
+
+    activation_raw = getattr(args, "fp8_activation_granularity", None)
+    weight_raw = getattr(args, "fp8_weight_granularity", None)
+    rounding_raw = getattr(args, "fp8_rounding", None)
+    comm_enabled_raw = getattr(args, "fp8_comm_quant", None)
+    comm_granularity_raw = getattr(args, "fp8_comm_granularity", None)
+
+    activation_granularity = default.activation_quant_granularity
+    if activation_raw is not None:
+        activation_granularity = _normalize_quant_granularity(
+            activation_raw,
+            flag_name="--fp8-activation-granularity",
+        )
+
+    weight_granularity = default.weight_quant_granularity
+    if weight_raw is not None:
+        weight_granularity = _normalize_quant_granularity(
+            weight_raw,
+            flag_name="--fp8-weight-granularity",
+        )
+
+    rounding_mode = default.rounding_mode
+    if rounding_raw is not None:
+        rounding_mode = _normalize_rounding_mode(rounding_raw)
+
+    comm_quant_enabled = default.comm_quant_enabled
+    if comm_enabled_raw is not None:
+        comm_quant_enabled = bool(comm_enabled_raw)
+
+    comm_quant_granularity = default.comm_quant_granularity
+    if comm_granularity_raw is not None:
+        comm_quant_granularity = _normalize_quant_granularity(
+            comm_granularity_raw,
+            flag_name="--fp8-comm-granularity",
+        )
+
+    return DeepSeekV3PrecisionRecipe(
+        activation_quant_granularity=activation_granularity,
+        weight_quant_granularity=weight_granularity,
+        rounding_mode=rounding_mode,
+        comm_quant_enabled=comm_quant_enabled,
+        comm_quant_granularity=comm_quant_granularity,
+        high_precision_module_patterns=default.high_precision_module_patterns,
+        high_precision_grad_patterns=default.high_precision_grad_patterns,
+    )
+
+
+def _match_recipe_pattern(name: str, pattern: str) -> bool:
+    return re.search(pattern, name) is not None
+
+
 def _collect_required_lowbit_modes(config: PrecisionConfig) -> set[LowBitComputeMode]:
     modes: set[LowBitComputeMode] = set()
     if config.mode in ("fp8", "fp4"):
@@ -218,6 +356,9 @@ def resolve_module_precision_policy(
         fp4_persistent_format=_normalize_fp4_format(
             getattr(args, "fp4_param_format", "nf4")
         ),
+        module_compute_dtype_rules=_iter_patterns(
+            getattr(args, "module_compute_dtype_rule", None)
+        ),
     )
 
     return policy
@@ -234,180 +375,250 @@ def _match_pattern(
     return fnmatch.fnmatch(name, pattern)
 
 
-def _resolve_matches(
-    module_names: Iterable[str],
-    *,
-    default_all_when_no_include: bool,
-    include_patterns: tuple[str, ...],
-    exclude_patterns: tuple[str, ...],
-    pattern_type: ModulePatternType,
-    label: str,
-) -> set[str]:
-    names = list(module_names)
-    if include_patterns:
-        matches = {
-            name
-            for name in names
-            if any(
-                _match_pattern(name, pattern, pattern_type=pattern_type)
+class _ModulePrecisionResolverImpl(ModulePrecisionResolver):
+    """Resolve constructor-time per-module precision states from one run policy."""
+
+    def __init__(self, config: PrecisionConfig) -> None:
+        self._config = replace(config)
+        policy = config.module_precision_policy
+        if policy is None:
+            policy = ModulePrecisionPolicy()
+        self._policy = policy
+        self._module_compute_dtype_rules = _parse_module_compute_dtype_rules(
+            self._policy.module_compute_dtype_rules
+        )
+
+        self._seen_paths: set[str] = set()
+        self._compute_include_hits: set[str] = set()
+        self._persistent_include_hits: set[str] = set()
+        self._high_precision_hits: set[str] = set()
+        self._module_compute_dtype_rule_hits: set[tuple[str, PrecisionDType]] = set()
+
+        self._parameterized_count = 0
+        self._lowbit_capable_count = 0
+        self._compute_lowbit_count = 0
+        self._persistent_lowbit_count = 0
+        self._high_precision_exception_count = 0
+
+    def _resolve_compute_dtype_override(
+        self,
+        module_path: str,
+    ) -> Optional[PrecisionDType]:
+        override: Optional[PrecisionDType] = None
+        for pattern, dtype_alias in self._module_compute_dtype_rules:
+            if _match_pattern(module_path, pattern, pattern_type=self._policy.pattern_type):
+                override = dtype_alias
+                self._module_compute_dtype_rule_hits.add((pattern, dtype_alias))
+        return override
+
+    def _select(
+        self,
+        *,
+        module_path: str,
+        include_patterns: tuple[str, ...],
+        exclude_patterns: tuple[str, ...],
+        default_all_when_no_include: bool,
+    ) -> tuple[bool, bool]:
+        include_matched = False
+        if include_patterns:
+            include_matched = any(
+                _match_pattern(module_path, pattern, pattern_type=self._policy.pattern_type)
                 for pattern in include_patterns
             )
-        }
-        if not matches:
-            raise ValueError(f"{label} include patterns matched zero modules")
-    elif default_all_when_no_include:
-        matches = set(names)
-    else:
-        matches = set()
+            selected = include_matched
+        else:
+            selected = default_all_when_no_include
 
-    excluded = {
-        name
-        for name in matches
-        if any(_match_pattern(name, pattern, pattern_type=pattern_type) for pattern in exclude_patterns)
-    }
-    return matches - excluded
+        if selected and any(
+            _match_pattern(module_path, pattern, pattern_type=self._policy.pattern_type)
+            for pattern in exclude_patterns
+        ):
+            selected = False
+        return selected, include_matched
 
+    def resolve_module_init_state(
+        self,
+        *,
+        module_path: str,
+        module_type: str,
+        lowbit_capable_type: Optional[LowBitCapableModuleType],
+        kernel_spec: Optional[LowBitKernelSpec] = None,
+    ) -> ModulePrecisionInitState:
+        if not module_path:
+            raise ValueError("module_path must be non-empty for precision resolution")
+        if module_path in self._seen_paths:
+            raise ValueError(f"Duplicate module_path for precision resolution: {module_path}")
 
-def _is_lowbit_capable(module: torch.nn.Module) -> bool:
-    return callable(getattr(module, "set_precision_assignment", None)) and callable(
-        getattr(module, "refresh_persistent_lowbit_params", None)
-    )
+        self._seen_paths.add(module_path)
+        self._parameterized_count += 1
 
+        lowbit_capable = lowbit_capable_type in _LOWBIT_CAPABLE_TYPES
+        if lowbit_capable:
+            self._lowbit_capable_count += 1
 
-def build_model_precision_plan(
-    model: torch.nn.Module,
-    policy: ModulePrecisionPolicy,
-) -> ModelPrecisionPlan:
-    """Resolve concrete per-module assignments for one model instance.
+        compute_selected, compute_include_hit = self._select(
+            module_path=module_path,
+            include_patterns=self._policy.compute_lowbit_include,
+            exclude_patterns=self._policy.compute_lowbit_exclude,
+            default_all_when_no_include=(
+                self._policy.compute_lowbit_mode is not None and lowbit_capable
+            ),
+        )
+        if compute_include_hit:
+            self._compute_include_hits.add(module_path)
 
-    Low-bit compute is assignment-driven: layers do not infer compute mode from a global
-    runtime default.
-    """
-    named_modules = dict(model.named_modules())
-    module_names = tuple(name for name in named_modules if name)
-    lowbit_capable_names = {
-        name for name in module_names if _is_lowbit_capable(named_modules[name])
-    }
+        persistent_selected, persistent_include_hit = self._select(
+            module_path=module_path,
+            include_patterns=self._policy.persistent_lowbit_include,
+            exclude_patterns=self._policy.persistent_lowbit_exclude,
+            default_all_when_no_include=(
+                self._policy.persistent_lowbit_mode != "off" and lowbit_capable
+            ),
+        )
+        if persistent_include_hit:
+            self._persistent_include_hits.add(module_path)
 
-    if policy.compute_lowbit_mode is not None and not policy.compute_lowbit_include:
-        compute_matches = set(lowbit_capable_names)
-        compute_matches = {
-            name
-            for name in compute_matches
-            if not any(
-                _match_pattern(name, pattern, pattern_type=policy.pattern_type)
-                for pattern in policy.compute_lowbit_exclude
+        if compute_selected and not lowbit_capable and self._policy.compute_lowbit_mode is not None:
+            raise ValueError(
+                "compute_lowbit patterns matched modules without low-bit support: "
+                f"{module_path} ({module_type})"
             )
-        }
-    else:
-        compute_matches = _resolve_matches(
-            module_names,
-            default_all_when_no_include=False,
-            include_patterns=policy.compute_lowbit_include,
-            exclude_patterns=policy.compute_lowbit_exclude,
-            pattern_type=policy.pattern_type,
-            label="compute_lowbit",
-        )
 
-    if policy.persistent_lowbit_mode != "off" and not policy.persistent_lowbit_include:
-        persistent_matches = set(lowbit_capable_names)
-        persistent_matches = {
-            name
-            for name in persistent_matches
-            if not any(
-                _match_pattern(name, pattern, pattern_type=policy.pattern_type)
-                for pattern in policy.persistent_lowbit_exclude
+        if persistent_selected and not lowbit_capable and self._policy.persistent_lowbit_mode != "off":
+            raise ValueError(
+                "persistent_lowbit patterns matched modules without low-bit support: "
+                f"{module_path} ({module_type})"
             )
-        }
-    else:
-        persistent_matches = _resolve_matches(
-            module_names,
-            default_all_when_no_include=False,
-            include_patterns=policy.persistent_lowbit_include,
-            exclude_patterns=policy.persistent_lowbit_exclude,
-            pattern_type=policy.pattern_type,
-            label="persistent_lowbit",
-        )
 
-    unsupported_compute = sorted(
-        name
-        for name in compute_matches
-        if not _is_lowbit_capable(named_modules[name])
-    )
-    if unsupported_compute and policy.compute_lowbit_mode is not None:
-        sample = ", ".join(unsupported_compute[:5])
-        raise ValueError(
-            "compute_lowbit patterns matched modules without low-bit support: "
-            f"{sample}"
-        )
+        compute_mode = None
+        if lowbit_capable and compute_selected:
+            compute_mode = self._policy.compute_lowbit_mode
 
-    unsupported_persistent = sorted(
-        name
-        for name in persistent_matches
-        if not _is_lowbit_capable(named_modules[name])
-    )
-    if unsupported_persistent and policy.persistent_lowbit_mode != "off":
-        sample = ", ".join(unsupported_persistent[:5])
-        raise ValueError(
-            "persistent_lowbit patterns matched modules without low-bit support: "
-            f"{sample}"
-        )
+        persistent_mode: PersistentLowBitMode = "off"
+        if lowbit_capable and persistent_selected:
+            persistent_mode = self._policy.persistent_lowbit_mode
 
-    assignments: dict[str, ModulePrecisionAssignment] = {}
-    compute_count = 0
-    persistent_count = 0
+        recipe = self._config.deepseek_v3_recipe
+        high_precision_selected = False
+        if recipe is not None and recipe.high_precision_module_patterns:
+            high_precision_selected = any(
+                _match_recipe_pattern(module_path, pattern)
+                for pattern in recipe.high_precision_module_patterns
+            )
 
-    for name, module in named_modules.items():
-        if not name or not _is_lowbit_capable(module):
-            continue
+        if high_precision_selected:
+            self._high_precision_hits.add(module_path)
+            self._high_precision_exception_count += 1
+            compute_mode = None
+            persistent_mode = "off"
 
-        compute_mode = policy.compute_lowbit_mode if name in compute_matches else None
-        persistent_mode = policy.persistent_lowbit_mode if name in persistent_matches else "off"
+        compute_dtype_override = self._resolve_compute_dtype_override(module_path)
+        if compute_mode is not None and compute_dtype_override is not None:
+            raise ValueError(
+                "module matched both low-bit compute and compute-dtype override: "
+                f"{module_path}. Adjust --compute-lowbit-* or --module-compute-dtype-rule."
+            )
 
         if compute_mode is not None:
-            compute_count += 1
+            self._compute_lowbit_count += 1
         if persistent_mode != "off":
-            persistent_count += 1
+            self._persistent_lowbit_count += 1
 
-        assignments[name] = ModulePrecisionAssignment(
-            module_name=name,
-            module_type=module.__class__.__name__,
+        assignment = ModulePrecisionAssignment(
+            module_name=module_path,
+            module_type=module_type,
             compute_lowbit_mode=compute_mode,
             persistent_lowbit_mode=persistent_mode,
-            persistent_scale_granularity=policy.persistent_scale_granularity,
-            fp4_persistent_format=policy.fp4_persistent_format,
+            persistent_scale_granularity=self._policy.persistent_scale_granularity,
+            fp4_persistent_format=self._policy.fp4_persistent_format,
+            compute_dtype_override=compute_dtype_override,
         )
 
-    return ModelPrecisionPlan(
-        assignments=assignments,
-        compute_lowbit_module_count=compute_count,
-        persistent_lowbit_module_count=persistent_count,
-    )
-
-
-def apply_model_precision_plan(
-    model: torch.nn.Module,
-    plan: ModelPrecisionPlan,
-) -> None:
-    """Apply a model precision plan to module-local precision-capable layers.
-
-    Low-bit execution requires explicit assignments on individual modules. This function installs
-    those assignments before training.
-    """
-    for module_name, module in model.named_modules():
-        assignment = plan.assignments.get(module_name)
-        if assignment is None:
-            continue
-
-        setter = getattr(module, "set_precision_assignment", None)
-        if not callable(setter):
-            raise ValueError(
-                "Model precision plan includes unsupported module "
-                f"'{module_name}' ({module.__class__.__name__})"
+        backend: Optional[LowBitBackend] = None
+        if compute_mode is not None:
+            backend_kernel_spec = kernel_spec
+            if backend_kernel_spec is not None and recipe is not None:
+                backend_kernel_spec = replace(
+                    backend_kernel_spec,
+                    activation_quant_granularity=recipe.activation_quant_granularity,
+                    weight_quant_granularity=recipe.weight_quant_granularity,
+                    rounding_mode=recipe.rounding_mode,
+                )
+            backend = build_lowbit_backend_for_mode(
+                self._config,
+                mode=compute_mode,
+                kernel_spec=backend_kernel_spec,
             )
-        setter(assignment)
+            if backend is None:
+                raise RuntimeError(
+                    f"No backend available for compute mode {compute_mode} at module {module_path}"
+                )
 
-    refresh_persistent_lowbit_params(model)
+        master_ownership_mode: MasterOwnershipMode = self._config.lowbit_master_ownership
+
+        return ModulePrecisionInitState(
+            assignment=assignment,
+            lowbit_backend=backend,
+            lowbit_capable_type=lowbit_capable_type,
+            master_ownership_mode=master_ownership_mode,
+        )
+
+    def finalize(self) -> ModulePrecisionSummary:
+        if self._policy.compute_lowbit_include and not self._compute_include_hits:
+            raise ValueError("compute_lowbit include patterns matched zero modules")
+        if self._policy.persistent_lowbit_include and not self._persistent_include_hits:
+            raise ValueError("persistent_lowbit include patterns matched zero modules")
+        unmatched_dtype_rules = [
+            f"{pattern}={dtype_alias}"
+            for pattern, dtype_alias in self._module_compute_dtype_rules
+            if (pattern, dtype_alias) not in self._module_compute_dtype_rule_hits
+        ]
+        if unmatched_dtype_rules:
+            raise ValueError(
+                "module compute dtype rules matched zero modules: "
+                f"{unmatched_dtype_rules[:3]}"
+            )
+
+        if self._config.mode in ("fp8", "fp4") and self._compute_lowbit_count == 0:
+            raise RuntimeError(
+                f"Low-bit mode '{self._config.mode}' is active but zero modules were assigned "
+                "for low-bit compute. Check --compute-lowbit-include/--compute-lowbit-exclude "
+                "or verify the model uses low-bit-capable layers."
+            )
+
+        recipe = self._config.deepseek_v3_recipe
+        if (
+            recipe is not None
+            and recipe.high_precision_module_patterns
+            and not self._high_precision_hits
+        ):
+            raise ValueError(
+                "DeepSeek-V3 high_precision_module_patterns matched zero modules"
+            )
+
+        return ModulePrecisionSummary(
+            parameterized_module_count=self._parameterized_count,
+            lowbit_capable_module_count=self._lowbit_capable_count,
+            compute_lowbit_module_count=self._compute_lowbit_count,
+            persistent_lowbit_module_count=self._persistent_lowbit_count,
+            high_precision_exception_module_count=self._high_precision_exception_count,
+        )
+
+    def deepseek_v3_recipe(self) -> Optional[DeepSeekV3PrecisionRecipe]:
+        """Return recipe configured for this run when DeepSeek-V3 preset is active."""
+        return self._config.deepseek_v3_recipe
+
+
+def build_module_precision_resolver(config: PrecisionConfig) -> ModulePrecisionResolver:
+    """Build constructor-time precision resolver for one runtime precision config."""
+    return _ModulePrecisionResolverImpl(config)
+
+
+def finalize_module_precision_resolver(
+    resolver: ModulePrecisionResolver,
+) -> ModulePrecisionSummary:
+    """Validate resolver coverage and return assignment summary."""
+    return resolver.finalize()
 
 
 def refresh_persistent_lowbit_params(model: torch.nn.Module) -> int:
@@ -421,29 +632,25 @@ def refresh_persistent_lowbit_params(model: torch.nn.Module) -> int:
     return refreshed
 
 
-def ensure_lowbit_compute_assignments(
-    config: PrecisionConfig,
-    plan: ModelPrecisionPlan,
-    *,
-    script_name: str,
-) -> None:
-    """Fail fast when low-bit mode is active but no modules were assigned for compute."""
-    if config.mode not in ("fp8", "fp4"):
-        return
-    if plan.compute_lowbit_module_count > 0:
-        return
-    raise RuntimeError(
-        f"{script_name}: low-bit mode '{config.mode}' is active but zero modules were assigned "
-        "for low-bit compute. Check --compute-lowbit-include/--compute-lowbit-exclude or verify "
-        "the model uses low-bit-capable layers, then rerun build_model_precision_plan(...) and "
-        "apply_model_precision_plan(...)."
-    )
-
-
 def resolve_precision_config(args, device: torch.device) -> PrecisionConfig:
     """Resolve run precision config from Megatron-style precision flags."""
+    precision_recipe_name = _normalize_precision_recipe_name(
+        getattr(args, "precision_recipe", "default")
+    )
     explicit_mode = _resolve_mode_from_flags(args)
-    mode = explicit_mode or _default_mode_for_device(device)
+    if precision_recipe_name == "deepseek_v3":
+        if explicit_mode is None:
+            mode: PrecisionMode = "fp8"
+        elif explicit_mode != "fp8":
+            raise ValueError("--precision-recipe deepseek_v3 requires --fp8 (or no explicit mode)")
+        else:
+            mode = explicit_mode
+    else:
+        mode = explicit_mode or _default_mode_for_device(device)
+
+    deepseek_v3_recipe: Optional[DeepSeekV3PrecisionRecipe] = None
+    if precision_recipe_name == "deepseek_v3":
+        deepseek_v3_recipe = _build_deepseek_v3_recipe_from_args(args)
 
     if mode == "bf16":
         if device.type != "cuda":
@@ -458,6 +665,7 @@ def resolve_precision_config(args, device: torch.device) -> PrecisionConfig:
     fp8_amax_history_len = int(getattr(args, "fp8_amax_history_len", 16))
     fp8_amax_compute_algo = str(getattr(args, "fp8_amax_compute_algo", "most_recent"))
     fp4_backend = str(getattr(args, "fp4_backend", "emulated"))
+    lowbit_master_ownership = str(getattr(args, "lowbit_master_ownership", "optimizer"))
 
     if mode == "fp8" and fp8_backend not in ("transformer_engine", "emulated"):
         raise ValueError("--fp8-backend must be transformer_engine or emulated")
@@ -470,6 +678,8 @@ def resolve_precision_config(args, device: torch.device) -> PrecisionConfig:
 
     if mode == "fp4" and fp4_backend != "emulated":
         raise ValueError("--fp4-backend currently supports only emulated")
+    if lowbit_master_ownership not in ("module", "optimizer"):
+        raise ValueError("--lowbit-master-ownership must be module or optimizer")
 
     params_dtype_raw = getattr(args, "params_dtype", None)
     main_params_dtype_raw = getattr(args, "main_params_dtype", None)
@@ -521,6 +731,9 @@ def resolve_precision_config(args, device: torch.device) -> PrecisionConfig:
         persistent_scale_granularity=_normalize_scale_granularity(
             getattr(args, "persistent_scale_granularity", "per_channel")
         ),
+        lowbit_master_ownership=lowbit_master_ownership,  # type: ignore[arg-type]
+        precision_recipe_name=precision_recipe_name,
+        deepseek_v3_recipe=deepseek_v3_recipe,
         loss_scale_init=float(getattr(args, "loss_scale_init", 65536.0)),
         loss_scale_growth_factor=float(getattr(args, "loss_scale_growth_factor", 2.0)),
         loss_scale_backoff_factor=float(getattr(args, "loss_scale_backoff_factor", 0.5)),
@@ -544,13 +757,13 @@ def resolve_precision_config(args, device: torch.device) -> PrecisionConfig:
     config.module_precision_policy = policy
 
     for required_mode in _collect_required_lowbit_modes(config):
-        _ = build_lowbit_backend_for_mode(config, mode=required_mode)
+        _ = build_lowbit_backend_for_mode(config, mode=required_mode, kernel_spec=None)
 
     return config
 
 
 class MixedPrecisionController:
-    """Apply autocast, low-bit backend context, and dynamic loss scaling policies."""
+    """Apply autocast and dynamic loss-scaling policies."""
 
     def __init__(
         self,
@@ -560,11 +773,6 @@ class MixedPrecisionController:
     ) -> None:
         self.config = replace(config)
         self.device = device
-        self.lowbit_backends: dict[str, LowBitBackend] = {}
-        for mode in sorted(_collect_required_lowbit_modes(config)):
-            backend = build_lowbit_backend_for_mode(config, mode=mode)
-            if backend is not None:
-                self.lowbit_backends[mode] = backend
         self.runtime_state = PrecisionRuntimeState(loss_scale=float(config.loss_scale_init))
 
     @property
@@ -577,25 +785,9 @@ class MixedPrecisionController:
 
     @contextmanager
     def autocast_context(self) -> Iterator[None]:
-        """Context manager for per-step autocast and low-bit backend activation.
-
-        Layer-level module assignments still control whether low-bit kernels are used.
-        """
-        lowbit_context = None
-        if self.lowbit_backends:
-            lowbit_context = ActiveLowBitContext(
-                backend_by_mode=dict(self.lowbit_backends),
-                default_mode=self.config.mode,
-                config=self.config,
-            )
-            set_active_lowbit_context(lowbit_context)
-
-        try:
-            with self._autocast_context_impl():
-                yield
-        finally:
-            if lowbit_context is not None:
-                clear_active_lowbit_context()
+        """Context manager for per-step autocast policy."""
+        with self._autocast_context_impl():
+            yield
 
     def _autocast_context_impl(self):
         dtype = self.activation_torch_dtype()
